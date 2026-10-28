@@ -1,0 +1,195 @@
+---
+title: Model routing, cascades, effort and batch
+description: Paying for intelligence only where it's needed. Choosing between models, effort levels, routers and cascades (simulated and tested), the hidden costs of multi-model systems, and the Batch API for work nobody is waiting on.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import CascadeCalculator from '../../../components/CascadeCalculator.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The router that saved 60% and lost a customer" severity="SEV2">
+To cut costs, Relay added a router: a small classifier sent "simple" tickets to the cheapest model and "complex" ones to the large model. Costs fell 60%. Six weeks later, Acme's largest customer escalated: their claims (long, multi-shipment, in German) were being labeled "simple" because they used plain language, and the cheap model was mishandling them. Nobody had evaluated the router itself, or sliced quality by customer.
+</Incident>
+
+Not every request needs your most capable model at maximum effort. But every attempt to save money by using less intelligence is a **quality decision**, and needs the same evidence as any other (Module 5).
+
+## The levers, in order
+
+Try them in this order. The early ones are simpler and keep one model:
+
+| Lever | What you change | Typical effect | Watch out for |
+|---|---|---|---|
+| **1. Effort** | `output_config: {"effort": "low" \| "medium" \| "high" \| ...}` on the same model | Fewer thinking and output tokens on easy routes; often the best first move | Quality drops on hard tasks; measure per route |
+| **2. Model per feature** | A smaller model for a whole feature (classification, extraction, short replies) | Large savings for well-defined tasks | Needs its own evals and prompt tuning |
+| **3. Routing** | A classifier picks the model per request | Savings on mixed traffic | The router is a model too: its mistakes are silent |
+| **4. Cascade** | Try the small model; escalate when a check fails | Near large-model quality at a fraction of the cost (when the check is good) | Escalated requests pay twice; latency rises for them |
+| **5. Batch** | Asynchronous processing for work nobody waits on | 50% off on the Claude Message Batches API | Results take minutes to hours |
+
+A useful default from practice: **before building a multi-model system, measure your strongest model at a lower effort level.** On current models, lower effort often matches what you'd get from a cascade, with one model, one prompt, one set of evals, and one prompt cache. That last point matters: **caches are per model**, so every model in a router or cascade warms its own cache, and a request escalated to a second model reads nothing from the first one's cache.
+
+## Routing vs cascades
+
+<Diagram
+	caption="A router decides before any model runs. A cascade decides after the cheap model has answered, using a check on that answer."
+	code={`flowchart LR
+    subgraph R["Router"]
+      direction LR
+      R1["Ticket"] --> R2{"Classifier:<br/>easy or hard?"}
+      R2 -- "easy" --> R3["Small model"]
+      R2 -- "hard" --> R4["Large model"]
+    end
+    subgraph C["Cascade"]
+      direction LR
+      C1["Ticket"] --> C2["Small model"]
+      C2 --> C3{"Check passes?<br/>(schema, grounding,<br/>confidence)"}
+      C3 -- "yes" --> C4["Return"]
+      C3 -- "no" --> C5["Large model"]
+    end`}
+/>
+
+A cascade is only as good as its **check**. Good checks are cheap and objective: the output validates against the schema, every claim cites a retrieved passage (Module 4), the classification falls into a known category with no "other", a code check passes. "Ask the small model how confident it is" is weak: models are often confidently wrong.
+
+```python
+"""Model cascade: try the small model first; escalate when a check says the answer isn't good enough."""
+from dataclasses import dataclass
+from typing import Callable
+
+
+@dataclass
+class Result:
+    answer: str
+    model: str
+    cost_usd: float
+    escalated: bool
+
+
+def cascade(
+    ticket: str,
+    small: Callable[[str], tuple[str, float]],     # returns (answer, cost)
+    large: Callable[[str], tuple[str, float]],
+    accept: Callable[[str, str], bool],            # a cheap check: schema valid? grounded? confident?
+) -> Result:
+    answer, cost = small(ticket)
+    if accept(ticket, answer):
+        return Result(answer, "small", cost, escalated=False)
+    better, extra = large(ticket)                   # you pay for both calls on escalation
+    return Result(better, "large", cost + extra, escalated=True)
+```
+
+Simulated on 20,000 tickets, with assumed accuracies (80% easy tickets; the check catches 70% of bad small-model answers and wrongly flags 5% of good ones):
+
+```text
+always small  accuracy  88.1%   cost per 1,000 tickets $  0.30
+always large  accuracy  95.3%   cost per 1,000 tickets $  6.00
+cascade       accuracy  95.4%   cost per 1,000 tickets $  1.07
+escalated: 12.9%
+```
+
+Under these assumptions, the cascade matches the large model's accuracy at **18% of its cost**. Before you believe numbers like that for your system, notice what the simulation assumed: the small model's errors, the large model's errors and the check's misses are **independent**. In reality they're correlated: the tickets that fool the small model are often the ones that fool the check, and that the large model also finds hard. Measure all three on real data.
+
+Change the assumptions yourself (the calculator uses the same math as the simulation):
+
+<CascadeCalculator />
+
+## Batch processing: half price for patience
+
+Lots of AI work has no user waiting: nightly ticket classification, re-embedding documents, generating summaries for yesterday's calls, running eval suites. The **Message Batches API** processes requests asynchronously at **50% of the normal price**: up to 100,000 requests (or 256 MB) per batch, most finishing within an hour, at most 24 hours, with results available for 29 days.
+
+```python
+import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
+
+client = anthropic.Anthropic()
+
+batch = client.messages.batches.create(
+    requests=[
+        Request(
+            custom_id=ticket.id,                  # results come back in any order: key by this
+            params=MessageCreateParamsNonStreaming(
+                model="claude-haiku-5-5",
+                max_tokens=256,
+                system=TRIAGE_PROMPT,
+                messages=[{"role": "user", "content": ticket.text}],
+            ),
+        )
+        for ticket in yesterdays_tickets
+    ]
+)
+# Later (a scheduled job, not a sleeping web request):
+# client.messages.batches.retrieve(batch.id).processing_status == "ended"
+# for result in client.messages.batches.results(batch.id): ...
+```
+
+Batches combine with prompt caching (a shared system prompt across the batch). They're single-shot: no tool loops inside a batch. On cloud platforms, the Claude Message Batches API isn't available everywhere; Bedrock and Vertex AI have their own batch inference offerings.
+
+<FailureCard
+	title="The unevaluated router"
+	symptom="Costs fell, overall quality looked stable, and one customer's quality collapsed."
+	cause="The router's mistakes were never measured. It routed by surface features (length, vocabulary), which correlated with one customer's writing style."
+	detect="Evaluate the router as a classifier (precision and recall of 'hard'), and slice end-to-end quality by customer and route."
+	fix="A labeled routing eval set, per-segment quality monitoring (Module 9), and a bias toward the large model when the router is unsure."
+/>
+
+<FailureCard
+	title="The cascade that cost more"
+	symptom="After introducing a cascade, total costs went up and latency got worse."
+	cause="The check flagged 55% of answers (the threshold was strict and the small model was weak on this task), so most requests paid for two model calls, sequentially."
+	detect="Escalation rate and the cost per request by path, on the dashboard."
+	fix="A cascade only pays when most requests stop at the first step. Improve the small model's prompt, use a better check, or just use the large model at lower effort."
+/>
+
+<ThinkFirst question="Relay has three workloads: (a) live chat with customers, (b) triage of incoming emails into 12 categories, (c) a nightly summary of every claim filed that day for the claims team. Which cost levers would you try for each, in which order?">
+
+- **(a) Live chat:** prompt caching first (lesson 1). Then try a lower effort level on the current model, measured with the chat eval suite. Routing is risky here (conversations change difficulty mid-way) and cascades add latency a user feels, so they come last, if at all.
+- **(b) Email triage:** a well-defined classification task, so a **small model per feature** is the natural candidate. Validate it against labeled data, and add a cascade with an objective check: escalate when the small model returns "other" or a low-agreement label. If triage can wait a few minutes, batch it.
+- **(c) Nightly summaries:** nobody is waiting, so the **Batch API** (50% off) is an easy win, combined with prompt caching for the shared instructions. Model choice here follows quality evals: summaries are what claims handlers read every morning.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run Relay's eval suite on your main model at two lower effort levels. Record quality, output tokens and latency per level.
+- **Stretch:** build a cascade for email triage with an objective check, and measure escalation rate, accuracy and cost on 200 labeled emails, against the large model alone.
+- **Boss level:** move one Relay workload that nobody waits on to the Batch API, with a scheduled job, idempotent result processing keyed by `custom_id` (Module 6), and a cost comparison before and after.
+
+</Practice>
+
+<Quiz
+	id="m10-routing"
+	questions={[
+		{
+			q: 'What should you usually try before building a router or cascade?',
+			options: ['Fine-tuning', 'Measuring your strong model at a lower effort level, on the same evals', 'A bigger model', 'Removing evals'],
+			answer: 1,
+			why: 'One model, one prompt, one cache, often similar savings.',
+		},
+		{
+			q: 'Why do multi-model systems lose some prompt-caching benefit?',
+			options: ['They use more tools', 'Caches are per model, so each model warms its own cache and escalations read nothing from the first model\'s cache', 'Batching is disabled', 'They don\'t'],
+			answer: 1,
+			why: 'Count cache effects in your cost model.',
+		},
+		{
+			q: 'What makes a cascade work?',
+			options: ['A large model', 'A cheap, objective check on the small model\'s answer, and most requests stopping at the first step', 'High temperature', 'Asking the model if it is sure'],
+			answer: 1,
+			why: 'The check decides both quality and cost.',
+		},
+		{
+			q: 'Which workload fits the Batch API?',
+			options: ['Live chat', 'Nightly summaries of all claims filed that day', 'Autocomplete', 'Voice calls'],
+			answer: 1,
+			why: 'Nobody is waiting, so trade latency for a 50% discount.',
+		},
+	]}
+/>
+
+<LessonComplete id="performance/routing-and-cascades" />

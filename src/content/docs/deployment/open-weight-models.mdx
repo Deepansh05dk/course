@@ -1,0 +1,162 @@
+---
+title: Open-weight models and self-hosting
+description: When running your own model pays off, and when it doesn't. Serving with vLLM and Ollama, what you take on (GPUs, throughput, ops, evals), a break-even calculator, and hybrid designs that use open models where they fit.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import SelfHostCalculator from '../../../components/SelfHostCalculator.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The GPU cluster that saved nothing" severity="SEV3">
+Acme's platform team proposed moving Relay to a self-hosted open model "to cut the AI bill by 80%". Six months later: four GPUs running around the clock at 15% average utilization (traffic is mostly business hours), two engineers spending a third of their time on serving infrastructure, and an eval suite showing the open model 9 points below the API model on claims handling. The bill went up. The comparison had used the GPU's hourly price and the API's per-token price, at 100% utilization.
+</Incident>
+
+**Open-weight models** publish their weights, so you can run them on your own hardware or cloud GPUs. Families like Llama, Qwen, Mistral, Gemma and DeepSeek have made this a real option. "Real option" is not the same as "cheaper".
+
+## Good reasons to self-host
+
+| Reason | Example |
+|---|---|
+| **Data can't leave** an environment that no API route serves | Air-gapped networks, specific sovereign-cloud requirements |
+| **Offline or edge** operation | On-device features, ships, factories, field equipment |
+| **Deep customization** | Full fine-tuning, custom decoding, access to internals (logits, hidden states) |
+| **Very high, steady volume on a narrow task** | Millions of classifications a day, where a small fine-tuned model matches quality |
+| **Latency or cost for small models** | A small local model for autocomplete, routing or PII detection on the hot path |
+
+And the usual **bad** reason: "it'll obviously be cheaper". It might be, at high and steady utilization, after you count everything. Small API models have become cheap, which moves the break-even point a long way out.
+
+## What you take on
+
+<Diagram
+	caption="Self-hosting replaces one line on an invoice with a system you operate."
+	code={`flowchart TB
+    A["Pick and evaluate a model<br/>(on YOUR evals)"] --> B["GPU capacity<br/>(reserved or on-demand)"]
+    B --> C["Serving engine<br/>vLLM, SGLang, TGI, Ollama"]
+    C --> D["Scaling, batching,<br/>quantization, KV cache"]
+    D --> E["Monitoring, on-call,<br/>upgrades, security patches"]
+    E --> F["Re-evaluating every<br/>model update"]`}
+/>
+
+- **Serving engines:** **vLLM** and **SGLang** are the common high-throughput servers (continuous batching, paged KV cache; the planned Elective E2 covers why those matter). **Ollama** and llama.cpp are great for local development and small deployments. Most expose an OpenAI-compatible HTTP API.
+- **Throughput depends on batching.** One GPU serving one user at a time is wasteful; throughput comes from serving many requests together, which needs steady traffic.
+- **You pay for capacity, not usage.** Idle GPUs at night cost the same as busy ones, unless you scale to zero (and accept cold starts of minutes).
+- **Quality is your problem.** Run the same eval suite (Module 5) on the open model. Prompts tuned for one model rarely transfer unchanged.
+
+## Serving a model locally
+
+For development and experimentation, both of these start an HTTP server you can call from Python. (Not run in this course's environment: there was no GPU, and model downloads were blocked. Check each project's docs for current flags.)
+
+```bash
+# Ollama: pull and run a small model locally, with an HTTP API on port 11434
+ollama run qwen2.5:7b
+
+# vLLM: a high-throughput server with an OpenAI-compatible API on port 8000 (needs a GPU)
+vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 16384
+```
+
+```python
+import httpx
+
+# Both servers above speak the OpenAI-style chat completions format.
+response = httpx.post(
+    "http://localhost:8000/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [{"role": "user", "content": "Classify: 'pallet arrived crushed'. One word."}],
+        "max_tokens": 10,
+    },
+    timeout=60,
+)
+print(response.json()["choices"][0]["message"]["content"])
+```
+
+Put it behind your gateway (Module 9) like any other route, so tracing, budgets and fallback work the same way.
+
+## Is it cheaper? Do the full math
+
+<SelfHostCalculator />
+
+Things the calculator makes visible:
+
+- **Utilization is the whole game.** Try 15% instead of 40%: business-hours traffic leaves GPUs idle most of the day.
+- **Redundancy:** production needs at least two replicas (and more across zones), even when one would carry the load.
+- **People:** ops and engineering time is usually the largest line. Set it to zero and see how misleading the comparison becomes.
+- **Compare against the right API option:** if a small API model meets your quality bar, compare against **its** price, not the frontier model's.
+
+## Hybrid designs
+
+The common production answer isn't "API or self-host" but **both, for different jobs**:
+
+| Job | Often a good fit |
+|---|---|
+| Customer-facing reasoning, agents, long context | API models (frontier quality, no ops) |
+| High-volume narrow tasks (PII detection, routing, embeddings, classification) | Small open or fine-tuned models, self-hosted or via a managed endpoint |
+| Air-gapped or offline components | Self-hosted open models |
+| Development and tests | Local models via Ollama for fast, free iteration on plumbing (never as a stand-in for quality evals) |
+
+<FailureCard
+	title="Quantized into errors"
+	symptom="After switching to a 4-bit quantized version to fit on fewer GPUs, extraction accuracy dropped on long, number-heavy documents."
+	cause="Quantization reduces quality to some degree, and the effect varies by task. It was benchmarked on general chat, not on Relay's tasks."
+	detect="Run your own eval suite on the exact quantized build you deploy."
+	fix="Evaluate each quantization level on your tasks, and treat the serving configuration (model, quantization, engine version) as part of the versioned AI config (Module 9)."
+/>
+
+<ThinkFirst question="A logistics customer wants Relay's ticket classifier (12 categories, 3 million tickets a month) to run on their own GPUs 'for cost and privacy'. Their tickets can go to an API in their region per their contract. What do you recommend, and what evidence do you collect?">
+
+**Evidence first:**
+
+1. **Quality:** label ~1,000 tickets. Evaluate (a) a small API model, (b) an open model zero-shot, (c) an open model fine-tuned on their labeled history (next lesson).
+2. **Cost:** 3 million short tickets a month is a few billion tokens; price it on the small API model (with batching and caching) versus GPUs at realistic utilization plus ops time.
+3. **Privacy:** their contract already allows the API in-region, so privacy isn't decisive. Confirm with their security team rather than assuming.
+
+**A likely recommendation:** start with the small API model via the Batch API (cheap, no ops, fast to ship), and revisit self-hosting only if volume grows by an order of magnitude or a requirement changes. If they insist on self-hosting for strategic reasons, a small fine-tuned open model is a reasonable fit for a narrow classification task, **provided it matches quality on the eval set**.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** install Ollama on your laptop, run a small model, and call it from Python through your gateway's route interface.
+- **Stretch:** run Relay's triage eval set against a small open model and a small API model. Compare accuracy, latency and cost.
+- **Boss level:** write a one-page "build vs buy" recommendation for self-hosting one Relay workload, with eval results, a cost model with your assumptions visible (use the calculator), and the operational plan if the answer is "build".
+
+</Practice>
+
+<Quiz
+	id="m11-open-weight"
+	questions={[
+		{
+			q: 'What most often makes self-hosting more expensive than expected?',
+			options: ['Electricity', 'Low GPU utilization, redundancy, and engineering/ops time', 'Model licenses', 'Bandwidth'],
+			answer: 1,
+			why: 'You pay for capacity around the clock, and people to run it.',
+		},
+		{
+			q: 'Which is a strong reason to self-host?',
+			options: ['APIs are unreliable', 'Data must stay in an environment no API route can serve, or the system must run offline', 'It is always cheaper', 'Open models are always better'],
+			answer: 1,
+			why: 'Control and environment constraints are the clearest drivers.',
+		},
+		{
+			q: 'What must you do before deploying a quantized open model?',
+			options: ['Nothing', 'Run your own eval suite on the exact build you will deploy', 'Increase max_tokens', 'Disable streaming'],
+			answer: 1,
+			why: 'Quality effects of quantization vary by task.',
+		},
+		{
+			q: 'Why do self-hosted servers need steady traffic for good throughput?',
+			options: ['Licensing', 'Throughput comes from batching many requests together on the GPU', 'Caching', 'They don\'t'],
+			answer: 1,
+			why: 'Idle or one-at-a-time serving wastes expensive capacity.',
+		},
+	]}
+/>
+
+<LessonComplete id="deployment/open-weight-models" />

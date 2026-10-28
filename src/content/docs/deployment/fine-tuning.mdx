@@ -1,0 +1,206 @@
+---
+title: Fine-tuning and distillation
+description: When fine-tuning beats prompting and RAG, and when it doesn't. SFT, LoRA, preference tuning and distillation in plain terms, the data you need, a dataset checker that catches leakage (tested), and how to evaluate a tuned model honestly.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="99% accurate, in the lab" severity="SEV2">
+Acme fine-tuned a small model to classify support tickets and reported 99% accuracy on the evaluation set. In production, accuracy was 81%. The cause: the training and evaluation sets were split **after** deduplication was skipped. Thousands of near-identical tickets ("Where is my parcel?" in a hundred spellings) appeared in both, so the model was graded on questions it had memorized. The real test set had never been seen, and there was no real test set.
+</Incident>
+
+**Fine-tuning** continues training a model on your examples so it learns a behaviour directly, instead of being told about it in every prompt. It's powerful and often unnecessary. The most common FDE conversation about fine-tuning is explaining why to try something else first.
+
+## The decision: prompt, retrieve, or tune?
+
+<Diagram
+	caption="Fine-tuning changes behaviour and style. It's a poor way to add knowledge that changes, and it's rarely the first thing to try."
+	code={`flowchart TD
+    A["The model gets it wrong"] --> B{"Missing knowledge<br/>(facts, docs, data)?"}
+    B -- "yes" --> R["RAG / tools<br/>(Modules 4, 6)"]
+    B -- "no" --> C{"Better instructions<br/>and examples fix it?"}
+    C -- "yes" --> P["Prompting<br/>(Module 1)"]
+    C -- "no" --> D{"Narrow, high-volume task<br/>with lots of good labels?"}
+    D -- "yes" --> F["Fine-tune (often a smaller model)<br/>or distill"]
+    D -- "no" --> E["Bigger model, more effort,<br/>or rethink the task"]`}
+/>
+
+| Fine-tuning is good at | Fine-tuning is bad at |
+|---|---|
+| A consistent format, style or tone across millions of outputs | Adding knowledge that changes (prices, policies, shipment status) |
+| Narrow tasks (classification, extraction, routing) on a **small, cheap** model | Tasks where you have few labeled examples |
+| Shorter prompts (behaviour learned instead of instructed) | Quick iteration: every change is a training run plus evals |
+| Domain jargon and patterns the base model handles poorly | Teaching broad reasoning the base model lacks |
+
+## The techniques in plain terms
+
+| Technique | What it does | Typical use |
+|---|---|---|
+| **Supervised fine-tuning (SFT)** | Train on input → ideal output pairs | Classification, extraction, a house style |
+| **LoRA / adapters** | Train small extra matrices instead of all weights; cheap to train and to store (many adapters per base model) | Most practical fine-tuning of open models |
+| **Preference tuning** (DPO and similar) | Train on pairs of "better vs worse" outputs | Tone, helpfulness, avoiding specific failure patterns |
+| **Distillation** | Use a strong model's outputs (on your inputs) as training data for a small model | Get frontier-quality behaviour on a narrow task at small-model cost and latency |
+
+**Distillation** is the pattern you'll use most in practice: run your large model with a carefully evaluated prompt on thousands of real inputs, filter the outputs (with judges, rules or human review), and fine-tune a small model on them. Check your model provider's terms on using outputs for training first.
+
+Where you can fine-tune depends on the model: open-weight models can always be fine-tuned (on your GPUs or a managed service); for proprietary models, availability varies by provider, model and platform, so check current offerings.
+
+## Data is the work
+
+Good fine-tuning data is **representative** (real inputs, including the messy ones), **correct** (reviewed labels, not guesses), **consistent** (the same input type always gets the same treatment) and **clean** (no duplicates, no leakage). A few hundred excellent examples can beat thousands of noisy ones for a narrow task.
+
+Before spending money on training, check the dataset. This checker catches two of the most common problems, duplicates and train/eval leakage:
+
+```python
+"""Sanity checks for a fine-tuning dataset (chat-format JSONL) before you spend money training on it."""
+import hashlib
+import json
+import re
+
+
+def normalize(text: str) -> str:
+    return re.sub(r"\W+", " ", text.lower()).strip()
+
+
+def fingerprint(example: dict) -> str:
+    user_turns = " ".join(m["content"] for m in example["messages"] if m["role"] == "user")
+    return hashlib.sha256(normalize(user_turns).encode()).hexdigest()
+
+
+def check(train_path: str, eval_path: str) -> dict:
+    problems, seen, train_fps = [], set(), set()
+    train = [json.loads(line) for line in open(train_path)]
+    for i, ex in enumerate(train):
+        roles = [m["role"] for m in ex.get("messages", [])]
+        if not roles or roles[-1] != "assistant":
+            problems.append(f"train line {i + 1}: must end with an assistant message (the target)")
+        fp = fingerprint(ex)
+        if fp in seen:
+            problems.append(f"train line {i + 1}: duplicate of an earlier example")
+        seen.add(fp)
+        train_fps.add(fp)
+    evals = [json.loads(line) for line in open(eval_path)]
+    leaked = sum(fingerprint(ex) in train_fps for ex in evals)   # eval questions that also appear in training
+    return {"train": len(train), "eval": len(evals), "eval_leaked_into_train": leaked, "problems": problems}
+```
+
+```text
+{
+ "train": 4,
+ "eval": 2,
+ "eval_leaked_into_train": 1,
+ "problems": [
+  "train line 3: duplicate of an earlier example",
+  "train line 4: must end with an assistant message (the target)"
+ ]
+}
+```
+
+The eval example "Classify: Pallet arrived CRUSHED!" counts as leaked because it normalizes to the same text as a training example, exactly the incident above at small scale. Real pipelines add **near-duplicate** detection (embeddings or MinHash), and split by **time** or by **customer**, so the test set looks like the future, not like the past.
+
+## Evaluating a tuned model honestly
+
+1. **A held-out test set** that never touched training, split by time or customer, and deduplicated against training data.
+2. **Compare against the strong baselines**, not a straw man: the best prompt on the base model, and a bigger model with a good prompt. Fine-tuning must beat what you'd otherwise ship.
+3. **Check for regressions** outside the target task: tuned models can lose general abilities or safety behaviours ("catastrophic forgetting"). Keep a broad regression set.
+4. **Plan the lifecycle:** the base model will be updated or retired; the data drifts. Budget for retraining and re-evaluation, and version the tuned model as part of the AI config (Module 9).
+
+<IncidentDrill
+	id="finetune-drill"
+	title="'Let's fine-tune it'"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Relay sometimes quotes outdated refund rules. A stakeholder proposes fine-tuning a model on the policy documents. Your response?',
+			choices: [
+				{ label: 'Diagnose first: is the right policy passage retrieved? Is it the current version? Are citations required?', next: 's2', cost: 2 },
+				{ label: 'Agree and start collecting training data', next: 's1b', cost: 40, note: 'Weeks later the tuned model knows the old policy by heart, and the policy changes again next month.' },
+			],
+		},
+		s1b: { text: 'The policy changed after training. The tuned model now confidently quotes the old version. Next?', choices: [{ label: 'Go back and diagnose retrieval', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'Diagnosis: the index contained both the old and the new policy, without effective dates. Fix?',
+			choices: [
+				{ label: 'Add effective dates as metadata, filter out superseded versions, require citations, and add eval cases for policy-change questions', next: 's3', cost: 0 },
+				{ label: 'Fine-tune on the new policy only', next: 'end_ok', cost: 20, note: 'It fixes today\'s version and repeats the problem at the next change.' },
+			],
+		},
+		s3: {
+			text: 'Solved with RAG. Separately, ticket triage (3M/month) costs a lot on the large model. Fine-tuning candidate?',
+			choices: [
+				{ label: 'Yes, a good one: narrow, high-volume, stable labels. Distill the large model into a small one, evaluate on a time-split held-out set against the prompted small model', next: 'end_good', cost: 0 },
+				{ label: 'No, never fine-tune', next: 'end_ok', cost: 0, note: 'Too absolute: narrow, high-volume, stable tasks are exactly where it pays.' },
+			],
+		},
+		end_good: { text: 'Knowledge problems solved with retrieval, behaviour and cost problems with tuning, each backed by evals.', end: 'good' },
+		end_ok: { text: 'Workable, but you used the wrong tool for at least one job.', end: 'ok' },
+	}}
+/>
+
+<FailureCard
+	title="The tuned model that forgot its manners"
+	symptom="After fine-tuning on terse internal ticket labels, the model's customer-facing replies became curt and occasionally rude."
+	cause="The same tuned model was reused for a different task than it was trained for; tuning shifted its general style."
+	detect="A regression eval set covering other tasks the model is used for."
+	fix="Use tuned models only for the task they were tuned for, keep the general model for everything else, and include regression checks in the tuning pipeline."
+/>
+
+<ThinkFirst question="An FDE customer has 400 labeled examples of a complex document-extraction task and wants to fine-tune. The base model with a good prompt scores 88% on their eval set; they need 95%. What would you try, in order?">
+
+1. **Error analysis first** (Module 5): read the failures. Are they missing fields, wrong formats, misread tables, or ambiguous labels? Often 30% of "errors" are label disagreements, which training won't fix.
+2. **Prompt and pipeline fixes:** structured outputs with a strict schema, better instructions for the failing fields, a few well-chosen examples, a higher effort level or a stronger model, and image/PDF handling (lesson 5).
+3. **Task decomposition:** split extraction into steps (find the table, then extract rows), with validation checks between them.
+4. **Only then fine-tuning**, with the 400 examples split into training and a **held-out** set (deduplicated, split by document source), and compared against the best prompted pipeline. 400 examples is small; distillation from the strongest prompted model on more of their unlabeled documents can enlarge the training set.
+
+Fine-tuning is the last step, not the first: it's the most expensive one to iterate on.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the dataset checker on a labeled dataset you have (or Relay's triage set). Count duplicates and leakage.
+- **Stretch:** add near-duplicate detection with embeddings (Module 3) and a time-based split.
+- **Boss level:** distill Relay's triage task: label 2,000 tickets with the large model plus filtering, fine-tune a small open model with LoRA (a free GPU notebook is enough), and compare against the prompted small and large models on a held-out set. Report accuracy, cost and latency.
+
+</Practice>
+
+<Quiz
+	id="m11-finetune"
+	questions={[
+		{
+			q: 'Relay quotes outdated policies. Is fine-tuning the fix?',
+			options: ['Yes', 'No: changing knowledge belongs in retrieval with versioning and citations; fine-tuning would freeze the knowledge again', 'Only with LoRA', 'Only for small models'],
+			answer: 1,
+			why: 'Fine-tune behaviour; retrieve knowledge.',
+		},
+		{
+			q: 'What is distillation?',
+			options: ['Compressing prompts', 'Training a small model on a strong model\'s (filtered) outputs for a specific task', 'Removing layers', 'Quantization'],
+			answer: 1,
+			why: 'It moves narrow-task quality to a cheaper, faster model.',
+		},
+		{
+			q: 'Why did the incident\'s model score 99% in the lab and 81% in production?',
+			options: ['The model was too small', 'Near-identical examples appeared in both training and evaluation data (leakage)', 'Production was slower', 'Wrong temperature'],
+			answer: 1,
+			why: 'Deduplicate, then split by time or customer.',
+		},
+		{
+			q: 'What must a fine-tuned model beat to be worth shipping?',
+			options: ['Nothing', 'The best prompted pipeline on the base model (and a bigger model with a good prompt), on a held-out set', 'Random guessing', 'Last year\'s model'],
+			answer: 1,
+			why: 'Compare against strong baselines, not straw men.',
+		},
+	]}
+/>
+
+<LessonComplete id="deployment/fine-tuning" />

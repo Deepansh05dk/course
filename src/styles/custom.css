@@ -414,3 +414,24 @@
 .alert__out strong { font-size: 1.3rem; font-variant-numeric: tabular-nums; }
 .alert__incidents { font-size: 0.85rem; padding-left: 1rem; }
 .alert__note { font-weight: 600; font-size: 0.9rem; }
+
+/* cache lab, semantic tuner, cascade, self-host */
+.cachelab__bar { display: flex; gap: 2px; margin: 0.6rem 0 0.3rem; border-radius: 0.4rem; overflow: hidden; }
+.cachelab__seg { min-width: 0; padding: 0.35rem 0.4rem; font-size: 0.72rem; color: #fff; display: grid; overflow: hidden; }
+.cachelab__seg b, .cachelab__seg small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cachelab__seg--hit, .cachelab__k--hit { background: #059669; }
+.cachelab__seg--user, .cachelab__k--user { background: #b45309; }
+.cachelab__seg--full, .cachelab__k--full { background: #dc2626; }
+.cachelab__legend { font-size: 0.8rem; display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
+.cachelab__k { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 2px; margin-right: 0.25rem; }
+.cachelab__toggles { border: 1px solid var(--c-border); border-radius: 0.4rem; margin: 0.75rem 0; padding: 0.5rem 0.75rem; display: grid; gap: 0.3rem; font-size: 0.88rem; }
+.cachelab__toggles legend { font-weight: 600; padding: 0 0.3rem; }
+.cachelab__note, .cascade__note, .selfhost__note, .semtune__note { font-weight: 600; color: var(--sl-color-text); }
+.semtune__list { list-style: none; padding: 0; display: grid; gap: 0.3rem; font-size: 0.85rem; }
+.semtune__row { margin: 0; display: flex; gap: 0.6rem; align-items: baseline; background: var(--sl-color-bg); border-radius: 0.4rem; padding: 0.35rem 0.6rem; border-left: 4px solid var(--sl-color-gray-4); }
+.semtune__row small { display: block; color: var(--sl-color-gray-2); font-size: 0.78rem; }
+.semtune__row--good, .semtune__row--ok { border-left-color: var(--c-ok); }
+.semtune__row--bad { border-left-color: var(--c-bad); }
+.semtune__row--miss { border-left-color: var(--c-warn); }
+.cascade__table { width: 100%; display: table; font-size: 0.9rem; margin-top: 0.5rem; }
+.calc .calc__grid input[type='range'] { padding: 0; }

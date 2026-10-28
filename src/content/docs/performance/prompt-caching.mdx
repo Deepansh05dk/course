@@ -1,0 +1,208 @@
+---
+title: Prompt caching
+description: The biggest safe cost and latency win. How provider prompt caching works (a prefix match), breakpoints and TTLs, the economics, the silent things that break it, and how to verify it in production.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import CacheLab from '../../../components/CacheLab.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The greeting that cost 40,000 dollars" severity="SEV3">
+Relay's prompt caching had cut input costs by 70%. In March, a product manager asked for friendlier answers, and an engineer added one line to the top of the system prompt: `f"Today is {date}. The customer's name is {name}."`. Every test passed, and the answers were friendlier. Nothing errored. But the cache hit rate fell from 92% to 3%, and the monthly bill rose by 40,000 dollars. Nobody noticed until the quarterly cost review, because nothing was monitoring `cache_read_input_tokens`.
+</Incident>
+
+Most production prompts are mostly **the same** from request to request: the tool definitions, the system prompt, the policies, the few-shot examples. Only the end changes. **Prompt caching** lets the provider keep the processed form of that shared beginning, so later requests read it back instead of processing it again.
+
+The result: cached input tokens cost about **a tenth** of the normal price (less on some models), and responses start faster because the cached part doesn't need to be processed again. For most AI products it's the largest single cost reduction available, and unlike the levers in the next lessons, it doesn't trade away any quality.
+
+## How it works: a prefix match
+
+<Diagram
+	caption="The request renders in a fixed order: tools, then system, then messages. The cache matches the longest identical prefix up to a breakpoint. One changed byte invalidates everything after it."
+	code={`flowchart LR
+    T["tools<br/>2K tokens"] --> S["system prompt<br/>+ policies<br/>10K tokens"]
+    S --> BP(["cache breakpoint"])
+    BP --> D["retrieved docs<br/>3K, per question"]
+    D --> Q["question"]
+    style BP fill:#059669,color:#fff`}
+/>
+
+The rules that follow from "prefix match":
+
+1. **Order matters.** The render order is `tools` → `system` → `messages`. Put stable content first and volatile content last.
+2. **Any byte change invalidates everything after it.** A timestamp, a reordered JSON key, a different tool order, a user name.
+3. **You mark where caching ends** with a `cache_control` breakpoint (up to four per request), or use **automatic caching**, which places the breakpoint on the last cacheable block for you.
+4. **There's a minimum length.** Prefixes shorter than the model's minimum (512 tokens on the newest Claude models, more on some older ones) silently don't cache.
+5. **Entries expire.** The default lifetime is 5 minutes, refreshed for free on every read; a 1-hour option exists for traffic with longer gaps.
+6. **Caches are scoped** to a model and to your workspace or organization. Switching models means a cold cache.
+
+## In code
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.messages.create(
+    model="claude-sonnet-5-5",
+    max_tokens=2000,
+    tools=sorted_tools,                      # deterministic order: tools render first
+    system=[{
+        "type": "text",
+        "text": RELAY_INSTRUCTIONS_AND_POLICIES,   # frozen: no dates, names or IDs in here
+        "cache_control": {"type": "ephemeral"},    # breakpoint: cache everything up to here
+    }],
+    messages=[{"role": "user", "content": f"<docs>{retrieved}</docs>\n\n{question}"}],  # volatile part last
+)
+
+u = response.usage
+print(u.cache_creation_input_tokens, u.cache_read_input_tokens, u.input_tokens)
+```
+
+The three usage fields are your ground truth:
+
+| Field | Meaning | Price (multiple of normal input) |
+|---|---|---|
+| `cache_creation_input_tokens` | Written to the cache this request | 1.25× (5-minute TTL), 2× (1-hour TTL) |
+| `cache_read_input_tokens` | Read from the cache | ~0.1× (0.05× on Claude Opus 5.5) |
+| `input_tokens` | Processed normally (after the last breakpoint) | 1× |
+
+So with the 5-minute TTL, a prefix pays for itself on the **second** request: 1.25 + 0.1 = 1.35 versus 2.0 without caching. For multi-turn conversations and agent loops, automatic caching (a top-level `cache_control`) moves the breakpoint forward as the conversation grows, so each turn reads everything before it.
+
+## 🧊 The cache lab
+
+Toggle the things teams really do when assembling prompts, and watch what happens to the cached share and the cost:
+
+<CacheLab />
+
+## Find what's breaking your cache
+
+Code review rarely spots cache breakers, because each one looks harmless. A more reliable method: **render consecutive requests and find where they first differ.** This small auditor does exactly that (tested on a "bad" and a "good" version of Relay's request builder):
+
+```python
+"""Find what breaks prompt caching: diff the rendered prefix of consecutive requests."""
+import json
+
+
+def render(request: dict) -> str:
+    # The cache is a prefix match over tools -> system -> messages, in that order.
+    parts = [request.get("tools", []), request.get("system", ""), request.get("messages", [])]
+    return json.dumps(parts, ensure_ascii=False)
+
+
+def shared_prefix(a: dict, b: dict) -> tuple[int, int, str]:
+    ra, rb = render(a), render(b)
+    n = 0
+    while n < min(len(ra), len(rb)) and ra[n] == rb[n]:
+        n += 1
+    return n, len(rb), rb[max(0, n - 30):n + 40]  # where the two requests diverge
+
+
+def audit(requests: list[dict]) -> None:
+    for prev, cur in zip(requests, requests[1:]):
+        n, total, around = shared_prefix(prev, cur)
+        print(f"  reusable prefix: {n / total:5.1%} of {total} chars | diverges at: ...{around}...")
+```
+
+```text
+bad builder:
+  reusable prefix:  5.6% of 4177 chars | diverges at: ...urrent time: 2026-10-28T09:00:37. You are helping omar.\nAcme refund a...
+  reusable prefix:  0.3% of 4156 chars | diverges at: ...[[{"name": "search_policies", "description": "Search...
+good builder:
+  reusable prefix: 98.9% of 4151 chars | diverges at: ...t": "[2026-10-28 09:00, user: omar] Can I get a refund for a late pall...
+  reusable prefix: 99.2% of 4130 chars | diverges at: ..., "content": "[2026-10-28 09:01, user: jane] And the invoice?"}]]...
+```
+
+The bad builder's requests diverge at the timestamp in the system prompt, and then at the very first byte, because the tool order changed. The good builder shares 99% of every request. It moved the date and the user into the user message, after the cached prefix, and sorted the tools.
+
+The usual suspects:
+
+| Pattern | Why it breaks caching |
+|---|---|
+| `datetime.now()` or a request ID in the system prompt | The prefix is unique per request |
+| The user's name, plan or locale in the system prompt | One cache entry per user, which usually expires before it's reused |
+| Tools built from a `set`, a dict from an unordered source, or a per-user tool list | Tools render first, so nothing after them matches |
+| `json.dumps` without `sort_keys=True` in prompt content | Different key order, different bytes |
+| Conditional sections (`if flag: system += ...`) | Every combination of flags is a different prefix |
+| Switching models, or changing thinking/effort settings per request | Caches are per model; thinking settings can invalidate parts of the cache |
+
+On the Claude API there's also a **cache diagnostics** feature (beta) that reports server-side where two consecutive requests diverged, so you don't have to log and diff the payloads yourself.
+
+## Verify continuously
+
+The most expensive caching failure is **silent**: the requests keep succeeding and only the bill grows, like in the incident above. Make it impossible to miss:
+
+- **A dashboard and an alert** on the cached share: `cache_read_input_tokens / (cache_read + cache_creation + input_tokens)`, per feature (Module 9).
+- **An integration test** that sends the same prefix twice and asserts `cache_read_input_tokens > 0` on the second request. Run it in CI whenever prompt-assembly code changes.
+- **A code-review rule:** nothing dynamic before the breakpoint.
+
+<FailureCard
+	title="Writing on every request, reading never"
+	symptom="cache_creation_input_tokens is high on every request; cache_read_input_tokens is near zero; costs went UP after enabling caching."
+	cause="The breakpoint was placed after the per-request content (the retrieved documents), so every request wrote a new, unique cache entry and paid the 1.25× premium."
+	detect="Writes on every request with no matching reads: the signature of a misplaced breakpoint."
+	fix="Put the breakpoint at the end of the shared part. Automatic caching is great for conversations, but for 'shared prefix + unique tail' requests, use an explicit breakpoint."
+/>
+
+<FailureCard
+	title="The cache that only works in the morning"
+	symptom="Cache hit rate is 90% during business hours and under 10% at night and on weekends."
+	cause="Requests at night arrive more than 5 minutes apart, so entries expire between them."
+	detect="Hit rate by hour of day."
+	fix="Usually accept it (night traffic is small). If the gaps are 5–60 minutes and volume matters, the 1-hour TTL (2× write) can pay off; for very expensive prefixes, a scheduled request can re-warm the cache."
+/>
+
+<ThinkFirst question="Relay's agent sends a 14,000-token prefix (tools + system + policies) and has 25 turns per conversation on average. Each turn adds ~1,500 tokens. Roughly what share of its total input tokens could caching serve from cache, and what one design decision protects that number?">
+
+Total input over 25 turns: each turn sends the prefix plus the history so far, so about 25 × 14,000 + 1,500 × (0 + 1 + … + 24) = 350,000 + 450,000 = **800,000 tokens**. With automatic caching, each turn reads everything the previous turn sent and only processes the newly appended ~1,500 tokens (plus the write premium on them). New tokens total about 14,000 + 25 × 1,500 ≈ 51,500, so roughly **94% of input tokens** can come from cache.
+
+The decision that protects it: **the conversation is append-only**. Never edit or reorder earlier turns, never change the tools or the system prompt mid-conversation, and never vary thinking or effort settings per turn. Any of those rewrites the prefix and turns cheap reads back into full-price writes.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** add `cache_control` to Relay's system prompt and log the three usage fields. Send the same question twice and confirm the second request reads from cache.
+- **Stretch:** run the prefix auditor on 20 real consecutive requests from Relay's logs. Fix every divergence before the user message.
+- **Boss level:** add a CI test that asserts a cache hit on the second identical request for every Relay feature, and a dashboard panel with the cached share per feature, alerting if it drops by more than 20 points.
+
+</Practice>
+
+<Quiz
+	id="m10-prompt-caching"
+	questions={[
+		{
+			q: 'Why does a timestamp at the top of the system prompt ruin caching?',
+			options: ['Timestamps are long', 'Caching is a prefix match: a change early in the prompt invalidates everything after it', 'Dates are not allowed', 'It changes the model'],
+			answer: 1,
+			why: 'Put volatile content after the cached prefix.',
+		},
+		{
+			q: 'In what order is the request rendered for caching?',
+			options: ['messages, system, tools', 'tools, system, messages', 'system, messages, tools', 'Any order'],
+			answer: 1,
+			why: 'Tools come first, so an unstable tool list breaks everything.',
+		},
+		{
+			q: 'With a 5-minute TTL, after how many requests sharing a prefix does caching pay off?',
+			options: ['10', '2: a 1.25× write plus a 0.1× read beats two full-price requests', 'Never', '100'],
+			answer: 1,
+			why: '1.35× versus 2×.',
+		},
+		{
+			q: 'What is the most reliable way to know caching works in production?',
+			options: ['Code review', 'Monitoring cache_read_input_tokens per feature, plus a CI test that asserts a hit', 'Asking the provider', 'Lower latency'],
+			answer: 1,
+			why: 'Cache failures are silent. Only the usage fields tell the truth.',
+		},
+	]}
+/>
+
+<LessonComplete id="performance/prompt-caching" />

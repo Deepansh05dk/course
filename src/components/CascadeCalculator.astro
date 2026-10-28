@@ -1,0 +1,53 @@
+---
+// Compare always-small, always-large and a cascade (small first, escalate when a check fails).
+---
+
+<section class="calc cascade not-content" data-cascade>
+	<p class="calc__badge">🪜 Cascade calculator: Claude Haiku 5.5 first, Claude Sonnet 5.5 when needed</p>
+	<div class="calc__grid">
+		<label>Share of easy tickets: <output name="easyOut"></output><input type="range" name="easy" min="0" max="1" step="0.05" value="0.8" /></label>
+		<label>Small model accuracy, easy: <output name="seOut"></output><input type="range" name="se" min="0.5" max="1" step="0.01" value="0.95" /></label>
+		<label>Small model accuracy, hard: <output name="shOut"></output><input type="range" name="sh" min="0.2" max="1" step="0.01" value="0.6" /></label>
+		<label>Large model accuracy, easy: <output name="leOut"></output><input type="range" name="le" min="0.5" max="1" step="0.01" value="0.97" /></label>
+		<label>Large model accuracy, hard: <output name="lhOut"></output><input type="range" name="lh" min="0.2" max="1" step="0.01" value="0.9" /></label>
+		<label>Check catches this share of bad small answers: <output name="recOut"></output><input type="range" name="rec" min="0" max="1" step="0.05" value="0.7" /></label>
+		<label>Check wrongly flags this share of good answers: <output name="ffOut"></output><input type="range" name="ff" min="0" max="0.5" step="0.01" value="0.05" /></label>
+	</div>
+	<table class="cascade__table">
+		<thead><tr><th>Strategy</th><th>Accuracy</th><th>Cost / 1,000 tickets</th></tr></thead>
+		<tbody></tbody>
+	</table>
+	<p class="calc__note cascade__note" aria-live="polite"></p>
+	<p class="calc__note">Each ticket: 1,500 input + 300 output tokens. Haiku 5.5 at $0.10/$0.50 and Sonnet 5.5 at $2/$10 per million tokens (Oct 2026). Accuracies are assumptions: measure your own with evals (Module 5). The model assumes errors are independent, which flatters cascades: in reality, tickets that fool the small model also fool the check more often.</p>
+</section>
+
+<script>
+	const SMALL = (1500 * 0.1 + 300 * 0.5) / 1e6;
+	const LARGE = (1500 * 2 + 300 * 10) / 1e6;
+	for (const box of document.querySelectorAll<HTMLElement>('[data-cascade]')) {
+		const v = (n: string) => Number(box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.value);
+		const render = () => {
+			for (const n of ['easy', 'se', 'sh', 'le', 'lh', 'rec', 'ff']) box.querySelector<HTMLOutputElement>(`[name="${n}Out"]`)!.value = `${Math.round(v(n) * 100)}%`;
+			const e = v('easy');
+			const mix = (a: number, b: number) => e * a + (1 - e) * b;
+			// Cascade, per difficulty: keep the small answer unless flagged; flagged tickets get the large model's answer.
+			const flag = (s: number) => (1 - s) * v('rec') + s * v('ff');
+			const acc = (s: number, l: number) => s * (1 - v('ff')) + flag(s) * l;
+			const escal = mix(flag(v('se')), flag(v('sh')));
+			const rows: [string, number, number][] = [
+				['Always small', mix(v('se'), v('sh')), SMALL],
+				['Always large', mix(v('le'), v('lh')), LARGE],
+				['Cascade', mix(acc(v('se'), v('le')), acc(v('sh'), v('lh'))), SMALL + escal * LARGE],
+			];
+			box.querySelector('.cascade__table tbody')!.innerHTML = rows
+				.map(([name, a, c]) => `<tr><td>${name}</td><td>${(a * 100).toFixed(1)}%</td><td>$${(c * 1000).toFixed(2)}</td></tr>`)
+				.join('');
+			const [, large, casc] = rows;
+			box.querySelector('.cascade__note')!.textContent =
+				`The cascade escalates ${(escal * 100).toFixed(0)}% of tickets and costs ${Math.round((casc[2] / large[2]) * 100)}% of always-large, ` +
+				(casc[1] >= large[1] - 0.005 ? 'at about the same accuracy.' : `but loses ${((large[1] - casc[1]) * 100).toFixed(1)} points of accuracy. The check is the bottleneck: improve what it catches.`);
+		};
+		box.addEventListener('input', render);
+		render();
+	}
+</script>

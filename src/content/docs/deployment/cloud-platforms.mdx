@@ -1,0 +1,168 @@
+---
+title: Cloud AI platforms and multi-provider fallback
+description: Running Claude through Amazon Bedrock, Google Vertex AI and Microsoft Foundry as well as the first-party API. Why enterprises choose them, what differs (features, quotas, regions, pricing), one client factory for all four (tested), and same-model fallback across platforms.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Blocked by procurement, not by code" severity="SEV3">
+Relay's pilot at a bank went well. Then the bank's procurement team said: "We can't sign a contract with a new AI vendor this year. Can it run through our existing AWS account?" The engineering answer was "yes, the same models are on Amazon Bedrock". The real answer took three weeks: two features used API capabilities that weren't available on that platform, the bank's account had a low default quota for the model, and the region they required didn't offer it yet.
+</Incident>
+
+As an FDE you'll often deploy into a customer's cloud, not your own. The same Claude models are available through several routes, and the choice is usually made by **procurement, security and data-residency requirements**, not by engineers.
+
+## The routes
+
+| Route | Operated by | Why customers choose it |
+|---|---|---|
+| **Claude API** (first-party) | Anthropic | Newest features first; simplest setup |
+| **Amazon Bedrock** | AWS | Existing AWS contract and billing, IAM, VPC endpoints, AWS regions |
+| **Google Cloud Vertex AI** | Google Cloud | Existing Google Cloud contract, IAM, regions |
+| **Microsoft Foundry** | Microsoft | Existing Azure contract and Entra ID |
+
+Anthropic also offers Anthropic-operated options inside cloud marketplaces (for example Claude Platform on AWS). Names and options evolve; check current offerings when you start an engagement.
+
+## What actually differs
+
+| Dimension | What to check |
+|---|---|
+| **Feature availability** | Core features (messages, streaming, tools, structured outputs, prompt caching, PDFs, citations) are broadly available. Newer or server-side features vary: for example, the Message Batches API, the Files API, some server tools and the MCP connector aren't available on every platform. Check the platform's feature matrix for every feature your app uses |
+| **Model and region availability** | Which models are enabled in which regions, and in the customer's account |
+| **Quotas** | Cloud accounts often start with low default quotas per model and region; increases take time. Request them early |
+| **Model IDs** | Bedrock uses an `anthropic.` prefix; Vertex AI and Foundry use the plain model ID for current models |
+| **Authentication** | Each cloud's own identity: IAM roles, Google Application Default Credentials, Entra ID or keys. No Anthropic API key |
+| **Pricing and billing** | Billed through the cloud account; partner pricing can differ from first-party rates |
+| **Networking** | Private endpoints (no public internet path) are often a hard requirement in banks and healthcare |
+
+## One factory, four platforms
+
+The Anthropic Python SDK has a client class per platform, with the same `messages.create` surface afterwards, so your features don't change:
+
+```python
+"""One factory for every platform Relay can run on. Features call `client.messages.create` the same way."""
+import os
+
+from anthropic import Anthropic, AnthropicBedrockMantle, AnthropicFoundry, AnthropicVertex
+
+MODEL = "claude-sonnet-5-5"
+
+
+def make_client(platform: str):
+    """Return (client, model_id) for a platform. Credentials come from the platform's usual sources."""
+    match platform:
+        case "anthropic":   # ANTHROPIC_API_KEY (or another credential source the SDK supports)
+            return Anthropic(), MODEL
+        case "bedrock":     # AWS credentials chain (role, profile, env); model IDs take an "anthropic." prefix
+            return AnthropicBedrockMantle(aws_region=os.environ["AWS_REGION"]), f"anthropic.{MODEL}"
+        case "vertex":      # Google Application Default Credentials; same model ID as first-party
+            return AnthropicVertex(project_id=os.environ["GCP_PROJECT"], region=os.environ.get("GCP_REGION", "global")), MODEL
+        case "foundry":     # an Azure AI Foundry resource and key (or an Entra ID token provider)
+            return AnthropicFoundry(resource=os.environ["FOUNDRY_RESOURCE"], api_key=os.environ["FOUNDRY_API_KEY"]), MODEL
+    raise ValueError(f"unknown platform {platform!r}")
+```
+
+Constructed with test credentials (no calls made), the factory produces:
+
+```text
+anthropic Anthropic                model=claude-sonnet-5-5              endpoint=https://api.anthropic.com
+bedrock   AnthropicBedrockMantle   model=anthropic.claude-sonnet-5-5    endpoint=https://bedrock-mantle.eu-central-1.api.aws/anthropic/
+vertex    AnthropicVertex          model=claude-sonnet-5-5              endpoint=https://europe-west1-aiplatform.googleapis.com/v1/
+foundry   AnthropicFoundry         model=claude-sonnet-5-5              endpoint=https://acme-ai.services.ai.azure.com/anthropic/
+```
+
+Your features call `client.messages.create(model=model_id, ...)` exactly as before. The platform-specific parts (credentials, region, model ID) live in one place, chosen by configuration per deployment.
+
+## Same-model fallback across platforms
+
+Module 9's gateway falls back when a provider fails. The safest fallback is **the same model through a different platform or region**: same behaviour, same prompts, same evals.
+
+<Diagram
+	caption="Primary and fallback serve the same model, so a failover changes the route, not the behaviour."
+	code={`flowchart LR
+    G["Gateway"] -- "primary" --> A["Claude API<br/>claude-sonnet-5-5"]
+    G -- "fallback (breaker open)" --> B["Bedrock eu-central-1<br/>anthropic.claude-sonnet-5-5"]
+    G -. "second fallback" .-> C["Vertex AI europe-west1<br/>claude-sonnet-5-5"]`}
+/>
+
+What makes it work in practice:
+
+1. **Only use features available on every route** in the fallback path, or make the fallback path degrade explicitly (for example, no server-side web search in fallback mode).
+2. **Quota on the fallback route** must be sized for failover traffic, not for its normal trickle. An untested fallback with a tiny quota fails at the worst moment.
+3. **Data-residency rules apply to the fallback too.** A European customer's fallback must also be in an allowed region.
+4. **Exercise the fallback**: route a small share of traffic through it continuously, or run regular game days (Module 9), so you know it works.
+5. **Record the route on every span**, and alert when fallback traffic stays high.
+
+<FailureCard
+	title="The fallback that had never run"
+	symptom="During a provider incident, the failover to the secondary platform immediately failed too."
+	cause="The fallback route had a default quota of a few requests per minute, a model ID with the wrong prefix, and used a feature that platform didn't support. It had never received real traffic."
+	detect="Synthetic traffic through every route, continuously."
+	fix="Keep 1–5% of real traffic on the fallback route at all times (or scheduled game days), with quotas sized for failover."
+/>
+
+<FailureCard
+	title="Feature drift between platforms"
+	symptom="A new feature works in staging (first-party API) and returns 400 errors in production (a cloud platform)."
+	cause="The feature wasn't yet available on the production platform. Staging and production used different routes."
+	detect="Run staging on the same platform as production; integration tests per route."
+	fix="Keep a feature matrix per route in your repo, and check it in design review before adopting a new API feature."
+/>
+
+<ThinkFirst question="A German insurance customer requires: data processed only in the EU, no public internet path from their VPC, and billing through their existing Azure contract. What do you check before promising Relay can run there?">
+
+1. **Model and region:** is the model Relay needs available through Microsoft Foundry in an EU region the customer accepts, and in their tenant?
+2. **Features:** every API feature Relay uses (prompt caching, structured outputs, citations, PDF input, any server tools, Batches, Files) against Foundry's feature matrix. Plan replacements for anything missing (for example, your own batch job instead of the Batch API).
+3. **Networking:** private connectivity from their VPC/VNet to the endpoint, with no public internet path.
+4. **Quota:** expected peak requests and tokens per minute, and the process and lead time for increases.
+5. **Data handling:** retention and logging terms on that route, in writing, for their DPO.
+6. **The rest of Relay's stack:** vector DB, observability, queues; all must also stay in the EU and inside their network rules. The model is only one of the data flows.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** list every Claude API feature Relay uses, and check each against one cloud platform's documentation.
+- **Stretch:** add the client factory to Relay's gateway, with the platform per route set by configuration, and the route recorded on every span.
+- **Boss level:** if you have access to a cloud account, deploy the same Relay feature on two routes, run the eval suite on both, and run a failover drill: break the primary and show the gateway serving from the fallback with identical eval results.
+
+</Practice>
+
+<Quiz
+	id="m11-platforms"
+	questions={[
+		{
+			q: 'Why do enterprises often run Claude through their cloud platform?',
+			options: ['It is always cheaper', 'Existing contracts and billing, cloud identity, private networking and regional requirements', 'Better models', 'Faster tokens'],
+			answer: 1,
+			why: 'The decision is usually about procurement, security and residency.',
+		},
+		{
+			q: 'What is the safest fallback for a provider outage?',
+			options: ['A different, smaller model', 'The same model through another platform or region', 'A cached answer', 'No fallback'],
+			answer: 1,
+			why: 'Same model, same behaviour, same evals.',
+		},
+		{
+			q: 'What usually breaks an untested fallback route?',
+			options: ['The model', 'Low default quotas, wrong model IDs, and features unavailable on that platform', 'The prompt', 'Network speed'],
+			answer: 1,
+			why: 'Keep traffic flowing through the fallback so these surface early.',
+		},
+		{
+			q: 'How do Bedrock model IDs differ from first-party IDs?',
+			options: ['They are the same', 'They take an "anthropic." prefix', 'They include the region', 'They are numbers'],
+			answer: 1,
+			why: 'Keep platform-specific details in one factory.',
+		},
+	]}
+/>
+
+<LessonComplete id="deployment/cloud-platforms" />

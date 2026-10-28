@@ -1,0 +1,65 @@
+---
+// Threshold tuner for a semantic cache, using real similarity scores computed in the lesson's test.
+interface Pair {
+	cached: string;
+	query: string;
+	same: boolean;
+	sim: number;
+}
+interface Props {
+	pairs: Pair[];
+}
+const { pairs } = Astro.props;
+---
+
+<section class="calc semtune not-content" data-semtune={JSON.stringify(pairs)}>
+	<p class="calc__badge">🎯 Semantic cache tuner: pick a similarity threshold</p>
+	<div class="calc__grid">
+		<label>Reuse the cached answer when similarity ≥ <output name="thrOut"></output>
+			<input type="range" name="thr" min="0.80" max="1.00" step="0.005" value="0.90" />
+		</label>
+	</div>
+	<div class="calc__out">
+		<div><span>Correct reuses</span><strong data-o="good"></strong></div>
+		<div><span>Wrong answers served</span><strong data-o="bad"></strong></div>
+		<div><span>Missed reuses</span><strong data-o="miss"></strong></div>
+	</div>
+	<ul class="semtune__list"></ul>
+	<p class="calc__note semtune__note" aria-live="polite"></p>
+</section>
+
+<script>
+	type Pair = { cached: string; query: string; same: boolean; sim: number };
+	for (const box of document.querySelectorAll<HTMLElement>('[data-semtune]')) {
+		const pairs: Pair[] = JSON.parse(box.dataset.semtune!);
+		const input = box.querySelector<HTMLInputElement>('[name="thr"]')!;
+		const render = () => {
+			const thr = Number(input.value);
+			box.querySelector<HTMLOutputElement>('[name="thrOut"]')!.value = thr.toFixed(3);
+			let good = 0, bad = 0, miss = 0;
+			const sorted = [...pairs].sort((a, b) => b.sim - a.sim);
+			box.querySelector('.semtune__list')!.innerHTML = sorted
+				.map((p) => {
+					const hit = p.sim >= thr;
+					const kind = hit ? (p.same ? 'good' : 'bad') : p.same ? 'miss' : 'ok';
+					if (kind === 'good') good++;
+					if (kind === 'bad') bad++;
+					if (kind === 'miss') miss++;
+					const label = { good: '✅ reused, correct', bad: '❌ reused, WRONG answer', miss: '⚪ miss (paid for a new call)', ok: '✅ miss, correct' }[kind];
+					return `<li class="semtune__row semtune__row--${kind}"><code>${p.sim.toFixed(3)}</code> <span>“${p.query}”<small>cached: “${p.cached}” · ${label}</small></span></li>`;
+				})
+				.join('');
+			box.querySelector('[data-o="good"]')!.textContent = String(good);
+			box.querySelector('[data-o="bad"]')!.textContent = String(bad);
+			box.querySelector('[data-o="miss"]')!.textContent = String(miss);
+			box.querySelector('.semtune__note')!.textContent =
+				bad === 0 && good === 0
+					? 'No wrong answers, but no reuse either: at this threshold the cache does nothing.'
+					: bad === 0
+						? 'No wrong answers at this threshold. Check the list: is the reuse rate worth running a cache?'
+						: `Every threshold that reuses anything also serves wrong answers here: the highest-scoring pair is a question with the opposite meaning. Similarity is not equivalence.`;
+		};
+		input.addEventListener('input', render);
+		render();
+	}
+</script>

@@ -154,18 +154,18 @@ You build one product the whole way through, like a real FDE engagement. *Acme L
 5. [Incident response for AI features](/llmops/incident-response/): kill switches, runbooks, blast-radius queries, blameless post-mortems, and the Module 9 lab
 
 #### Module 10 · Performance & Cost Optimization *(week 19)*
-- **Provider prompt caching** (the biggest safe win) and the silent things that break it
-- **Semantic caching** with Redis: thresholds, per-tenant isolation, and when it returns *wrong* answers
-- Model routing and cascades; reasoning-effort tuning; batch APIs
-- Prompt compression (LLMLingua-style): when it's worth it
-- Concurrency with asyncio, queues and background jobs; latency budgets
+1. [Prompt caching](/performance/prompt-caching/): the prefix match, breakpoints and TTLs, economics, silent cache breakers, a prefix auditor (tested), and the 🧊 cache lab
+2. [Semantic caching](/performance/semantic-caching/): why similarity isn't equivalence (tested, with failures), tenant and entity scoping, exact-match caching, and the 🎯 threshold tuner
+3. [Model routing, cascades, effort and batch](/performance/routing-and-cascades/): the lever order, routers vs cascades (simulated), the cascade calculator, the Batch API
+4. [Putting prompts on a token diet](/performance/token-diet/): trimming tool results (tested), output tokens, prompt compression, cutting with evals
+5. [Concurrency, queues and latency budgets](/performance/concurrency-and-latency/): bounded async concurrency (tested), separating background work, latency budgets, and the Module 10 lab
 
 #### Module 11 · Deployment & Models *(weeks 20–21)*
-- Containerizing and deploying AI services; cloud AI platforms (Bedrock, Vertex AI, Azure AI Foundry)
-- Provider outages: multi-provider fallback
-- Open-weight models with vLLM/Ollama: when self-hosting pays off
-- Fine-tuning and distillation: when it beats prompting + RAG (LoRA/SFT)
-- Multimodal inputs and voice/realtime agents (overview)
+1. [Deploying AI services](/deployment/deploying-ai-services/): streaming through proxies, timeouts, disconnects (tested), health checks, graceful shutdown, scaling on concurrency
+2. [Cloud AI platforms and multi-provider fallback](/deployment/cloud-platforms/): Bedrock, Vertex AI and Foundry, what differs, one client factory (tested), same-model fallback
+3. [Open-weight models and self-hosting](/deployment/open-weight-models/): vLLM and Ollama, what you take on, a break-even calculator, hybrid designs
+4. [Fine-tuning and distillation](/deployment/fine-tuning/): when to tune, SFT/LoRA/preference tuning/distillation, a leakage checker (tested), honest evaluation
+5. [Multimodal inputs and voice agents](/deployment/multimodal-and-voice/): image cost and preparation (tested), PDFs, voice pipelines, and the Module 11 lab
 
 ### Phase 6: The field
 
@@ -224,5 +224,7 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 | Module 7 · MCP & Enterprise Integrations | ✅ Ready |
 | Module 8 · Safe Tool Execution & AI Security | ✅ Ready |
 | Module 9 · LLMOps & Observability | ✅ Ready |
+| Module 10 · Performance & Cost Optimization | ✅ Ready |
+| Module 11 · Deployment & Models | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
-| Modules 10–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
+| Module 12, electives, C2–C3, capstones | 📝 Planned (outlined above) |

@@ -1,0 +1,86 @@
+[
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "How can I cancel my shipment?",
+  "same": true,
+  "sim": 0.988
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "What's the process to cancel a shipment?",
+  "same": true,
+  "sim": 0.857
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "I want to cancel my delivery, how?",
+  "same": true,
+  "sim": 0.949
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "Cancel my shipment please, how does it work",
+  "same": true,
+  "sim": 0.929
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "How do I NOT cancel my shipment?",
+  "same": false,
+  "sim": 0.994
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "How do I cancel my subscription?",
+  "same": false,
+  "sim": 0.958
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "How do I reschedule my shipment?",
+  "same": false,
+  "sim": 0.982
+ },
+ {
+  "cached": "How do I cancel my shipment?",
+  "query": "How do I track my shipment?",
+  "same": false,
+  "sim": 0.962
+ },
+ {
+  "cached": "What are your delivery hours?",
+  "query": "When do you deliver?",
+  "same": true,
+  "sim": 0.881
+ },
+ {
+  "cached": "What are your delivery hours?",
+  "query": "What time do drivers deliver?",
+  "same": true,
+  "sim": 0.86
+ },
+ {
+  "cached": "What are your delivery hours?",
+  "query": "Delivery hours?",
+  "same": true,
+  "sim": 0.877
+ },
+ {
+  "cached": "What are your delivery hours?",
+  "query": "What are your delivery hours on Sunday?",
+  "same": false,
+  "sim": 0.965
+ },
+ {
+  "cached": "What are your delivery hours?",
+  "query": "What are your office hours?",
+  "same": false,
+  "sim": 0.939
+ },
+ {
+  "cached": "What are your delivery hours?",
+  "query": "What are your delivery charges?",
+  "same": false,
+  "sim": 0.937
+ }
+]

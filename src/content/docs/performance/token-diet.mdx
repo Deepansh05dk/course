@@ -1,0 +1,167 @@
+---
+title: Putting prompts on a token diet
+description: Cutting tokens without cutting quality. Trimming tool results and documents (tested), controlling output length, managing long histories, prompt compression (LLMLingua-style) and when it's worth it, and measuring every cut with evals.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import ContextBudget from '../../../components/ContextBudget.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="108,000 tokens to answer 'how many are late?'" severity="SEV3">
+An ops manager asked Relay's agent "How many of our shipments are late this week?". The `search_shipments` tool returned all 340 matching shipments as pretty-printed JSON, including a raw carrier payload with 12 tracking events per shipment: about 108,000 tokens. The model answered correctly ("41"). It also re-sent those 108,000 tokens on each of the next four turns of the conversation. One question cost more than a hundred normal ones.
+</Incident>
+
+Input tokens usually dominate the bill, and in agent loops every token that enters the context is **paid for again on every later turn** (Module 6). The cheapest token is the one you never send.
+
+## Where the tokens hide
+
+Measure before cutting. In most AI products, the big consumers are:
+
+| Source | Typical problem | Fix |
+|---|---|---|
+| **Tool results** | Whole records, raw payloads, hundreds of rows | Project to needed fields, paginate, summarize counts |
+| **Retrieved documents** | Too many chunks, or whole documents "to be safe" | Better retrieval and reranking (Module 4); fewer, better chunks |
+| **Conversation history** | Long sessions re-sending everything | Compaction or context editing for long sessions (Module 6) |
+| **System prompt** | Years of accumulated rules and examples, many obsolete | Prune with evals; newer models need fewer instructions |
+| **Output** | Verbose answers, unneeded explanations, long reasoning on easy tasks | Format instructions, structured outputs, lower effort |
+| **Images and PDFs** | Full-resolution images when a thumbnail would do | Downscale to what the task needs (Module 11) |
+
+<ContextBudget />
+
+## Trim tool results at the source
+
+The highest-leverage fix is in your tools (Module 7's "bounded outputs"), because it applies to every conversation automatically. Two small helpers, tested on the incident's data:
+
+```python
+"""Keep tool results small before they enter the context (and every later turn's input)."""
+import json
+
+
+def trim_rows(rows: list[dict], keep_fields: list[str], max_rows: int = 20) -> str:
+    """Project to the fields the model needs, cap the row count, and say what was left out."""
+    shown = [{k: r.get(k) for k in keep_fields} for r in rows[:max_rows]]
+    note = f"\n(showing {len(shown)} of {len(rows)} rows; ask with filters to see others)" if len(rows) > max_rows else ""
+    return json.dumps(shown, separators=(",", ":"), ensure_ascii=False) + note
+
+
+def trim_text(text: str, max_chars: int = 4000) -> str:
+    """Keep the head and tail of a long text (logs, documents); mark the cut."""
+    if len(text) <= max_chars:
+        return text
+    head, tail = text[: max_chars * 3 // 4], text[-max_chars // 4:]
+    return f"{head}\n[... {len(text) - len(head) - len(tail):,} characters omitted ...]\n{tail}"
+```
+
+```text
+raw tool result:   432,324 chars  (~108,081 tokens)
+trimmed:             1,529 chars  (~382 tokens)
+"in_transit","eta":"2026-11-06"}]
+(showing 20 of 340 rows; ask with filters to see others)
+log: 180,031 -> 4,038 chars; error kept: True
+```
+
+From ~108,000 tokens to ~380, and the model still has what it needs: the fields that matter, the total, and an instruction for getting more. For logs and long documents, keeping the head and tail preserves the beginning (context) and the end (where the error usually is).
+
+Better still: **give the model tools that compute**. A `count_shipments(status, since)` tool returns "41". The model doesn't need 340 rows to count them.
+
+## Output tokens
+
+Output tokens cost several times more than input tokens (5× on current Claude models) and they're generated one by one, so they're also your latency.
+
+- **Say what you want, precisely:** "Reply in at most 3 sentences" or "Return only the category" beats hoping for brevity.
+- **Structured outputs** (Module 1) remove preamble and wrapping text for machine-consumed results.
+- **Effort** controls how much the model thinks before answering (lesson 3). Easy, high-volume routes rarely need high effort.
+- **`max_tokens` is a safety cap, not a length control.** Hitting it truncates the answer mid-sentence. Set it generously, and control length with instructions.
+
+## Prompt compression
+
+**Prompt compression** methods (the LLMLingua family is the best-known) use a small model to drop tokens that carry little information, rewriting a long context into a shorter one that the large model can still use. Reported compression ratios are large on some benchmarks.
+
+In production, weigh it carefully:
+
+| For | Against |
+|---|---|
+| Can cut very long, verbose contexts (transcripts, logs) substantially | An extra model step adds latency and infrastructure |
+| Works without changing the main model | Compressed text varies per request, which **defeats prompt caching** for that content |
+| | Drops details unpredictably, and the dropped detail may be the one that mattered (an ID, a negation, a number) |
+| | Simpler fixes (better retrieval, trimmed tool results, summaries) often get most of the gain |
+
+A sensible rule: reach for compression only for long, **unique**, low-density content (call transcripts, chat logs) after the simpler fixes, and evaluate it on your task. Never compress the stable prefix you're caching.
+
+## Every cut needs an eval
+
+Each of these changes can silently reduce quality: a dropped field the model needed, a summary that lost the key fact, a "concise" instruction that removed the safety caveat. Treat token cuts like any other change: run the eval suite (Module 5), compare quality and cost side by side, and keep the cut only when quality holds.
+
+<FailureCard
+	title="The field that went missing"
+	symptom="After a token-saving change, Relay started telling customers their insured shipments weren't insured."
+	cause="The trimmed shipment tool result dropped the `insurance` field, which looked unimportant. The model filled the gap with a guess."
+	detect="Evals covering insurance questions failed, once someone added them; until then, customer complaints."
+	fix="Decide fields per tool with the people who know the domain, run the full eval suite on every trim, and make 'unknown' explicit rather than absent."
+/>
+
+<FailureCard
+	title="The prompt nobody dared to shorten"
+	symptom="The system prompt has grown to 9,000 tokens of rules, many contradicting each other."
+	cause="Every incident added a rule; none were ever removed, because nobody knew which ones mattered."
+	detect="Ablation: remove a section and run the evals. If nothing changes, the section isn't earning its tokens."
+	fix="Prune with evals, one section at a time. Prompts written for older models are often too prescriptive for newer ones."
+/>
+
+<ThinkFirst question="A Relay conversation about a damage claim routinely reaches 60,000 input tokens per turn by turn 15. Where would you look first, and what would you change?">
+
+Look at a trace (Module 9) and break the 60,000 tokens down by source. Typically:
+
+1. **Tool results kept in history:** the first turns fetched the shipment, the customer overview, the policy search and photo metadata. They're re-sent every turn even though they were only needed once. Fix: trim tool results at the source, and clear old tool results with context editing once they've been used.
+2. **Retrieval on every turn:** if every turn retrieves 8 policy chunks again, the history fills with repeats. Fix: retrieve once per topic, or only when needed (agentic retrieval, Module 4).
+3. **Verbose assistant turns:** long explanations repeated back each turn. Fix: shorter answer style for agent-internal turns.
+
+Then confirm with caching in place: with an append-only conversation, most of those tokens should be cache reads (lesson 1), which makes the remaining cost much smaller than "60,000 tokens per turn" suggests. Optimize the **uncached** tokens and the context size first.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** for every Relay tool, measure the average size of its result in tokens. Trim the largest one.
+- **Stretch:** add a `count_shipments` tool and a projection with pagination to `search_shipments`; measure tokens per conversation before and after on your eval set, with quality unchanged.
+- **Boss level:** ablate Relay's system prompt section by section with your eval suite. Remove every section that doesn't move the scores, and report the token savings and the (unchanged) quality.
+
+</Practice>
+
+<Quiz
+	id="m10-token-diet"
+	questions={[
+		{
+			q: 'Why are large tool results especially expensive in agents?',
+			options: ['They are slow to parse', 'They stay in the history and are re-sent on every later turn', 'Tools cost extra', 'They break streaming'],
+			answer: 1,
+			why: 'Every token in the context is paid for again on each turn (partly mitigated by caching).',
+		},
+		{
+			q: 'What is max_tokens for?',
+			options: ['Controlling answer length', 'A safety cap: hitting it truncates the answer, so set it generously and control length with instructions', 'Saving input tokens', 'Caching'],
+			answer: 1,
+			why: 'Truncated answers are failures, not short answers.',
+		},
+		{
+			q: 'Why is prompt compression a poor fit for the stable part of your prompt?',
+			options: ['It is too slow', 'Compressed output varies, which defeats prompt caching, and the stable prefix is already cheap when cached', 'It is illegal', 'It only works on code'],
+			answer: 1,
+			why: 'Cache the stable prefix; consider compression only for long, unique content.',
+		},
+		{
+			q: 'How do you know a token cut is safe?',
+			options: ['It looks fine in a demo', 'The eval suite shows quality unchanged while cost drops', 'The prompt is shorter', 'The model doesn\'t complain'],
+			answer: 1,
+			why: 'Token cuts are quality changes. Measure them.',
+		},
+	]}
+/>
+
+<LessonComplete id="performance/token-diet" />

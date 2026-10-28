@@ -26,6 +26,8 @@ export default defineConfig({
 				{ label: '7 · MCP & Integrations', items: [{ autogenerate: { directory: 'mcp' } }] },
 				{ label: '8 · AI Security', items: [{ autogenerate: { directory: 'security' } }] },
 				{ label: '9 · LLMOps & Observability', items: [{ autogenerate: { directory: 'llmops' } }] },
+				{ label: '10 · Performance & Cost', items: [{ autogenerate: { directory: 'performance' } }] },
+				{ label: '11 · Deployment & Models', items: [{ autogenerate: { directory: 'deployment' } }] },
 				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
 			],
 		}),

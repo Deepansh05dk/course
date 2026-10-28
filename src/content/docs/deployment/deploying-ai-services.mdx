@@ -1,0 +1,246 @@
+---
+title: Deploying AI services
+description: What changes when you deploy a service whose requests last 30 seconds and stream. Streaming through proxies, timeouts, client disconnects (tested), health checks, graceful shutdown, scaling on concurrency, secrets, and a production Dockerfile.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="It streamed on my laptop" severity="SEV2">
+Relay's streaming chat worked perfectly in development: words appeared as they were generated. In production, users stared at a spinner for 12 seconds, then the whole answer appeared at once. Some long answers never appeared: they were cut off at exactly 60 seconds. The code was identical. The difference was everything **between** the code and the user: a reverse proxy buffering responses, and a load balancer with a 60-second idle timeout.
+</Incident>
+
+A typical web request takes 50 milliseconds. An AI request takes 2 to 60 seconds, streams, costs money for every second it runs, and sometimes runs for minutes (agents). Infrastructure defaults were designed for the first kind.
+
+## The path of a streamed answer
+
+<Diagram
+	caption="Every hop between the model and the browser can buffer the stream or cut it off. Check each one."
+	code={`flowchart LR
+    B["Browser"] <--> CDN["CDN / WAF"] <--> LB["Load balancer"] <--> RP["Reverse proxy<br/>(nginx, ingress)"] <--> APP["App server<br/>(FastAPI + uvicorn)"] <--> M["Model API"]`}
+/>
+
+| Hop | Typical default | What to set |
+|---|---|---|
+| **Reverse proxy** (nginx) | Buffers proxied responses (`proxy_buffering on`) | Disable buffering for streaming routes (`proxy_buffering off`), or send `X-Accel-Buffering: no` from the app; raise `proxy_read_timeout` |
+| **Load balancer** | Idle timeouts around 60 seconds | Raise it for streaming routes, and send periodic data (SSE comments as heartbeats) during long pauses |
+| **CDN / WAF** | May buffer or not support streaming responses | Bypass the CDN for the streaming API, or confirm streaming support |
+| **App server** | Request timeouts, worker timeouts | Async workers; timeouts sized for the longest legitimate request |
+| **Compression** | Some gzip layers buffer to compress efficiently | Don't compress event streams, or verify the layer flushes per chunk |
+
+## A streaming endpoint that behaves well
+
+```python
+"""Relay's AI service: a streaming endpoint, health checks, and settings from the environment."""
+import asyncio
+import json
+import os
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+if os.environ.get("ENABLE_GZIP") == "1":
+    app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
+async def fake_model_stream(question: str):  # stands in for client.messages.stream(...)
+    for word in f"Your pallet for '{question}' is delayed in Antwerp, new ETA Friday.".split():
+        await asyncio.sleep(0.15)
+        yield word + " "
+
+
+@app.get("/healthz")              # liveness: the process is up (no model call!)
+async def healthz():
+    return {"ok": True}
+
+
+@app.get("/readyz")               # readiness: config loaded, dependencies reachable
+async def readyz():
+    return {"ready": bool(os.environ.get("MODEL_ID"))}
+
+
+@app.post("/chat")
+async def chat(request: Request):
+    body = await request.json()
+
+    async def events():
+        sent = 0
+        try:
+            async for text in fake_model_stream(body["question"]):
+                if await request.is_disconnected():   # user closed the tab: stop paying for tokens
+                    break
+                sent += 1
+                yield f"data: {json.dumps({'text': text})}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            print(f"stream ended after {sent} chunks", flush=True)  # in production: a span attribute
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},  # tell nginx-style proxies not to buffer
+    )
+```
+
+Three things this service does deliberately:
+
+1. **Stops when the user leaves.** If the browser disconnects, the generator stops, and with a real SDK stream (inside `async with client.messages.stream(...)`) leaving the block closes the upstream request, so you stop paying for tokens nobody will read. Tested by closing the connection after a few words:
+
+```text
+stream ended after 3 chunks
+stream ended after 11 chunks
+```
+
+The first stream stopped after 3 chunks when the client left; the complete one ran all 11.
+
+2. **Tells proxies not to buffer** (`X-Accel-Buffering: no`, `Cache-Control: no-cache`).
+
+3. **Separates liveness from readiness**, and neither calls the model. A health check that calls the model costs money every few seconds and fails your whole fleet when the provider has a bad minute.
+
+We also tested whether FastAPI's own `GZipMiddleware` buffers the stream:
+
+```text
+gzip middleware off: first bytes after 0.21s, total 1.73s, 12 network chunks, content-encoding=none
+gzip middleware on : first bytes after 0.21s, total 1.73s, 12 network chunks, content-encoding=none
+```
+
+It doesn't: the current Starlette version skips compression for `text/event-stream`, so the first bytes still arrive after ~0.2 s either way. That's the right result to check for, not to assume. The buffering in the incident came from the reverse proxy in front of the app, which this test environment didn't have. Test streaming **through your real infrastructure**, with a script that measures time to first byte from outside.
+
+## A production Dockerfile
+
+Not built in this course's environment (no container runtime was available), but standard practice:
+
+```dockerfile
+FROM python:3.12-slim AS base
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# Dependencies first, so code changes don't reinstall everything.
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
+
+COPY app/ app/
+COPY prompts/ prompts/
+RUN useradd --uid 10001 relay
+USER relay
+
+# Long graceful shutdown: let in-flight streams finish during deploys.
+CMD ["uvicorn", "app.service:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--timeout-graceful-shutdown", "60", "--proxy-headers"]
+```
+
+- **Prompts ship with the code** (Module 1), versioned together, or come from your AI config store (Module 9) by version.
+- **Secrets come from the platform** (a secrets manager, injected as environment variables or files), never baked into the image.
+- **Graceful shutdown:** during a deploy, stop accepting new requests and let in-flight streams finish. Set the orchestrator's termination grace period longer than your longest normal stream; otherwise every deploy cuts answers off mid-sentence.
+
+## Scaling AI services
+
+AI services are **I/O-bound**: a process spends most of its time waiting for the model. So:
+
+- **Scale on concurrency** (in-flight requests per instance) or on latency, not on CPU. CPU stays low while the instance is saturated with open streams.
+- **Async all the way** (lesson 5 of Module 10): one async worker can hold hundreds of open streams.
+- **The real ceiling is usually the provider's rate limit**, not your servers. Adding instances beyond it just creates 429s. Capacity planning is a conversation with your provider (or your cloud platform's quota settings, next lesson).
+- **Long agent tasks don't belong in web requests** at all: run them in workers (Module 6), and stream progress from there.
+
+<IncidentDrill
+	id="deploy-drill"
+	title="Answers cut off at 60 seconds"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'After moving Relay to a new cluster, long answers stop abruptly, always around 60 seconds. Short answers are fine. First step?',
+			choices: [
+				{ label: 'Check every hop\'s timeout settings (load balancer idle timeout, proxy read timeout, app server) against the 60 s pattern', next: 's2', cost: 5 },
+				{ label: 'Lower max_tokens so answers finish sooner', next: 's1b', cost: 25, note: 'Now answers are short AND some still get cut off when the model is slow.' },
+				{ label: 'Switch to a faster model', next: 's1b', cost: 25, note: 'A guess, with quality consequences, and it doesn\'t fix the cause.' },
+			],
+		},
+		s1b: { text: 'Still cut off on slow responses. Now?', choices: [{ label: 'Check every hop\'s timeouts', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'The load balancer has a 60 s idle timeout. During long thinking phases no bytes are sent. Fix?',
+			choices: [
+				{ label: 'Raise the idle timeout for the streaming route AND send SSE heartbeat comments every 15 s during pauses', next: 's3', cost: 0 },
+				{ label: 'Raise the timeout to 1 hour for all routes', next: 'end_ok', cost: 5, note: 'It works, but now every stuck connection on every route lingers for an hour.' },
+			],
+		},
+		s3: {
+			text: 'Fixed. How do you keep it fixed?',
+			choices: [
+				{ label: 'A synthetic check that streams a long answer through the real public endpoint every few minutes and alerts on time-to-first-byte or cut-offs', next: 'end_good', cost: 0 },
+				{ label: 'Document it in the wiki', next: 'end_ok', cost: 0, note: 'The next infrastructure migration will reset the defaults again.' },
+			],
+		},
+		end_good: { text: 'Diagnosed from the pattern, fixed at the right hop, and guarded by a synthetic test.', end: 'good' },
+		end_ok: { text: 'It works today. Infrastructure defaults will bite again.', end: 'ok' },
+	}}
+/>
+
+<FailureCard
+	title="Every deploy cuts answers off"
+	symptom="A spike of truncated answers and user complaints at every deploy."
+	cause="The orchestrator gave pods 30 seconds to shut down; streams and agent steps took longer, so they were killed mid-answer."
+	detect="Truncated responses and client disconnects correlated with deploy times."
+	fix="Graceful shutdown (stop taking new requests, finish in-flight ones), a termination grace period longer than your longest stream, and durable agents that resume after restarts (Module 6)."
+/>
+
+<ThinkFirst question="Relay's CPU-based autoscaling never adds instances, yet users see 429s and long waits at peak. What's happening, and what do you change?">
+
+The instances are **I/O-bound**: each holds many open streams while the CPU idles, so a CPU-based autoscaler sees no reason to scale. At the same time, the 429s mean the **provider's rate limit** is being hit, and that's a ceiling more instances wouldn't raise.
+
+Changes:
+
+1. **Scale on in-flight requests per instance** (or on latency), not CPU.
+2. **Look at the rate-limit headroom** on the dashboard (Module 9). If the limit is the bottleneck: request a higher limit, use prompt caching (cached tokens may count differently against limits; check your provider's rules), move background work to separate budgets or the Batch API (Module 10), and add a fallback platform (next lesson).
+3. **Queue rather than fail:** for non-interactive work, a queue absorbs peaks; for interactive work, the gateway's backoff should be short, then degrade gracefully.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the service above, then use `curl -N` to watch it stream. Close curl early and see the "stream ended" line.
+- **Stretch:** put nginx in front of it (Docker Compose), first with default settings, then with buffering disabled. Measure time to first byte through the proxy in both cases.
+- **Boss level:** deploy Relay to a cloud environment with graceful shutdown, readiness checks, concurrency-based autoscaling, secrets from a secrets manager, and a synthetic streaming check that alerts on time to first byte.
+
+</Practice>
+
+<Quiz
+	id="m11-deploy"
+	questions={[
+		{
+			q: 'Streaming works locally but arrives all at once in production. What is the most likely cause?',
+			options: ['The model', 'A reverse proxy or another hop buffering the response', 'Python version', 'The prompt'],
+			answer: 1,
+			why: 'Check every hop: proxy buffering, CDN, compression.',
+		},
+		{
+			q: 'Why should a health check not call the model?',
+			options: ['It is slow', 'It costs money constantly and makes your whole fleet look unhealthy when the provider has a blip', 'It is not allowed', 'Models can\'t answer health checks'],
+			answer: 1,
+			why: 'Liveness and readiness check your service, not the provider.',
+		},
+		{
+			q: 'Why stop generating when the client disconnects?',
+			options: ['To save memory', 'You pay for every token generated, even if nobody reads it', 'The SDK requires it', 'For logging'],
+			answer: 1,
+			why: 'The test showed the stream stopping after 3 chunks instead of 11.',
+		},
+		{
+			q: 'What should AI services autoscale on?',
+			options: ['CPU', 'In-flight requests (concurrency) or latency', 'Memory only', 'Disk'],
+			answer: 1,
+			why: 'They are I/O-bound: CPU stays low while instances are saturated.',
+		},
+	]}
+/>
+
+<LessonComplete id="deployment/deploying-ai-services" />

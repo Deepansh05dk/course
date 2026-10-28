@@ -1,0 +1,188 @@
+---
+title: Multimodal inputs and voice agents
+description: Images, PDFs and documents as model inputs (cost, resolution, what goes wrong), a tested image-preparation helper, and an overview of voice and realtime agents with their latency budgets. Plus the Module 11 lab.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The damage photos that cost more than the damage" severity="SEV3">
+Relay's claims flow asked customers to upload photos of damaged goods. Phones produce 12-megapixel images, customers uploaded 8 to 15 per claim, and every photo was re-sent on every turn of the claim conversation. A single claim conversation consumed about 400,000 image tokens. For small claims, the AI review cost more than the compensation it was assessing.
+</Incident>
+
+Modern models read images, scanned documents, PDFs with tables and charts, and screenshots. That unlocks a lot of FDE work: invoices, delivery notes, damage photos, forms, dashboards. It also adds new costs and failure modes.
+
+## Images: cost scales with pixels
+
+Image tokens grow with resolution (on current Claude models, roughly one token per 28×28-pixel patch, with large images downscaled automatically to a maximum size). The cost depends on how many pixels you send, not on how much information the image holds. So **send what the task needs**:
+
+```python
+"""Control image cost: estimate tokens and downscale before sending."""
+import base64
+import io
+import math
+
+from PIL import Image
+
+PATCH = 28            # roughly one token per 28x28 pixel patch (check the vision docs for your model)
+MAX_LONG_EDGE = 2576  # high-resolution models: larger images are downscaled by the API anyway...
+MAX_PIXELS = 3.75e6   # ...and so are images above ~3.75 megapixels (so at most ~4,800 tokens per image)
+
+
+def estimate_tokens(width: int, height: int) -> int:
+    scale = min(1.0, MAX_LONG_EDGE / max(width, height), math.sqrt(MAX_PIXELS / (width * height)))
+    w, h = width * scale, height * scale
+    return math.ceil(w / PATCH) * math.ceil(h / PATCH)
+
+
+def prepare_image(data: bytes, max_long_edge: int = 1280) -> tuple[dict, int]:
+    """Downscale to what the task needs and return an API image block plus its estimated tokens."""
+    img = Image.open(io.BytesIO(data))
+    img.thumbnail((max_long_edge, max_long_edge))           # keeps aspect ratio, never upscales
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=85)
+    block = {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                         "data": base64.b64encode(buf.getvalue()).decode()}}
+    return block, estimate_tokens(*img.size)
+```
+
+```text
+phone photo of a damaged pallet  4032x3024: ~4,800 tokens as sent -> ~1,610 at 1280px (per 100k images: $960 -> $322)
+A4 scan at 300 dpi               2480x3508: ~4,897 tokens as sent -> ~1,518 at 1280px (per 100k images: $979 -> $304)
+screenshot                       1920x1080: ~2,691 tokens as sent -> ~1,196 at 1280px (per 100k images: $538 -> $239)
+```
+
+A damage photo at 1280 pixels still shows the crushed corner clearly, at about a third of the tokens. A screenshot of a form needs more resolution than a photo of a pallet. Choose per use case, verify the task still works with your evals, and use the API's token counting on real images instead of trusting estimates (the formula changes between model generations).
+
+Other image rules from production:
+
+- **Send each image once, where it's needed.** In a conversation, keep images in the turn where they were discussed rather than re-attaching them; or describe the image once (with a model) and carry the description forward.
+- **Put images before the question** about them, and say which image is which ("Image 1: the label. Image 2: the damaged corner.").
+- **For dense images (charts, tables, small text), let the model zoom.** A crop tool that returns a region at higher resolution often beats sending one huge image.
+- **Strip metadata** you don't want to process (EXIF GPS locations in customer photos are personal data).
+
+## Documents and PDFs
+
+Claude accepts PDFs directly: it reads both the extracted text and page images, so tables, charts and layout are visible. Use it for documents where layout matters. For large document collections you still want an ingestion pipeline (Module 4): extract, chunk and index once, rather than sending whole PDFs on every question.
+
+| Situation | Approach |
+|---|---|
+| One document, layout matters (an invoice, a form) | Send the PDF (or page images) directly, with structured outputs for the fields |
+| Many documents, questions across them | Ingestion pipeline + retrieval (Module 4); send only relevant pages |
+| Scanned documents | Check quality on your scans; poor scans need preprocessing (deskew, contrast) or a dedicated OCR step |
+| Citations required | Document blocks with citations enabled (Module 4), so answers point to pages |
+
+<FailureCard
+	title="Reading the wrong column"
+	symptom="Extracted invoice totals are sometimes the tax amount, sometimes the subtotal."
+	cause="Invoices from 40 suppliers have different layouts. The prompt said 'extract the total'; the model picked the most prominent number on some layouts."
+	detect="Field-level evals per supplier layout, and arithmetic checks (subtotal + tax = total)."
+	fix="Structured outputs with all three fields and a validation rule; per-layout examples for the worst suppliers; route failed validations to a human."
+/>
+
+## Voice and realtime agents
+
+Voice is a fast-growing area for support and operations (phone lines, drivers, warehouse staff). Two architectures:
+
+<Diagram
+	caption="A cascaded voice pipeline: three models, each adding latency. Realtime speech-to-speech models collapse the steps, trading control for speed."
+	code={`flowchart LR
+    M["Caller's audio"] --> STT["Speech-to-text<br/>(streaming)"]
+    STT --> T["Turn detection<br/>(did they finish?)"]
+    T --> L["LLM<br/>(streaming tokens, tools)"]
+    L --> TTS["Text-to-speech<br/>(streaming audio)"]
+    TTS --> O["Audio back to caller"]`}
+/>
+
+| | Cascaded (STT → LLM → TTS) | Realtime speech-to-speech |
+|---|---|---|
+| **Latency** | Higher: each stage adds time, so every stage must stream | Lower, more natural turn-taking |
+| **Control** | Full: you see the transcript, can apply guardrails and policy checks to text, can choose each model | Less visibility between hearing and speaking |
+| **Tools and logic** | Your normal agent stack (Modules 6–8) works unchanged | Tool support varies by product |
+| **Debugging** | Transcripts at every step | Harder |
+
+The hard parts of voice are rarely the model:
+
+- **Latency budget:** people expect a reply within roughly a second of finishing speaking. Speech recognition, end-of-turn detection, time to first token and time to first audio must all fit. Stream everything, keep prompts cached, and avoid slow tools on the hot path (or say "let me check that" while a tool runs).
+- **Turn-taking:** detecting when the caller has finished, and handling interruptions (the caller talks over the agent: stop speaking immediately).
+- **Telephony:** phone audio quality, call transfer to humans, recording consent and retention rules.
+- **Speech is a new injection channel:** anything said on the call is untrusted input, just like a chat message (Module 8).
+
+The planned Elective E3 goes deeper into voice.
+
+<ThinkFirst question="Acme wants drivers to report delivery problems by voice from their truck ('Pallet 3 is damaged, customer refused it'), creating a claim automatically. Sketch the design decisions that matter most.">
+
+1. **Cascaded pipeline**, because claims need a transcript (audit, evidence), policy checks on text, and Relay's existing tools.
+2. **Noise:** truck cabs are loud. Evaluate speech recognition on real recordings from trucks, with logistics vocabulary (pallet, consignee, ACM numbers spoken digit by digit), and confirm critical fields back ("Shipment ACM-2025-000183, pallet 3, refused. Correct?").
+3. **Structured output:** the model extracts `{shipment_id, item, problem_type, customer_refused, notes}` with validation; a failed validation asks a follow-up question.
+4. **Safety:** drivers are driving. Short, hands-free interactions, no reading long text back, and the claim is only **drafted**; the office approves it (Module 2's human-in-the-loop).
+5. **Offline gaps:** rural areas have no coverage; record locally and process when back online (a queue, Module 10).
+6. **Latency:** a quick acknowledgement matters more than speed of claim creation, which can happen asynchronously.
+
+</ThinkFirst>
+
+## 🧪 Module 11 lab: ship Relay to a real environment
+
+**Acceptance criteria:**
+
+1. **Containerized service** with a non-root user, secrets from the platform, liveness and readiness checks that don't call the model, and graceful shutdown longer than your longest stream.
+2. **Streaming verified end to end** through the real infrastructure (proxy, load balancer), with a synthetic check that alerts on time to first byte and on cut-off streams. Client disconnects stop generation.
+3. **Concurrency-based autoscaling**, with interactive and background traffic separated (Module 10).
+4. **A platform factory** with at least two routes configured (for example the Claude API and one cloud platform), a feature matrix for the features you use, and a failover drill with identical eval results on both routes.
+5. **A self-hosting decision** for one workload: eval results for an open model, a cost model with visible assumptions, and a written recommendation.
+6. **Image handling** for claim photos: downscaling, metadata stripping, images sent once per conversation, and an eval proving damage assessment quality held.
+7. `docs/module-11.md`: deployment architecture diagram, route matrix, and the decisions above with their evidence.
+
+<Practice title="Build it yourself: Module 11 wrap-up">
+
+- **Warm-up:** run the image helper on photos from your phone; compare the estimated tokens with the API's token count for the same images.
+- **Stretch:** add PDF invoice extraction to Relay with structured outputs and an arithmetic validation rule, evaluated per supplier layout.
+- **Boss level:** complete the Module 11 lab. A deployed service with a working, tested failover between two platforms is the kind of operational maturity customers' platform teams look for.
+
+</Practice>
+
+<Quiz
+	id="m11-final"
+	title="Module 11 final quiz"
+	questions={[
+		{
+			q: 'What determines an image\'s token cost?',
+			options: ['Its file size in KB', 'Its pixel dimensions (up to the model\'s maximum), not how much information it contains', 'Its format', 'Nothing; images are free'],
+			answer: 1,
+			why: 'Downscale to what the task needs.',
+		},
+		{
+			q: 'Why prefer a cascaded STT → LLM → TTS pipeline for a claims voice agent?',
+			options: ['It is always faster', 'Transcripts at every step enable audit, text guardrails and your existing tools', 'It is cheaper to build', 'Realtime models can\'t speak'],
+			answer: 1,
+			why: 'Control and auditability matter for actions with consequences.',
+		},
+		{
+			q: 'Long answers are cut off at exactly 60 seconds in production. First suspect?',
+			options: ['The model', 'An idle or read timeout at some hop (load balancer, proxy)', 'The prompt', 'The database'],
+			answer: 1,
+			why: 'Round numbers point at infrastructure defaults.',
+		},
+		{
+			q: 'Which knowledge problem should NOT be solved with fine-tuning?',
+			options: ['A consistent output format', 'Policies that change monthly', 'Ticket classification', 'A house style'],
+			answer: 1,
+			why: 'Changing knowledge belongs in retrieval.',
+		},
+		{
+			q: 'What makes a fallback platform route trustworthy?',
+			options: ['Documentation', 'Real traffic flowing through it continuously (or regular drills), with quotas sized for failover', 'A bigger model', 'Lower prices'],
+			answer: 1,
+			why: 'An unexercised fallback is a hypothesis, not a fallback.',
+		},
+	]}
+/>
+
+<LessonComplete id="deployment/multimodal-and-voice" />

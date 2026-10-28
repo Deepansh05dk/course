@@ -1,0 +1,196 @@
+---
+title: Concurrency, queues and latency budgets
+description: Making AI features fast and high-throughput. Async concurrency with limits and backoff (tested against a rate-limited fake provider), background jobs and queues, latency budgets, streaming and parallelism, plus the Module 10 lab.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="asyncio.gather(*everything)" severity="SEV2">
+A backfill script re-classified 80,000 old tickets with `asyncio.gather` over all of them at once. Within seconds, the provider returned `429 rate limited` to almost every request. The script retried them all immediately, so the retries were rate-limited too. Meanwhile, Relay's live chat (sharing the same API key and rate limit) started failing for customers. The backfill took down production.
+</Incident>
+
+## Three ways to call a model 60 times
+
+LLM calls are slow (seconds) and I/O-bound: your process spends almost all that time waiting. Concurrency helps enormously, but providers enforce **rate limits** (requests and tokens per minute, and sometimes concurrent requests). This test runs 60 calls against a fake provider that takes ~0.4 s per call and rejects requests beyond 10 in flight:
+
+```python
+"""Process many LLM calls concurrently, without tripping the provider's rate limits."""
+import asyncio
+import random
+
+
+class RateLimited(Exception):
+    pass
+
+
+async def classify_all(tickets, call, max_concurrency=8, max_retries=4):
+    """Run `call` for every ticket with bounded concurrency and retry-with-backoff on 429s."""
+    gate = asyncio.Semaphore(max_concurrency)
+
+    async def one(ticket):
+        for attempt in range(max_retries + 1):
+            async with gate:                       # at most max_concurrency requests in flight
+                try:
+                    return await call(ticket)
+                except RateLimited:
+                    if attempt == max_retries:
+                        raise
+            await asyncio.sleep(min(4.0, 0.25 * 2 ** attempt) * random.uniform(0.5, 1.0))  # back off OUTSIDE the gate
+
+    # return_exceptions: one failed ticket doesn't cancel the other 499
+    return await asyncio.gather(*(one(t) for t in tickets), return_exceptions=True)
+```
+
+```text
+sequential                    25.0s  ok 60/60  calls  60  rejected (429) 0
+gather, unbounded              0.5s  ok 10/60  calls  60  rejected (429) 50
+gather, unbounded + retries    3.8s  ok 57/60  calls 223  rejected (429) 166
+semaphore 8 + retries          3.2s  ok 60/60  calls  60  rejected (429) 0
+```
+
+- **Sequential:** correct, and 25 seconds.
+- **Unbounded `gather`:** 0.5 seconds, and **50 of 60 failed**. This is the incident.
+- **Unbounded with retries:** most succeed eventually, but it made **223 calls** for 60 tickets: 166 of them were rejected retries hammering an already overloaded limit.
+- **A semaphore of 8 plus backoff:** all 60 in 3.2 seconds, **zero** rejections, 60 calls. Bounded concurrency is both faster *and* kinder.
+
+Details that matter in the code: the backoff sleep happens **outside** the semaphore (a sleeping task shouldn't hold a slot); jitter spreads retries apart; `return_exceptions=True` keeps one failure from cancelling the rest. In real code you'd also honour the provider's `retry-after` header, and turn off the SDK's own retries if you retry yourself (or vice versa; Module 9's retry storm).
+
+## Separate interactive and background traffic
+
+The deeper fix for the incident: **batch jobs must never compete with users.**
+
+<Diagram
+	caption="Interactive requests go straight to the model with a reserved share of capacity. Background work goes through a queue with its own concurrency limit (or the Batch API)."
+	code={`flowchart LR
+    U["User chat"] --> API["API server"] --> G["Gateway<br/>(interactive budget)"]
+    J["Backfills, nightly jobs,<br/>evals"] --> Q[("Queue")]
+    Q --> W["Workers<br/>concurrency 8"] --> G2["Gateway<br/>(background budget)"]
+    W -.-> B["Batch API<br/>(no rush: 50% off)"]
+    G --> P["Model provider"]
+    G2 --> P`}
+/>
+
+- **Separate API keys or workspaces** (or at least separate rate-limit budgets in your gateway) for interactive and background work.
+- **A queue** (Celery, RQ, Arq, Cloud Tasks, SQS…) for anything that takes more than a few seconds and doesn't need an immediate answer: document ingestion, re-embedding, long agent tasks. The API returns a job ID; the client polls or gets a webhook or a server-sent event.
+- **Idempotent jobs** (Module 6), because queues deliver at least once.
+- **Batch API** for large offline workloads (lesson 3).
+
+## Latency budgets
+
+Users judge an AI feature by how fast it **feels**. Decide the target first, then allocate it like money:
+
+| Step (Relay chat) | Budget |
+|---|---|
+| Auth, rate limiting, loading the conversation | 50 ms |
+| Retrieval (embed query + vector search + rerank) | 300 ms |
+| Model: time to first token (TTFT) | 1,000 ms |
+| **First words on screen** | **≈ 1.4 s** |
+| Streaming the rest of the answer | 3–6 s, but the user is already reading |
+
+The techniques, roughly in order of impact:
+
+| Technique | Effect |
+|---|---|
+| **Streaming** (Module 1) | Users see progress at TTFT instead of waiting for the whole answer |
+| **Prompt caching** (lesson 1) | Lower TTFT for long prompts: the cached prefix isn't reprocessed |
+| **Parallelism** | Run independent steps together: parallel tool calls (Module 6), retrieval in parallel with other lookups, guardrails in parallel with the main call (Module 8) |
+| **Less work** | Fewer tokens in (lesson 4), shorter outputs, lower effort on easy turns, a smaller model where evals allow |
+| **Prefetching** | Load what almost every conversation needs (customer overview, open shipments) before the first message arrives |
+| **Speculation** | Start likely work before you know you need it (e.g. retrieve while classifying intent), and cancel if unused. It costs tokens, so use it on the critical path only |
+| **Async UX** | For slow tasks, don't make users wait at all: "I'll message you when the claim review is ready" (Module 2) |
+
+Measure all of it with traces (Module 9): p50 **and** p95 TTFT per feature, because the slow tail is what users remember.
+
+<FailureCard
+	title="One slow tool holds up everything"
+	symptom="p95 latency is 9 seconds; p50 is 2 seconds."
+	cause="A tool calling a legacy system takes 6 seconds 10% of the time, and the agent waits for it before every answer."
+	detect="Per-span latency percentiles in traces; look at the slow tail, not the average."
+	fix="A timeout with a useful fallback ('I couldn't reach the billing system; here's what I know'), caching that system's slow lookups, or prefetching them before they're needed."
+/>
+
+<FailureCard
+	title="Blocking the event loop"
+	symptom="Under load, a FastAPI service with async endpoints handles one request at a time and latency explodes."
+	cause="An async endpoint called a synchronous SDK client (and a sync database driver). Each call blocked the whole event loop."
+	detect="Latency that grows linearly with concurrent requests; profiling shows time in blocking calls."
+	fix="Use the async client (`AsyncAnthropic`) and async drivers in async code, or run blocking calls in a thread pool."
+/>
+
+<ThinkFirst question="Acme wants to re-run Relay's new triage prompt over 2 million historical tickets to update their analytics, 'by Monday'. It's Friday afternoon. Design the job.">
+
+1. **Batch API first:** nobody is waiting interactively, and Monday is days away. 2 million requests is 20 batches of 100,000, at 50% of the price; most batches finish within hours, all within 24.
+2. **Prompt caching** for the shared triage instructions across requests.
+3. **A small driver job**, not a script on a laptop: it creates batches, records batch IDs, and processes results **idempotently** keyed by `custom_id` (the ticket ID), so a crash or rerun can't double-write.
+4. **A pilot first:** run 1,000 tickets, check the distribution of categories and a sample of results against the eval set, and only then launch the rest.
+5. **Isolation:** a separate API key or workspace, so even a mistake can't consume live traffic's rate limits.
+6. **Cost estimate up front**, shared with Acme before launching: tokens per ticket × 2 million × batch price.
+
+</ThinkFirst>
+
+## 🧪 Module 10 lab: make Relay fast and cheap
+
+**Acceptance criteria:**
+
+1. **A cost and latency baseline:** cost per conversation and per feature, TTFT and total latency p50/p95, from your traces (Module 9).
+2. **Prompt caching** on every feature, with deterministic prompt assembly, a CI test that asserts cache hits, and a dashboard panel for the cached share.
+3. **A caching decision for answers:** normalized exact-match caching where safe; a semantic cache only if your measured correct-hit rate on labeled near-miss pairs justifies it, with tenant and entity scoping.
+4. **Model and effort choices per feature**, each backed by an eval comparison (quality, cost, latency). At least one feature on a cheaper configuration, or a documented reason why not.
+5. **Token diet:** tool results trimmed at the source, with eval results showing quality held.
+6. **Bounded concurrency** for every background job, interactive and background traffic separated, and one offline workload moved to the Batch API.
+7. **A before/after report** in `docs/module-10.md`: cost per conversation, TTFT p95, and quality, before and after, with the eval evidence.
+
+<Practice title="Build it yourself: Module 10 wrap-up">
+
+- **Warm-up:** run the concurrency test above, then change the fake provider's limit and find the semaphore size that maximizes throughput without rejections.
+- **Stretch:** add a queue-backed background worker to Relay for document ingestion, with its own concurrency limit and idempotent jobs.
+- **Boss level:** complete the Module 10 lab. A one-page "we cut cost per conversation by X% and p95 TTFT by Y%, with quality unchanged, and here's the evidence" is precisely the kind of result FDEs present to customers.
+
+</Practice>
+
+<Quiz
+	id="m10-final"
+	title="Module 10 final quiz"
+	questions={[
+		{
+			q: 'In the test, why was "semaphore 8 + retries" both fast and free of 429s?',
+			options: ['It used a faster model', 'Bounded concurrency kept requests under the provider\'s limit, so no capacity was wasted on rejected calls', 'It skipped tickets', 'It cached answers'],
+			answer: 1,
+			why: 'Unbounded concurrency creates rejections and retry storms; bounded concurrency uses the limit fully without exceeding it.',
+		},
+		{
+			q: 'Why should backfills and live chat not share a rate limit?',
+			options: ['Different models', 'A large background job can consume the limit and make live users\' requests fail', 'Billing reasons only', 'They can'],
+			answer: 1,
+			why: 'Separate keys, workspaces or gateway budgets protect interactive traffic.',
+		},
+		{
+			q: 'Which technique most improves how fast a chat answer feels?',
+			options: ['A larger max_tokens', 'Streaming, so users see the first words at time to first token', 'Higher effort', 'Bigger chunks'],
+			answer: 1,
+			why: 'Perceived latency is TTFT when you stream.',
+		},
+		{
+			q: 'Which is the biggest safe cost win for most AI products?',
+			options: ['Semantic caching', 'Provider prompt caching with a stable prefix', 'Fine-tuning', 'Removing evals'],
+			answer: 1,
+			why: 'It cuts input cost and TTFT without changing the answers.',
+		},
+		{
+			q: 'A cascade escalates 55% of requests. What is likely true?',
+			options: ['It saves a lot', 'It probably costs more and is slower than just using the large model, because most requests pay for two calls', 'It is more accurate', 'Nothing'],
+			answer: 1,
+			why: 'Cascades only pay off when most requests stop at the cheap step.',
+		},
+	]}
+/>
+
+<LessonComplete id="performance/concurrency-and-latency" />

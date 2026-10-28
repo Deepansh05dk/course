@@ -1,0 +1,96 @@
+---
+// Prompt-caching lab: see how prompt layout decides how much of each request can be read from cache.
+---
+
+<section class="calc cachelab not-content" data-cachelab>
+	<p class="calc__badge">🧊 Cache lab: Relay's prompt, request after request (Claude Sonnet 5.5)</p>
+	<div class="cachelab__bar" aria-label="Prompt layout"></div>
+	<p class="cachelab__legend"><span><i class="cachelab__k cachelab__k--hit"></i>read from cache (0.1×)</span><span><i class="cachelab__k cachelab__k--user"></i>cached per user only</span><span><i class="cachelab__k cachelab__k--full"></i>full price every request</span></p>
+	<fieldset class="cachelab__toggles">
+		<legend>Prompt assembly (things teams really do)</legend>
+		<label><input type="checkbox" name="cache" checked /> Prompt caching enabled (breakpoint after the stable prefix)</label>
+		<label><input type="checkbox" name="time" /> Put the current time at the top of the system prompt</label>
+		<label><input type="checkbox" name="user" /> Put the user's name and plan in the system prompt</label>
+		<label><input type="checkbox" name="tools" /> Build the tool list from a set (order differs between server processes)</label>
+		<label><input type="checkbox" name="docs" /> Put the retrieved documents before the instructions</label>
+	</fieldset>
+	<div class="calc__grid">
+		<label>Traffic (requests per minute): <output name="rpmOut"></output>
+			<input type="range" name="rpm" min="0.05" max="60" step="0.05" value="20" />
+		</label>
+	</div>
+	<div class="calc__out">
+		<div><span>Input cost per 1,000 requests</span><strong data-o="cost"></strong></div>
+		<div><span>Without caching</span><strong data-o="base"></strong></div>
+		<div><span>Share of input read from cache</span><strong data-o="share"></strong></div>
+	</div>
+	<p class="calc__note cachelab__note" aria-live="polite"></p>
+</section>
+
+<script>
+	type Scope = 'global' | 'user' | 'volatile';
+	type Seg = { name: string; tokens: number; scope: Scope };
+	const PRICE = 2; // USD per million input tokens (Sonnet 5.5)
+	const USERS = 200;
+	const TTL_MIN = 5;
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-cachelab]')) {
+		const on = (n: string) => box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.checked;
+		const rpmIn = box.querySelector<HTMLInputElement>('[name="rpm"]')!;
+
+		const render = () => {
+			const rpm = Number(rpmIn.value);
+			box.querySelector<HTMLOutputElement>('[name="rpmOut"]')!.value = rpm < 1 ? `${rpm.toFixed(2)}` : `${Math.round(rpm)}`;
+
+			const segs: Seg[] = [];
+			segs.push({ name: on('tools') ? 'tools (order varies)' : 'tool definitions', tokens: 2000, scope: on('tools') ? 'volatile' : 'global' });
+			if (on('time')) segs.push({ name: 'current time', tokens: 20, scope: 'volatile' });
+			if (on('user')) segs.push({ name: "user's name + plan", tokens: 30, scope: 'user' });
+			if (on('docs')) segs.push({ name: 'retrieved docs', tokens: 3000, scope: 'volatile' });
+			segs.push({ name: 'instructions + policies', tokens: 10000, scope: 'global' });
+			if (!on('docs')) segs.push({ name: 'retrieved docs', tokens: 3000, scope: 'volatile' });
+			segs.push({ name: 'question', tokens: 150, scope: 'volatile' });
+
+			// The cacheable prefix ends at the first volatile segment. A per-user segment makes everything after it per-user.
+			const total = segs.reduce((a, s) => a + s.tokens, 0);
+			let prefix = 0;
+			let perUser = false;
+			const status: ('hit' | 'user' | 'full')[] = [];
+			let open = on('cache');
+			for (const s of segs) {
+				if (!open || s.scope === 'volatile') {
+					open = false;
+					status.push('full');
+					continue;
+				}
+				if (s.scope === 'user') perUser = true;
+				prefix += s.tokens;
+				status.push(perUser ? 'user' : 'hit');
+			}
+			// Chance that a request with the same prefix arrived within the TTL (Poisson arrivals).
+			const rate = perUser ? rpm / USERS : rpm;
+			const pHit = 1 - Math.exp(-rate * TTL_MIN);
+			const perReq = (prefix * (pHit * 0.1 + (1 - pHit) * 1.25) + (total - prefix)) * PRICE / 1e6;
+			const base = (total * PRICE) / 1e6;
+
+			box.querySelector('.cachelab__bar')!.innerHTML = segs
+				.map((s, i) => `<span class="cachelab__seg cachelab__seg--${status[i]}" style="flex:${Math.max(s.tokens, 900)}"><b>${s.name}</b><small>${s.tokens.toLocaleString('en')}</small></span>`)
+				.join('');
+			box.querySelector('[data-o="cost"]')!.textContent = `$${(perReq * 1000).toFixed(2)}`;
+			box.querySelector('[data-o="base"]')!.textContent = `$${(base * 1000).toFixed(2)}`;
+			box.querySelector('[data-o="share"]')!.textContent = `${Math.round(((prefix * pHit) / total) * 100)}%`;
+
+			let note = '';
+			if (!on('cache')) note = 'Caching is off: every request pays full price for 15,000+ identical tokens.';
+			else if (on('tools')) note = 'Tools render first. If their order changes, the prefix differs at byte one and nothing after it can be read from cache. Sort tools by name.';
+			else if (on('time')) note = 'A timestamp near the top makes every request unique from that point on. Only the tools are still cached. Move the time into the user message, after the cached prefix.';
+			else if (on('user')) note = `The prefix is now per user. With ${USERS} users, each user's cache usually expires before their next request (hit chance ${Math.round(pHit * 100)}%), so you mostly pay the 1.25× write premium. Move user details after the breakpoint.`;
+			else if (on('docs')) note = 'The per-question documents come before the instructions, so the 10,000 stable tokens after them are never reused. Stable first, volatile last.';
+			else if (pHit < 0.5) note = `Low traffic: requests arrive further apart than the 5-minute TTL, so most cache entries expire before reuse (hit chance ${Math.round(pHit * 100)}%). Consider the 1-hour TTL, or accept it.`;
+			else note = `Healthy: ${Math.round((prefix / total) * 100)}% of each prompt is a stable prefix, read from cache ${Math.round(pHit * 100)}% of the time. Input cost is ${Math.round((1 - perReq / base) * 100)}% lower.`;
+			box.querySelector('.cachelab__note')!.textContent = note;
+		};
+		box.addEventListener('input', render);
+		render();
+	}
+</script>

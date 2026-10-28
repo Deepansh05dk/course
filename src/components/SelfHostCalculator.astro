@@ -1,0 +1,52 @@
+---
+// API vs self-hosted open-weight model: a monthly cost comparison with every assumption exposed.
+---
+
+<section class="calc selfhost not-content" data-selfhost>
+	<p class="calc__badge">🖥️ API or self-host? A monthly break-even estimate</p>
+	<div class="calc__grid">
+		<label>Input tokens / month (millions) <input type="number" name="tin" min="0" value="2000" /></label>
+		<label>Output tokens / month (millions) <input type="number" name="tout" min="0" value="300" /></label>
+		<label>API input price ($ / M tokens) <input type="number" name="pin" min="0" step="0.01" value="2" /></label>
+		<label>API output price ($ / M tokens) <input type="number" name="pout" min="0" step="0.01" value="10" /></label>
+		<label>GPU price ($ / hour, per GPU) <input type="number" name="gpu" min="0" step="0.1" value="2.5" /></label>
+		<label>GPUs per model replica <input type="number" name="per" min="1" value="1" /></label>
+		<label>Throughput per replica (tokens / second, input + output) <input type="number" name="tps" min="1" value="2500" /></label>
+		<label>Average utilization (%) <input type="number" name="util" min="1" max="100" value="40" /></label>
+		<label>Minimum replicas (redundancy) <input type="number" name="minrep" min="1" value="2" /></label>
+		<label>Engineering & ops ($ / month) <input type="number" name="ops" min="0" step="100" value="4000" /></label>
+	</div>
+	<div class="calc__out">
+		<div><span>API per month</span><strong data-o="api"></strong></div>
+		<div><span>Self-hosted per month</span><strong data-o="self"></strong></div>
+		<div><span>Replicas needed</span><strong data-o="reps"></strong></div>
+	</div>
+	<p class="calc__note selfhost__note" aria-live="polite"></p>
+	<p class="calc__note">Every number here is an assumption to replace with your own quotes and load tests. Throughput depends heavily on the model size, GPU, serving engine, batch size, and input/output mix; and the open model must reach your quality bar on your evals before cost matters at all.</p>
+</section>
+
+<script>
+	const money = (n: number) => `$${Math.round(n).toLocaleString('en')}`;
+	for (const box of document.querySelectorAll<HTMLElement>('[data-selfhost]')) {
+		const v = (n: string) => Math.max(0, Number(box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.value) || 0);
+		const render = () => {
+			const api = v('tin') * v('pin') + v('tout') * v('pout');
+			const tokens = (v('tin') + v('tout')) * 1e6;
+			const capacity = v('tps') * 3600 * 730 * (Math.min(v('util'), 100) / 100); // tokens per replica per month
+			const reps = Math.max(v('minrep'), Math.ceil(tokens / Math.max(capacity, 1)));
+			const self = reps * v('per') * v('gpu') * 730 + v('ops');
+			box.querySelector('[data-o="api"]')!.textContent = money(api);
+			box.querySelector('[data-o="self"]')!.textContent = money(self);
+			box.querySelector('[data-o="reps"]')!.textContent = String(reps);
+			const ratio = self / Math.max(api, 1);
+			box.querySelector('.selfhost__note')!.textContent =
+				ratio > 1.3
+					? `Self-hosting costs ${ratio.toFixed(1)}× the API here. At this volume it only makes sense for reasons other than cost (data that can't leave, offline, deep customization).`
+					: ratio < 0.7
+						? `Self-hosting is ${Math.round((1 - ratio) * 100)}% cheaper on paper. Now check the hidden costs: on-call, upgrades, evals for every model update, and peak traffic (you pay for capacity, not usage).`
+						: 'Roughly break-even. At this point the decision is about control, data residency and team capacity, not cost.';
+		};
+		box.addEventListener('input', render);
+		render();
+	}
+</script>

@@ -1,0 +1,224 @@
+---
+title: Semantic caching
+description: Reusing answers for questions that "mean the same thing". How it works, why similarity is not equivalence (tested, with failures), per-tenant and per-entity isolation, exact-match caching, and when a semantic cache is worth running at all.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import SemanticCacheTuner from '../../../components/SemanticCacheTuner.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+import semanticPairs from '../../../data/semantic-pairs.json';
+
+<Incident title="Another customer's shipment" severity="SEV1">
+To cut costs, Relay added a semantic cache: if a new question was "similar enough" (cosine similarity ≥ 0.95) to a previously answered one, it returned the stored answer without calling the model. A week later, a customer asked "Where is shipment ACM-2025-000777?" and received the status, location and ETA of ACM-2025-000183, which belonged to a different company. To the embedding, the two questions were nearly identical. To the customers, they were completely different.
+</Incident>
+
+Prompt caching (previous lesson) reuses the **processing of the same prompt prefix**; the model still generates a fresh answer. A **semantic cache** goes further: it skips the model call entirely and returns a **stored answer** when a new question is similar to an old one.
+
+<Diagram
+	caption="A semantic cache sits in front of the model. A hit saves the whole call; a wrong hit serves someone the wrong answer, confidently and instantly."
+	code={`flowchart LR
+    Q["New question"] --> E["Embed"]
+    E --> S{"Most similar cached<br/>question ≥ threshold?"}
+    S -- "yes" --> A["Return stored answer<br/>(no model call)"]
+    S -- "no" --> M["Call the model"]
+    M --> W["Store question,<br/>embedding, answer"]
+    W --> R["Return answer"]`}
+/>
+
+It sounds like pure savings. The problem is in the diamond: **"similar" is not "same answer"**.
+
+## Tested: where similarity fails
+
+A semantic cache, with per-tenant namespaces and per-entity scoping (the fix for the incident above), tested with a simple local embedding (averaged spaCy word vectors):
+
+```python
+"""A semantic cache: reuse an earlier answer when a new question 'means the same'."""
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+
+
+@dataclass
+class Entry:
+    vector: np.ndarray
+    question: str
+    answer: str
+    created: float
+
+
+ENTITY = re.compile(r"\bACM-\d{4}-\d{6}\b|\bCUST-\d+\b", re.IGNORECASE)
+
+
+def scope_key(tenant: str, question: str) -> str:
+    """Only questions about the same tenant AND the same entities can share answers."""
+    ids = sorted({m.upper() for m in ENTITY.findall(question)})
+    return tenant + "|" + ",".join(ids)
+
+
+@dataclass
+class SemanticCache:
+    embed: Callable[[str], np.ndarray]
+    threshold: float = 0.95
+    ttl_s: float = 24 * 3600
+    entries: dict[str, list[Entry]] = field(default_factory=dict)   # one namespace per tenant + entities
+
+    def get(self, tenant: str, question: str) -> tuple[str, float, str] | None:
+        q = self._unit(self.embed(question))
+        now = time.time()
+        live = [e for e in self.entries.get(scope_key(tenant, question), []) if now - e.created < self.ttl_s]
+        if not live:
+            return None
+        sims = np.array([float(q @ e.vector) for e in live])
+        best = int(sims.argmax())
+        if sims[best] >= self.threshold:
+            return live[best].answer, float(sims[best]), live[best].question
+        return None
+
+    def put(self, tenant: str, question: str, answer: str) -> None:
+        self.entries.setdefault(scope_key(tenant, question), []).append(Entry(self._unit(self.embed(question)), question, answer, time.time()))
+
+    @staticmethod
+    def _unit(v: np.ndarray) -> np.ndarray:
+        return v / (np.linalg.norm(v) or 1.0)
+```
+
+Similarity of new questions to two cached questions, labeled by whether the cached answer would actually be correct:
+
+```text
+cached: How do I cancel my shipment?
+  0.988  SAME  How can I cancel my shipment?
+  0.857  SAME  What's the process to cancel a shipment?
+  0.949  SAME  I want to cancel my delivery, how?
+  0.929  SAME  Cancel my shipment please, how does it work
+  0.994  DIFF  How do I NOT cancel my shipment?
+  0.958  DIFF  How do I cancel my subscription?
+  0.982  DIFF  How do I reschedule my shipment?
+  0.962  DIFF  How do I track my shipment?
+cached: What are your delivery hours?
+  0.881  SAME  When do you deliver?
+  0.860  SAME  What time do drivers deliver?
+  0.877  SAME  Delivery hours?
+  0.965  DIFF  What are your delivery hours on Sunday?
+  0.939  DIFF  What are your office hours?
+  0.937  DIFF  What are your delivery charges?
+
+acme   'Where is shipment ACM-2025-000777?'         -> miss
+acme   'where is my shipment ACM-2025-000183'       -> miss
+globex 'Where is shipment ACM-2025-000183?'         -> miss
+```
+
+Read the numbers:
+
+- **"How do I NOT cancel my shipment?" scored 0.994**, higher than every real paraphrase. Negation barely moves an averaged embedding.
+- "Reschedule" (0.982) and "track" (0.962) scored above most correct paraphrases. One changed word, a completely different answer.
+- **"Delivery hours on Sunday?" (0.965) beat "When do you deliver?" (0.881).** The paraphrases that should hit score lower than the near-misses that shouldn't.
+- **Before** the entity scoping was added, the incident reproduced exactly: the cache returned ACM-2025-000183's status for a question about ACM-2025-000777, with similarity **1.000** (shipment IDs aren't in the word-vector vocabulary, so they don't change the vector's direction at all). With `scope_key`, questions about different shipments can't share answers at all, and the lowercase rephrasing of the **same** shipment question still missed. That's the price of safety: fewer hits.
+
+A real embedding model separates these cases better than averaged word vectors, so your numbers will differ. But the **shape** of the failure is general, and documented for modern embedding models too: negations, small changes of verb, numbers, IDs and qualifiers ("on Sunday") change the meaning a lot and the vector a little. **Always tune on your own labeled pairs.**
+
+## 🎯 Try to find a safe threshold
+
+These are the real scores from the test above. Find a threshold that reuses answers without ever serving a wrong one:
+
+<SemanticCacheTuner pairs={semanticPairs} />
+
+## Making a semantic cache safe enough
+
+If you still want one, these rules come from the failures above:
+
+| Rule | Why |
+|---|---|
+| **Namespace by tenant** (and by user when answers are personal) | Never serve one customer's answer to another |
+| **Scope by entities**: IDs, numbers, dates, product names must match exactly | The embedding ignores exactly the details that decide the answer |
+| **Only cache answers that don't depend on live state** | "Where is my shipment?" changes hourly; "What are your delivery hours?" doesn't |
+| **Short TTLs and invalidation on source changes** | When a policy changes, cached answers based on it are wrong |
+| **A labeled evaluation set of near-miss pairs** | The threshold is a model decision; evaluate it like one (Module 5) |
+| **Log every hit with the matched question** | So you can audit and measure wrong hits |
+| **Optional: verify hits with a cheap model** ("Does this cached answer answer this question?") | Catches negations and qualifiers, at a fraction of the full call's cost |
+
+## Often better: exact-match caching
+
+Many "cache" wins don't need embeddings at all:
+
+- **Normalized exact match:** lowercase, strip punctuation and whitespace, then hash. Catches repeated identical questions (FAQ buttons, retries, double-clicks) with zero risk of wrong answers.
+- **Cache deterministic sub-steps**, not final answers: embeddings of documents, classification of a ticket's category, retrieval results for a normalized query, tool results with a TTL.
+- **Precompute** answers to the top 50 FAQ questions, reviewed by a human, and route to them with a classifier.
+
+## When a semantic cache is worth it
+
+| Worth considering | Not worth it |
+|---|---|
+| High volume of repeated, generic questions (public FAQ bot, documentation search) | Personalized answers (account state, shipment status) |
+| Answers that are stable for days | Answers that depend on live data |
+| A wrong answer is low-stakes | A wrong answer causes harm, cost or a data leak |
+| You've measured the hit rate on real traffic and it's high | Hit rates of a few percent (common in practice!) that don't pay for the risk and complexity |
+
+Measure first: log a week of questions, cluster them, and estimate how many would be **correct** hits at a safe threshold. Often prompt caching plus exact-match caching gets most of the savings with none of the risk.
+
+<FailureCard
+	title="The stale policy answer"
+	symptom="After a policy change, the bot kept quoting the old refund window for two weeks."
+	cause="Answers about the policy were cached with a 30-day TTL, and nothing invalidated them when the policy document changed."
+	detect="Compare cached answers against current sources when documents change; track cache entry age."
+	fix="Tag entries with the source documents they were based on, and invalidate on document updates. Keep TTLs short for anything policy-related."
+/>
+
+<ThinkFirst question="Relay's public tracking website gets 200,000 questions a day. A teammate proposes a semantic cache to cut costs by '40%'. Which three questions do you ask before agreeing?">
+
+1. **What share of questions are generic versus personal?** Most tracking questions are about a specific shipment (personal, live state): they must never be served from a semantic cache. Only the generic part ("how do I file a claim?", "what are your hours?") is a candidate. The 40% estimate probably counted both.
+2. **What's the measured correct-hit rate at a safe threshold?** Take a week of real questions, label a few hundred near-duplicate pairs, and measure hits **and** wrong hits at candidate thresholds, with entity scoping on.
+3. **What would exact-match caching and prompt caching already save?** Prompt caching cuts input costs for every request without risk; normalized exact-match catches the repeated FAQ questions. The semantic cache only earns its complexity on what's left.
+
+A frequent outcome: route the generic FAQ questions to precomputed, reviewed answers with a classifier, and skip the semantic cache altogether.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the semantic cache above with a real embedding model (from Module 3) on the same pairs. Do the scores separate better? Does any threshold work?
+- **Stretch:** build a labeled set of 100 near-miss pairs from Relay's domain (negations, different IDs, different dates, different products) and plot correct and wrong hits against the threshold.
+- **Boss level:** implement Relay's caching layer: normalized exact match first, then (only for questions a classifier marks as generic) a semantic cache scoped by tenant and entities, with a cheap-model verification step on hits. Report the hit rate and the measured wrong-hit rate on a held-out set.
+
+</Practice>
+
+<Quiz
+	id="m10-semantic-cache"
+	questions={[
+		{
+			q: 'What is the main risk of a semantic cache?',
+			options: ['It is slow', 'Similar questions can need different answers, so it serves wrong answers confidently', 'It uses too much memory', 'It breaks prompt caching'],
+			answer: 1,
+			why: 'Similarity is not equivalence: negations, IDs and qualifiers change meaning more than vectors.',
+		},
+		{
+			q: 'In the test, which question scored highest against "How do I cancel my shipment?"',
+			options: ['A correct paraphrase', '"How do I NOT cancel my shipment?"', '"How do I track my shipment?"', 'None were similar'],
+			answer: 1,
+			why: '0.994: negation barely changes an averaged embedding.',
+		},
+		{
+			q: 'How do you stop a semantic cache from answering a question about one shipment with another shipment\'s status?',
+			options: ['Raise the threshold to 0.99', 'Scope cache entries by tenant and by the exact entities (IDs) in the question', 'Use a bigger embedding model', 'Shorter answers'],
+			answer: 1,
+			why: 'The embedding ignores IDs. Exact entity matching must be part of the key.',
+		},
+		{
+			q: 'Which caching is risk-free for answer correctness?',
+			options: ['Semantic caching at 0.9', 'Provider prompt caching and normalized exact-match caching', 'Caching by topic', 'Caching by user'],
+			answer: 1,
+			why: 'Prompt caching still generates a fresh answer; exact match only reuses answers to the identical question.',
+		},
+	]}
+/>
+
+<LessonComplete id="performance/semantic-caching" />
