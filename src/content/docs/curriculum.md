@@ -170,12 +170,12 @@ You build one product the whole way through, like a real FDE engagement. *Acme L
 ### Phase 6: The field
 
 #### Module 12 · Forward Deployed Engineering *(weeks 22–24)*
-- The engagement lifecycle: discovery → POC → pilot → production → expansion
-- Discovery: finding the workflow where AI pays off; success metrics agreed **with** the customer
-- Data and access audits; working inside VPCs, legacy systems and security reviews
-- Scoping and saying no; one-page design docs
-- Demos that build trust; pilots that prove ROI; handover
-- Interview prep: LLM system design, take-homes, customer role-plays
+1. [The FDE engagement lifecycle](/fde/engagement-lifecycle/): discovery → POC → pilot → production → expansion, the gates between them, and who you work with
+2. [Discovery and success metrics](/fde/discovery/): workflow shadowing, scoring use cases, baselines, metrics agreed with the customer, and a 💶 ROI sketch
+3. [Data, access and security reviews](/fde/data-and-access/): access audits, legacy systems, working inside VPCs, getting through security review
+4. [Scoping, saying no, and one-page design docs](/fde/scoping-and-design-docs/): non-goals, strong "no"s, a design doc template with a worked example
+5. [Demos, pilots and handover](/fde/demos-pilots-handover/): honest demos, pilots with control groups, a tested analysis with confidence intervals, adoption, handover, and the FDE simulation lab
+6. [Interview prep](/fde/interview-prep/): an LLM system design framework with a worked example, take-homes, customer role-plays, project stories
 
 ---
 
@@ -194,7 +194,7 @@ Each case study takes a **hard, real-world-scale system** and breaks it down wit
 | # | Case study | Why it's worth studying |
 |---|---|---|
 | **C1** | [**Claude Code: anatomy of an agentic coding tool**](/case-studies/claude-code/) | The agent loop, tools, context engineering without a vector index, compaction, subagents, permissions, hooks, MCP, and skills: a production agent harness end to end |
-| **C2** | **A deep-research answer engine** | Query planning, parallel web search/fetch, source ranking, citation-grounded synthesis, cost control on fan-out, freshness and abuse at scale |
+| **C2** | [**A deep-research answer engine**](/case-studies/deep-research/) | Query planning, parallel web search/fetch, source ranking, citation-grounded synthesis, cost control on fan-out, freshness and abuse at scale |
 | **C3** | **A multi-tenant enterprise support copilot** (an FDE deployment) | Tenant isolation, permission-aware RAG over customer systems, MCP connectors, approval workflows, per-customer evals, and rollout inside a customer VPC |
 
 ## 7. Capstone projects
@@ -226,5 +226,7 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 | Module 9 · LLMOps & Observability | ✅ Ready |
 | Module 10 · Performance & Cost Optimization | ✅ Ready |
 | Module 11 · Deployment & Models | ✅ Ready |
+| Module 12 · Forward Deployed Engineering | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
-| Module 12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
+| Case study C2 · Deep-research answer engine | ✅ Ready |
+| Electives, C3, capstones | 📝 Planned (outlined above) |

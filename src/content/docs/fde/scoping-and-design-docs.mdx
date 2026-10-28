@@ -1,0 +1,173 @@
+---
+title: Scoping, saying no, and one-page design docs
+description: Turning a fuzzy ambition into something you can ship. Scoping with explicit non-goals, saying no (and what to say instead), a one-page design doc template with a filled-in example, and a risk register.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'While you're at it…'" severity="SEV3">
+The pilot scope was draft replies for shipment-status tickets. By week six it also included German and French, claims tickets, a Slack bot for the sales team, a weekly management summary, and "the AI should also update the CRM". Each request was reasonable, and each was accepted in a meeting. The pilot ran three months late, the original metric was never cleanly measured, and the sponsor asked why nothing had shipped.
+</Incident>
+
+Scope is the FDE's main tool for managing risk. A small, clearly bounded first version that ships beats an ambitious one that doesn't, and it creates the trust that pays for the next version.
+
+## Scope with non-goals
+
+The most useful sentence in any scope is **"not in this phase"**. Write the non-goals down as explicitly as the goals:
+
+| In scope (pilot) | Not in this phase |
+|---|---|
+| Draft replies for shipment-status tickets, in English | Other ticket types; other languages |
+| Agents review and send every draft | Sending automatically |
+| Data from the tracking export and the policy wiki | CRM writes; live tracking API |
+| 15 agents in one team, 8 weeks | All 120 agents |
+
+When a new request arrives, it goes into a **backlog with a reason**, not into the current scope: "Good idea; it's in the backlog for phase 2, after we have results on phase 1."
+
+## Saying no (and what to say instead)
+
+Sometimes the honest answer is that AI isn't the right tool, the data isn't there, or the risk is too high. A good "no" comes with a reason, evidence and an alternative:
+
+| Request | Weak answer | Strong answer |
+|---|---|---|
+| "Let the AI approve all refunds automatically" | "No, too risky." | "Not yet. Let's have AI draft the decision with evidence and have a person approve it. Once we've measured agreement on 1,000 claims, we can automate the categories where the AI and humans agreed 99% of the time." |
+| "Use AI to predict which customers will churn" | "Sure!" | "That's a forecasting problem with structured data; a classic model will likely beat an LLM there. Where LLMs could help is reading the free-text complaints that feed into it." |
+| "Answer any question about our business" | "We'll try." | "Let's pick the three questions your team asks most often and make those excellent. A general assistant without a defined job is very hard to evaluate or trust." |
+
+## The one-page design doc
+
+Long design documents don't get read by busy customers. A **one-page** doc does, and it forces you to decide. A template that works:
+
+```markdown
+# <Feature>: one-page design                        Status: draft / agreed
+Owner: <you>   Customer sponsor: <name>   Date: <date>
+
+## Problem
+Who has the problem, how often, what it costs today (baseline numbers).
+
+## Goal and success criteria
+Primary metric + target + decision rule. Guardrail metrics.
+
+## Scope / Non-goals
+What's in this phase. What's explicitly not.
+
+## Design
+One diagram. Data sources, model calls, tools, human steps, where it runs.
+
+## Risks and mitigations
+Top 3–5 risks (quality, security, adoption, dependencies), each with a mitigation.
+
+## Plan
+Milestones with dates, including the gates (POC done, pilot start, go/no-go).
+
+## Open questions
+Each with an owner and a date.
+```
+
+Example, filled in for Relay's first pilot:
+
+| Section | Content |
+|---|---|
+| **Problem** | Shipment-status tickets are 40% of 40,000 monthly tickets; median handle time 11 min, of which ~3 min is looking up tracking data and ~4 min writing. |
+| **Goal** | Median handle time for these tickets −20% (to ≤ 8.8 min) with ≥ 60% draft adoption, CSAT not lower, zero wrong compensation promises. Roll out if met after 8 weeks. |
+| **Scope** | English shipment-status tickets; drafts only, agents send; 15 agents. **Not:** other types, other languages, automatic sending, CRM writes. |
+| **Design** | Ticket → extract shipment ID → tracking lookup (export, then API) → policy retrieval → draft with citations → agent edits and sends. Runs in Acme's cloud; model via their approved platform. |
+| **Risks** | Wrong compensation promises → policy citations required and a rule-based check on amounts. Low adoption → co-design with 3 agents, in-tool feedback. Tracking data a day old → show the data's timestamp in the draft. |
+| **Plan** | POC on exports by week 3; security sign-off by week 5; pilot weeks 6–13; go/no-go in week 14. |
+
+## A risk register
+
+Keep a living list of risks, reviewed weekly with the sponsor. Each has a **likelihood**, an **impact**, an **owner** and a **mitigation**. Surfacing risks early, with a plan, is what makes customers trust your status reports when they say "green".
+
+<IncidentDrill
+	id="scope-drill"
+	mode="decision"
+	title="Week six: a new request"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Mid-pilot, the sales director asks you in a meeting: "Can the bot also answer pricing questions for my team? Should be easy." Your answer?',
+			choices: [
+				{ label: '"Good idea. I\'ll add it to the phase-2 backlog with what it needs (pricing data access, its own evals), and we\'ll decide after the pilot results."', next: 's2', cost: 0 },
+				{ label: '"Sure, we\'ll add it this week."', next: 's1b', cost: 25, note: 'Now the pilot has two unrelated features and the metric is muddied.' },
+				{ label: '"No, that\'s out of scope."', next: 's2', cost: 5, note: 'Correct but cold. Give the reason and a path.' },
+			],
+		},
+		s1b: { text: 'Pricing answers turn out to need data from a system you don\'t have access to. The pilot slips two weeks. Now?', choices: [{ label: 'Move pricing to the phase-2 backlog, tell the sponsor, re-plan', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'The sponsor hears about the request and asks whether you\'re "being too conservative". What do you show?',
+			choices: [
+				{ label: 'The one-page doc: the goal, the decision date, and the backlog with phase-2 candidates and what each needs', next: 'end_good', cost: 0 },
+				{ label: 'A long technical explanation of why pricing is hard', next: 'end_ok', cost: 0, note: 'Accurate, but sponsors decide from plans and outcomes, not technical detail.' },
+			],
+		},
+		end_good: { text: 'The scope held, the requester felt heard, and the sponsor sees a plan rather than a refusal.', end: 'good' },
+		end_ok: { text: 'You protected the scope, but spent trust doing it.', end: 'ok' },
+	}}
+/>
+
+<FailureCard
+	title="The doc nobody agreed to"
+	symptom="At the go/no-go meeting, the sponsor disputes the success criteria the team has been working toward for eight weeks."
+	cause="The design doc was written and shared, but never explicitly agreed. Silence was taken as agreement."
+	detect="Ask: who signed off on the success criteria, and when?"
+	fix="Get explicit agreement (an email, a comment, a signature) on the goal, scope and decision rule before the pilot starts."
+/>
+
+<ThinkFirst question="Acme's COO wants Relay to 'handle all customer communication, in every channel, in all eight of our languages' by the end of the quarter. Write your reply in five sentences.">
+
+An example:
+
+"I share the goal, and I think we can get there in stages that each pay off on their own. I propose we start with the largest, lowest-risk slice: English shipment-status emails, 40% of volume, with agents approving every reply, and measure handle time and quality for eight weeks. In parallel we'll prepare the next slices (German and French, then claims), each with its own evaluation, so we can add them as soon as the first one proves out. Fully automatic replies come once we've measured, per ticket type, that agents rarely change the drafts. I'll send a one-page plan with dates and the decision points by Friday."
+
+It keeps the ambition, sets a first scope, shows the path, and ends with a concrete next step.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** write the scope and non-goals table for a feature you're working on now (or Relay's claims assistant).
+- **Stretch:** write a full one-page design doc for Relay's damage-claims assistant using the template.
+- **Boss level:** practise saying no: write strong answers (reason, evidence, alternative) to three requests you think are bad ideas for AI. Then ask a friend to play a pushy stakeholder and try them out loud.
+
+</Practice>
+
+<Quiz
+	id="m12-scoping"
+	questions={[
+		{
+			q: 'What is the most useful part of a scope?',
+			options: ['The budget', 'Explicit non-goals ("not in this phase")', 'The team names', 'The tech stack'],
+			answer: 1,
+			why: 'Non-goals make scope creep visible and discussable.',
+		},
+		{
+			q: 'A good "no" includes…',
+			options: ['Only the refusal', 'A reason, evidence and an alternative path', 'An apology', 'A higher price'],
+			answer: 1,
+			why: 'It turns a refusal into a plan.',
+		},
+		{
+			q: 'Why one page?',
+			options: ['Templates require it', 'Busy stakeholders read it, and it forces decisions', 'It\'s faster to write', 'Long docs are forbidden'],
+			answer: 1,
+			why: 'Clarity beats completeness at this stage.',
+		},
+		{
+			q: 'Mid-pilot, a stakeholder asks for an extra feature. What should usually happen?',
+			options: ['Add it immediately', 'Put it in the next-phase backlog with what it needs, and decide after the pilot', 'Ignore it', 'Restart the pilot'],
+			answer: 1,
+			why: 'Protect the pilot\'s measurement and timeline while keeping the requester engaged.',
+		},
+	]}
+/>
+
+<LessonComplete id="fde/scoping-and-design-docs" />

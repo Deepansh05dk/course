@@ -1,0 +1,152 @@
+---
+title: The FDE engagement lifecycle
+description: What a Forward Deployed Engineer actually does, stage by stage. Discovery, proof of concept, pilot, production and expansion, the gate between each, who you work with, and the traps that stall engagements.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The demo that never shipped" severity="SEV2">
+In week two of an engagement with Acme Logistics, an engineer built an impressive demo: a chatbot that answered questions about shipments from a CSV export. The VP loved it. Then nothing happened for four months. The real data lived in a 15-year-old system nobody had access to, the security review hadn't started, nobody had agreed what "success" meant, and the support team (the actual users) had never been asked. The demo had answered a question nobody had asked yet: "can AI do something cool here?"
+</Incident>
+
+A **Forward Deployed Engineer** sits inside (or right next to) a customer's organization and turns AI capability into a working system that changes how people work there. It's part engineer, part consultant, part product manager. The engineering in Modules 1–11 is necessary. This module covers what decides whether that engineering ever reaches production.
+
+## The lifecycle
+
+<Diagram
+	caption="Each stage ends with a gate: an explicit decision, with evidence, to go on, change course, or stop. Most failed engagements skipped a gate rather than failed one."
+	code={`flowchart LR
+    D["Discovery<br/>1–3 weeks"] -->|"gate: a workflow worth<br/>changing + agreed metrics"| P["Proof of concept<br/>2–4 weeks"]
+    P -->|"gate: works on real data,<br/>known failure modes"| PI["Pilot<br/>4–10 weeks"]
+    PI -->|"gate: measured impact<br/>vs success criteria"| PR["Production<br/>rollout"]
+    PR -->|"gate: stable, owned,<br/>supported"| E["Expansion<br/>next workflows"]`}
+/>
+
+| Stage | Goal | Main output | Typical trap |
+|---|---|---|---|
+| **Discovery** | Find a workflow where AI clearly pays off, and agree how success is measured | A problem statement, baseline numbers, success criteria, data and access map | Starting to build before knowing what to build |
+| **Proof of concept (POC)** | Prove it works on **real** data, and learn how it fails | A working prototype, an eval set, a list of failure modes | Demoing on clean sample data |
+| **Pilot** | Prove it changes the business metric with real users | Measured results against the baseline, user feedback, ops experience | No baseline, no control group, success defined after the fact |
+| **Production** | Run it reliably at full scale, owned by someone | A deployed, monitored, supported system and a handover | "Pilot purgatory": a pilot that never gets the security, ops and ownership work |
+| **Expansion** | Reuse what you built for the next workflows | A roadmap, reusable platform pieces, a reference story | Bespoke one-offs that can't be reused |
+
+## Who you work with
+
+| Role at the customer | What they care about | What you need from them |
+|---|---|---|
+| **Executive sponsor** | Business outcome, risk, cost | A clear goal, unblocking, a go/no-go at each gate |
+| **Process owner** (e.g. head of support) | Their team's metrics and workload | Access to the workflow, the baseline, pilot users |
+| **End users** (support agents) | Their daily work getting easier, not harder | Their time, honest feedback, trust |
+| **IT / platform team** | Integration, stability, maintenance | Access, environments, eventually ownership |
+| **Security, legal, privacy** | Data flows, risk, compliance | Early involvement; the questionnaire (Module 8) |
+| **Your own company** (product, research, sales) | Product feedback, revenue, references | Field insights, feature requests with evidence |
+
+A useful habit: write a one-line answer to "what does each of these people need to see to say yes at the next gate?" and keep it current.
+
+## A week in the life
+
+FDE work is mostly not coding, and the coding is unusually varied:
+
+- **Customer time:** workflow shadowing, working sessions with users, status updates with the sponsor, security calls.
+- **Engineering:** integrations with their systems (Module 7), the AI pipeline (Modules 1–6), evals on their data (Module 5), deployment in their environment (Module 11).
+- **Writing:** design docs, pilot reports, runbooks, feature requests to your own product team.
+- **Unblocking:** chasing access, finding the person who knows how the legacy system works, rescoping when something turns out impossible.
+
+<IncidentDrill
+	id="fde-lifecycle-drill"
+	mode="decision"
+	title="Week one at Acme"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Day one. The VP says: "We want AI for customer support. Show us something in two weeks." What do you do first?',
+			choices: [
+				{ label: 'Spend the first days with support agents and their leads: shadow tickets, collect baseline numbers, map the systems involved', next: 's2', cost: 3 },
+				{ label: 'Build a chatbot demo on a public dataset to impress them quickly', next: 's1b', cost: 20, note: 'Impressive, but it proves nothing about their data, systems or users.' },
+			],
+		},
+		s1b: { text: 'The VP likes the demo and asks "when can my team use it?". You don\'t know which systems it needs. Next?', choices: [{ label: 'Go back to discovery: shadow agents, map systems, get baselines', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'You find 40% of tickets are "where is my shipment?", answered by copying data from the tracking system. The rest is varied. What do you propose?',
+			choices: [
+				{ label: 'Start with draft replies for shipment-status tickets: frequent, measurable, low risk. Agree success metrics (handle time, adoption) with the support lead', next: 's3', cost: 0 },
+				{ label: 'An autonomous agent for all ticket types', next: 'end_ok', cost: 15, note: 'Maximal scope, maximal risk; it will stall in security review and evals.' },
+			],
+		},
+		s3: {
+			text: 'The tracking system has no API, only a web UI and a nightly database export. What now?',
+			choices: [
+				{ label: 'Start the POC on the nightly export to prove value, and in parallel request read access to the database (security review starts now, not later)', next: 'end_good', cost: 0 },
+				{ label: 'Wait until IT builds an API', next: 'end_ok', cost: 10, note: 'Months of waiting with nothing to show. Parallelize.' },
+			],
+		},
+		end_good: { text: 'Discovery before demos, a narrow measurable first use case, and the slow work (access, security) started on day one.', end: 'good' },
+		end_ok: { text: 'Progress, but the engagement is drifting toward the incident at the top of this page.', end: 'ok' },
+	}}
+/>
+
+<FailureCard
+	title="Pilot purgatory"
+	symptom="The pilot 'succeeded' six months ago and is still a pilot: 12 users, a staging environment, no owner."
+	cause="Success criteria didn't include the production requirements (security sign-off, ops ownership, budget), so nobody planned them."
+	detect="Ask at the pilot kickoff: if this works, who will own it, from which budget, and what must be true for security to approve it?"
+	fix="Make production readiness part of the pilot plan from day one, with a named owner and a date for the go/no-go decision."
+/>
+
+<ThinkFirst question="Why do FDE engagements put a gate (an explicit go/no-go decision) between every stage, instead of just iterating continuously?">
+
+1. **Stopping is a valid outcome.** Some workflows turn out not to be worth it, or not feasible with the available data. A gate makes it normal to stop early, before months are spent.
+2. **Each stage needs different people to commit.** A POC needs data access; a pilot needs users and their manager; production needs security, IT and budget. The gate is where you ask for that commitment explicitly.
+3. **Evidence instead of enthusiasm.** Gates force the question "what did we learn, measured how?", which protects both you and the customer from momentum-driven decisions.
+4. **Trust.** Customers trust partners who say "the data says we should change course" more than partners who are always on track.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** for an AI project you know (yours or a public case), map it onto the five stages. Where did it stall?
+- **Stretch:** write a stakeholder map for Acme's support-copilot engagement: each role, what they need to see at each gate, and how you'll show it.
+- **Boss level:** interview someone who works in operations or support (a friend, a colleague). Map their workflow end to end and find the step where AI would save the most time. That's discovery practice with a real person.
+
+</Practice>
+
+<Quiz
+	id="m12-lifecycle"
+	questions={[
+		{
+			q: 'What is the main purpose of the proof of concept stage?',
+			options: ['Impress the executive', 'Prove it works on real data and learn how it fails', 'Train the users', 'Sign the contract'],
+			answer: 1,
+			why: 'Real data and real failure modes, not a polished demo.',
+		},
+		{
+			q: 'What causes "pilot purgatory"?',
+			options: ['Bad models', 'Production requirements (security, ownership, budget) weren\'t planned as part of the pilot', 'Too many users', 'Fast success'],
+			answer: 1,
+			why: 'Plan the path to production from the pilot kickoff.',
+		},
+		{
+			q: 'When should the security review start?',
+			options: ['After the pilot', 'As early as possible, in parallel with the POC', 'Never', 'After production'],
+			answer: 1,
+			why: 'It\'s often the longest lead time in the whole engagement.',
+		},
+		{
+			q: 'Is stopping at a gate a failure?',
+			options: ['Yes, always', 'No: stopping early on evidence saves both sides months and builds trust', 'Only for small customers', 'Only after production'],
+			answer: 1,
+			why: 'Gates exist so that "stop" is a normal, early outcome.',
+		},
+	]}
+/>
+
+<LessonComplete id="fde/engagement-lifecycle" />

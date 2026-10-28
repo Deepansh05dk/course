@@ -1,0 +1,155 @@
+---
+title: Discovery and success metrics
+description: Finding the workflow where AI pays off. Workflow shadowing, the questions that matter, scoring candidate use cases, baselines, success metrics agreed with the customer, and a first ROI sketch.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import ROICalculator from '../../../components/ROICalculator.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Success, according to whom?" severity="SEV2">
+After a ten-week pilot, the engineering team presented the results: 94% answer accuracy on the eval set, a p95 latency of 3 seconds. The head of support asked: "And how much faster are my agents?" Nobody knew; handle time had never been measured before the pilot. The CFO asked: "And how much did we save?" Nobody had agreed what counted. The pilot was technically excellent and commercially unproven. The renewal was postponed.
+</Incident>
+
+Discovery answers three questions before anything is built: **which workflow**, **what would better look like (in numbers)**, and **what do we need to get there** (data, access, people). It's the highest-leverage time in the whole engagement.
+
+## Understand the work, not the request
+
+Customers ask for solutions ("we want a chatbot"). Your job is to find the problem underneath. The most effective method is simple: **watch people work.**
+
+- **Shadow the workflow** for a few hours: sit with support agents, claims handlers, dispatchers. Note every system they open, every copy-paste, every lookup, every wait.
+- **Follow a few cases end to end**, from the customer's first email to resolution.
+- **Collect artifacts:** real tickets, documents, templates, the internal wiki, the spreadsheets people actually use.
+- **Ask about exceptions:** "What's the most annoying ticket type?", "What do new hires get wrong?", "When does this go badly?"
+
+<Diagram
+	caption="A workflow map from shadowing Acme's support agents. The red steps are where time goes, and where AI might help."
+	code={`flowchart LR
+    A["Ticket arrives<br/>(email)"] --> B["Read + classify<br/>~1 min"]
+    B --> C["Look up shipment<br/>in tracking UI<br/>~3 min"]:::slow
+    C --> D["Check policy<br/>in wiki<br/>~2 min"]:::slow
+    D --> E["Write reply<br/>~4 min"]:::slow
+    E --> F{"Refund<br/>needed?"}
+    F -- "yes" --> G["Request approval<br/>in finance tool"]
+    F -- "no" --> H["Send"]
+    classDef slow fill:#dc2626,color:#fff`}
+/>
+
+## Questions that matter
+
+| Area | Questions |
+|---|---|
+| **Volume and value** | How many of these per month? How long does each take? What does a mistake cost? |
+| **Variation** | What share is routine? What are the hard cases? |
+| **Data** | Where does the needed information live? Who owns it? How clean is it? Can we get access, and how long will that take? |
+| **Risk** | What's the worst thing an AI mistake could cause here? Who's accountable today? |
+| **People** | Who does this work? What would they welcome, and what would they resist? |
+| **Measurement** | What's measured today? What would prove success to the sponsor, to users, to finance? |
+
+## Scoring candidate use cases
+
+Discovery usually surfaces several candidates. Score them before choosing:
+
+| Candidate (Acme) | Value | Feasibility (data, access) | Risk if wrong | Measurability | Verdict |
+|---|---|---|---|---|---|
+| Draft replies for shipment-status tickets (40% of volume) | High | Medium (tracking export now, API later) | Low (agent reviews every draft) | High (handle time) | **Start here** |
+| Automatic damage-claim decisions | High | Low (photos, policies, carrier data) | High (money, disputes) | Medium | Later, with human approval |
+| Summaries of long customer email threads | Medium | High | Low | Medium | Quick win, bundle with the first |
+| "AI that answers any question about our business" | Unclear | Low | Unclear | Low | Reframe into specific workflows |
+
+The best first use case is usually **frequent, narrow, low-risk and measurable**, not the most impressive one. A visible early win buys the trust to tackle the harder cases.
+
+## Baselines and success metrics
+
+You can't show improvement without a **baseline**, measured **before** the pilot starts. Agree with the customer, in writing:
+
+| Metric type | Example | Who cares |
+|---|---|---|
+| **Business outcome** (primary) | Median handle time for shipment-status tickets: 11 min → target 8.5 min | Sponsor, finance |
+| **Adoption** | Share of eligible tickets where agents use the draft: target ≥ 60% | Process owner |
+| **Quality guardrails** | Customer satisfaction not lower; escalation rate not higher; zero wrong refund promises | Process owner, sponsor |
+| **Technical** | Faithfulness ≥ 95% on the eval set; p95 latency < 4 s | You (supporting metrics, not the headline) |
+
+Agree the **primary metric, the target, the measurement method, and the decision rule** ("if handle time drops by at least 15% with no drop in CSAT, we roll out") before the pilot starts. Deciding afterwards invites both sides to see what they want in the numbers.
+
+## A first ROI sketch
+
+Discovery should end with an honest, rough business case. Not to promise a number, but to know whether the use case is worth a pilot, and which assumptions the pilot must test:
+
+<ROICalculator />
+
+<FailureCard
+	title="Automating the wrong step"
+	symptom="The AI writes great replies, but handle time barely changes."
+	cause="Shadowing would have shown that most time went into looking up shipment data in a slow UI, not into writing. The team automated the visible step, not the slow one."
+	detect="Time each step of the workflow during discovery."
+	fix="Map the workflow with timings first; target the steps where time actually goes (here: fetch the shipment data automatically and put it into the draft)."
+/>
+
+<FailureCard
+	title="The metric nobody could measure"
+	symptom="The pilot's primary metric was 'customer satisfaction', but only 3% of customers answer surveys, so after 8 weeks the result was noise."
+	cause="The metric was chosen for importance, not for measurability within the pilot's volume and duration."
+	detect="Before the pilot, estimate how much data you'll have and whether a realistic effect would be visible in it (lesson 5)."
+	fix="Pick a primary metric that's measured on every case (handle time, resolution rate), and keep the slow ones as guardrails."
+/>
+
+<ThinkFirst question="Acme's VP of Operations says: 'Success is when the AI handles 80% of tickets on its own.' What do you say?">
+
+Take the ambition seriously, and turn it into something measurable and safe:
+
+1. **Ask what's behind it:** is the goal lower cost, faster responses, handling growth without hiring? The real goal decides the metric.
+2. **Explain the path:** start with AI drafts that agents approve (low risk, measurable quickly), measure quality per ticket type, and move the types that prove reliable to automatic handling. "80% autonomous" becomes the destination, not the pilot's success criterion.
+3. **Propose pilot metrics** that predict that destination: handle time, adoption, the share of drafts sent without edits **per ticket type** (a measure of readiness for automation), and quality guardrails.
+4. **Write it down together**, with the decision rule for each step toward automation.
+
+You keep the VP's goal, and replace a promise you can't verify with a plan you can.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** pick a workflow you know well (at your job, or something like returning a parcel). Map every step with an estimated time. Mark the steps where AI could help.
+- **Stretch:** write five discovery interview questions for Acme's claims team, and for each, what you'd do with the answer.
+- **Boss level:** write a one-page discovery summary for Acme's support engagement: the workflow map, three scored use cases, the chosen one, baseline numbers, agreed metrics with targets, and an ROI sketch with its assumptions.
+
+</Practice>
+
+<Quiz
+	id="m12-discovery"
+	questions={[
+		{
+			q: 'What is the most effective discovery method?',
+			options: ['A long survey', 'Watching people do the work (shadowing), with timings', 'Asking the executive', 'Reading the API docs'],
+			answer: 1,
+			why: 'Workflows look different on the floor than in meetings.',
+		},
+		{
+			q: 'What makes a good first use case?',
+			options: ['The most impressive one', 'Frequent, narrow, low-risk and measurable', 'The one with the most data', 'The one the CEO mentioned'],
+			answer: 1,
+			why: 'An early, measurable win builds trust for harder cases.',
+		},
+		{
+			q: 'When must the baseline be measured?',
+			options: ['After the pilot', 'Before the pilot starts', 'Never', 'During production'],
+			answer: 1,
+			why: 'Without a baseline, improvement can\'t be shown.',
+		},
+		{
+			q: 'Which should be the pilot\'s primary metric?',
+			options: ['Eval accuracy', 'A business outcome measured on every case, like handle time', 'Number of prompts', 'Model latency'],
+			answer: 1,
+			why: 'Technical metrics support the case; business outcomes make it.',
+		},
+	]}
+/>
+
+<LessonComplete id="fde/discovery" />

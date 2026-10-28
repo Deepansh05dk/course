@@ -1,0 +1,48 @@
+---
+// Discovery-stage ROI estimate for an AI feature, with the assumptions you must validate in a pilot.
+---
+
+<section class="calc roi not-content" data-roi>
+	<p class="calc__badge">💶 ROI sketch: AI reply drafts for Acme's support team</p>
+	<div class="calc__grid">
+		<label>Tickets per month <input type="number" name="tickets" min="0" value="40000" /></label>
+		<label>Current handle time (minutes) <input type="number" name="handle" min="0" step="0.5" value="11" /></label>
+		<label>Time saved per ticket with a draft (%) <input type="number" name="saved" min="0" max="100" value="20" /></label>
+		<label>Share of tickets where agents use the draft (%) <input type="number" name="adopt" min="0" max="100" value="60" /></label>
+		<label>Fully loaded agent cost ($ / hour) <input type="number" name="rate" min="0" value="38" /></label>
+		<label>AI cost per ticket ($) <input type="number" name="ai" min="0" step="0.001" value="0.02" /></label>
+		<label>Run cost: hosting, monitoring, support ($ / month) <input type="number" name="ops" min="0" step="100" value="3000" /></label>
+		<label>One-time build and rollout ($) <input type="number" name="build" min="0" step="1000" value="90000" /></label>
+	</div>
+	<div class="calc__out">
+		<div><span>Agent hours saved / month</span><strong data-o="hours"></strong></div>
+		<div><span>Net value / month</span><strong data-o="net"></strong></div>
+		<div><span>Payback</span><strong data-o="payback"></strong></div>
+	</div>
+	<p class="calc__note roi__note" aria-live="polite"></p>
+	<p class="calc__note">Discovery numbers are hypotheses. "Time saved" and "adoption" are the two you must measure in the pilot; most ROI disappointments come from adoption, not from the model.</p>
+</section>
+
+<script>
+	const money = (n: number) => `${n < 0 ? '−' : ''}$${Math.round(Math.abs(n)).toLocaleString('en')}`;
+	for (const box of document.querySelectorAll<HTMLElement>('[data-roi]')) {
+		const v = (n: string) => Math.max(0, Number(box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.value) || 0);
+		const render = () => {
+			const used = v('tickets') * (Math.min(v('adopt'), 100) / 100);
+			const hours = (used * v('handle') * (Math.min(v('saved'), 100) / 100)) / 60;
+			const net = hours * v('rate') - v('tickets') * v('ai') - v('ops');
+			box.querySelector('[data-o="hours"]')!.textContent = Math.round(hours).toLocaleString('en');
+			box.querySelector('[data-o="net"]')!.textContent = money(net);
+			box.querySelector('[data-o="payback"]')!.textContent = net > 0 ? `${(v('build') / net).toFixed(1)} months` : 'never';
+			// What adoption level is needed to break even within 12 months?
+			const perAdopted = (v('tickets') * v('handle') * (Math.min(v('saved'), 100) / 100) / 60) * v('rate');
+			const needed = perAdopted > 0 ? ((v('build') / 12 + v('tickets') * v('ai') + v('ops')) / perAdopted) * 100 : Infinity;
+			box.querySelector('.roi__note')!.textContent =
+				net <= 0
+					? 'At these numbers the feature never pays for itself. Is there a bigger workflow, or a different metric (quality, speed, revenue) that matters more to this customer?'
+					: `To pay back within 12 months, at least ${needed > 100 ? 'more than 100' : Math.ceil(needed)}% of tickets must use the draft. That number belongs in the pilot's success criteria.`;
+		};
+		box.addEventListener('input', render);
+		render();
+	}
+</script>

@@ -1,0 +1,141 @@
+---
+title: Data, access and security reviews
+description: Working inside a customer's environment. Data and access audits, legacy systems, VPCs and private networking, getting through security review, and the day-one checklist that saves weeks.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Seven weeks for a database login" severity="SEV2">
+The POC was ready in two weeks. Read access to Acme's claims database took seven more: the request went to the wrong team, then needed a security review, then a data-protection assessment because the claims contained personal data, then a change-advisory board that met every other Thursday. None of it was unreasonable. All of it could have started on day one.
+</Incident>
+
+In your own company, data access is a ticket. At a customer, it's a **process**, owned by people with good reasons to be careful, and it's usually the longest lead time in an engagement. FDEs who treat access and security as first-class work, starting on day one, ship months earlier.
+
+## The data and access audit
+
+For every piece of information the use case needs, fill in one row:
+
+| Data | System | Owner | Access method | Contains personal data? | Freshness needed | Status |
+|---|---|---|---|---|---|---|
+| Shipment status | Tracking system (legacy) | Ops IT | Nightly DB export; read replica requested | No (shipment) / yes (consignee address) | Hourly | Export ✅, replica ⏳ |
+| Customer profile and tier | CRM (SaaS) | Sales ops | REST API, OAuth app | Yes | Daily | Requested ⏳ |
+| Policies | Wiki (Confluence) | Support lead | API, read-only space | No | On change | ✅ |
+| Past tickets (for evals) | Helpdesk | Support ops | Export, **redacted** (Module 8) | Yes | One-off | DPA review ⏳ |
+
+The audit makes the critical path visible (here: the CRM and the ticket export), and gives the sponsor a concrete list to unblock.
+
+## Legacy systems
+
+Most valuable data lives in systems that were never designed for AI: mainframes, old databases, SOAP services, desktop apps, spreadsheets on shared drives. Typical patterns, from least to most invasive:
+
+| Pattern | When |
+|---|---|
+| **Exports** (nightly files, read replicas) | Fastest start; fine for POCs and data that can be a day old |
+| **Existing APIs**, even old ones, wrapped as task-shaped tools (Module 7) | The usual production answer |
+| **Database read access** through views the owner controls | When there's no API; views keep the owner in control of what's exposed |
+| **Change data capture / events** | Freshness matters and the system can publish changes |
+| **UI automation** (computer use, RPA) | A last resort when there's truly no other way; fragile, so contain it and monitor it closely |
+
+Respect the system's limits: a 15-year-old database may not survive an agent issuing 50 queries per conversation. Cache, rate-limit and batch (Modules 7 and 10).
+
+## Working inside their network
+
+<Diagram
+	caption="A typical regulated deployment: Relay runs inside the customer's cloud network, reaches internal systems privately, and calls the model through a private endpoint in an approved region."
+	code={`flowchart LR
+    subgraph VPC["Customer's cloud network (VPC / VNet)"]
+      direction LR
+      U["Agents' browsers<br/>via SSO"] --> R["Relay service"]
+      R --> DB[("Claims DB<br/>read replica")]
+      R --> CRM["CRM connector"]
+      R --> V[("Vector DB")]
+      R --> O["Observability<br/>(their stack)"]
+    end
+    R -- "private endpoint,<br/>approved region" --> M["Claude via the customer's<br/>cloud platform"]`}
+/>
+
+What this usually means for you:
+
+- **You deploy into their environment**, with their CI/CD, their secrets manager, their logging. Build for portability from the start (Module 11): containers, configuration by environment, the client factory.
+- **No public internet path** for data. Model access through the platform route they've approved, often with private connectivity.
+- **Their identity system:** users log in with the company's SSO; your service acts with the user's permissions (Modules 4 and 7).
+- **Limited access for you:** you may get a locked-down laptop, a jump host, or work through their engineers. Plan for slower iteration and invest in good local test setups with synthetic data.
+
+## Getting through security review
+
+Security teams have seen many vendors over-promise. What gets you through:
+
+1. **Start early**, and ask for their process and questionnaire in week one.
+2. **Bring a clear data-flow diagram** (like the one above) and a threat model (Module 8).
+3. **Answer with evidence**, not assurances: test results for permission isolation, the red-team suite's results, sample audit logs.
+4. **Offer a staged scope:** read-only first, no customer-facing actions, redacted data for evals. Expand once trust exists.
+5. **Name an owner** for each open item, and keep a shared tracker. Security reviews stall on unanswered questions, not on "no".
+
+<FailureCard
+	title="Real data on a laptop"
+	symptom="An engagement is paused for a month after a customer audit finds production ticket exports on a contractor's laptop."
+	cause="To iterate faster, an engineer downloaded a ticket export to test prompts locally."
+	detect="The customer's data-loss-prevention tooling, or their audit."
+	fix="Agree the data-handling rules in writing at the start; work on customer data only in their approved environment; use synthetic or redacted data for local development."
+/>
+
+<ThinkFirst question="Day one at a new customer. Write the checklist of requests you send in your first email, so the slow things start immediately.">
+
+1. **People:** the sponsor, the process owner, 3–5 users to shadow, the IT contact for each system, and the security and data-protection contacts.
+2. **Security process:** their vendor or AI security questionnaire, the review process and its calendar (boards that meet every two weeks matter).
+3. **Access requests** for each system in the audit, starting with the slowest owner. Ask what the request process is, not just for access.
+4. **Environments:** where we deploy (their cloud account, network, CI/CD), how model access is approved (which platform, region), and the dev/test environment.
+5. **Data handling rules:** where customer data may be processed and stored, retention, and whether redacted samples can be used for evals.
+6. **Baseline data:** whatever they already measure for the target workflow (handle times, volumes), so the baseline (lesson 2) can start now.
+
+Then put every request in a shared tracker with an owner and a date, and review it in every status meeting.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** fill in the data and access audit table for Relay's damage-claims use case (photos, shipments, policies, customer tier, carrier data).
+- **Stretch:** draw the deployment and data-flow diagram for Relay inside a customer's cloud, including every system, the model route, and observability. Mark every place personal data flows.
+- **Boss level:** answer a real public AI vendor security questionnaire (several are published online) for Relay, with evidence from your Module 8 and 9 labs.
+
+</Practice>
+
+<Quiz
+	id="m12-data-access"
+	questions={[
+		{
+			q: 'Why start access requests and security review on day one?',
+			options: ['It\'s a formality', 'They\'re usually the longest lead time, and they run in parallel with your engineering', 'To impress the customer', 'Legal requirement'],
+			answer: 1,
+			why: 'Weeks of waiting are avoidable when the slow processes start immediately.',
+		},
+		{
+			q: 'A legacy system has no API. What\'s the usual first step?',
+			options: ['UI automation', 'Exports or a read replica, then views or an API wrapper for production', 'Rewrite the system', 'Skip the data'],
+			answer: 1,
+			why: 'Start with the least invasive access that proves value.',
+		},
+		{
+			q: 'What persuades a security team most?',
+			options: ['Assurances', 'Evidence: data-flow diagrams, permission tests, red-team results, audit logs', 'A famous logo', 'A lower price'],
+			answer: 1,
+			why: 'Security teams trust tests and logs.',
+		},
+		{
+			q: 'Where should you test prompts on real customer data?',
+			options: ['On your laptop', 'Only in the customer\'s approved environment; use synthetic or redacted data locally', 'In a public notebook', 'Anywhere encrypted'],
+			answer: 1,
+			why: 'Data handling rules are part of the trust you\'re building.',
+		},
+	]}
+/>
+
+<LessonComplete id="fde/data-and-access" />

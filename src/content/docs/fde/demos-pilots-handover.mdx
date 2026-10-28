@@ -1,0 +1,198 @@
+---
+title: Demos, pilots and handover
+description: Demos that build trust instead of hype, pilots designed to prove impact (control groups, enough data, a tested analysis with confidence intervals), driving adoption, and a handover that lets the customer run the system without you.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The perfect demo" severity="SEV2">
+The demo was flawless: five carefully chosen tickets, five excellent replies. The executive committee approved the pilot. On the pilot's first morning, agents fed it real tickets: forwarded chains with three languages, screenshots instead of text, angry customers writing in capitals. A third of the drafts were unusable. The agents decided by lunch that "the AI doesn't work", and adoption never recovered, even after the fixes shipped in week two.
+</Incident>
+
+## Demos that build trust
+
+A demo's job isn't to impress. It's to create **accurate expectations** in the people who'll decide and the people who'll use it.
+
+| Do | Don't |
+|---|---|
+| Use the customer's **real** data (with permission), including messy cases | Hand-pick only the cases that work |
+| Show a failure, and what happens then ("it says it isn't sure and routes to an agent") | Hide failure modes and hope |
+| Show the human controls: review, edit, approve, feedback | Present it as fully autonomous when it isn't |
+| Tie it to their metric ("this ticket took 11 minutes; with the draft, about 4") | Show generic AI tricks unrelated to their workflow |
+| Let a user drive it live | Only drive it yourself, on a script |
+
+Showing a failure deliberately is one of the most trust-building things you can do. It tells the audience you understand the system and won't oversell it.
+
+## Designing a pilot that proves something
+
+A pilot is an experiment. Design it like one:
+
+<Diagram
+	caption="A pilot with a control group: similar agents, same period, same ticket types. Only the AI differs, so the difference in outcomes can be attributed to it."
+	code={`flowchart LR
+    T["Eligible tickets<br/>(shipment status, English)"] --> S{"Assigned by<br/>agent team"}
+    S --> C["Control: 15 agents<br/>without drafts"]
+    S --> P["Pilot: 15 agents<br/>with Relay drafts"]
+    C --> M["Same metrics,<br/>same weeks"]
+    P --> M
+    M --> D["Compare with<br/>confidence intervals"]`}
+/>
+
+| Element | Why it matters |
+|---|---|
+| **Baseline** (lesson 2) | The starting point everything is compared with |
+| **Control group** (same period, comparable agents) | Removes seasonal effects, policy changes, and the pilot team simply trying harder |
+| **Enough volume and time** | Small samples produce noise that looks like results (see below) |
+| **Pre-agreed decision rule** | Prevents arguing about the result afterwards |
+| **Guardrail metrics** | A faster process that makes more mistakes isn't a win |
+| **A novelty and learning period** | Week one is learning; measure the steady state, but report everything |
+
+## Did it work? The analysis
+
+Handle times are skewed (a few tickets take very long), so compare **medians** with a **bootstrap confidence interval** rather than averages and gut feeling. A small, tested helper:
+
+```python
+"""Did the pilot work? Compare pilot and control groups with bootstrap confidence intervals."""
+import random
+import statistics
+
+
+def bootstrap_diff(a: list[float], b: list[float], stat=statistics.median, n: int = 5000, seed: int = 0):
+    """Return the observed stat(b) - stat(a) and a 95% confidence interval for it."""
+    rng = random.Random(seed)
+    diffs = sorted(
+        stat(rng.choices(b, k=len(b))) - stat(rng.choices(a, k=len(a)))
+        for _ in range(n)
+    )
+    return stat(b) - stat(a), (diffs[int(0.025 * n)], diffs[int(0.975 * n)])
+
+
+def rate_ci(successes: int, total: int, n: int = 5000, seed: int = 0):
+    """A 95% bootstrap confidence interval for a rate (e.g. tickets resolved without escalation)."""
+    rng = random.Random(seed)
+    outcomes = [1] * successes + [0] * (total - successes)
+    rates = sorted(sum(rng.choices(outcomes, k=total)) / total for _ in range(n))
+    return successes / total, (rates[int(0.025 * n)], rates[int(0.975 * n)])
+```
+
+On simulated pilot data (900 control tickets, 850 pilot tickets):
+
+```text
+full pilot (850 tickets)       median 8.6 min vs 10.4 min control | change -1.8 min, 95% CI [-2.5, -1.2]
+first week only (40 tickets)   median 9.4 min vs 10.4 min control | change -1.0 min, 95% CI [-2.8, +2.7]
+drafts sent with light or no edits: 72% (95% CI 69%-75%)
+same metric, first week only:       72% (95% CI 57%-85%)
+```
+
+The full pilot shows a clear improvement: handle time down 1.8 minutes, and the whole 95% interval (−2.5 to −1.2) is below zero. The **same pilot after its first week** (40 tickets) shows a confidence interval from −2.8 to **+2.7** minutes: the data can't distinguish "much faster" from "slower". A first-week readout presented as "1 minute faster!" would have been noise dressed as a result. The adoption rate has the same pattern: 72% either way, but ±15 points after one week versus ±3 at the end.
+
+Report results with their uncertainty, segment them (by ticket type, agent tenure, language), and read some of the worst cases yourself.
+
+## Adoption is the real risk
+
+Most AI pilots that fail commercially fail on **adoption**, not model quality. What helps:
+
+- **Co-design with users** from the POC on: 2–3 agents who try every version and shape it. They become your champions.
+- **Fit the existing workflow:** drafts appear in the helpdesk they already use, not in a new tab.
+- **Fast feedback loops:** a thumbs-down with a reason, reviewed weekly, with visible fixes ("you told us X, we changed Y").
+- **Respect their expertise:** position the AI as removing tedious steps, with agents in control of what's sent.
+- **Measure adoption per person**, and talk to the people who stopped using it.
+
+## Handover
+
+An engagement isn't finished until the customer can run, change and trust the system without you.
+
+| Handover item | Content |
+|---|---|
+| **Ownership** | A named team that owns the service, its budget and its on-call |
+| **Runbooks** (Module 9) | For each alert: what it means, what to check, how to contain |
+| **Evals and change process** | The eval suite, how to run it, and the rule that every prompt, model or retrieval change goes through it |
+| **Architecture and decisions** | The design docs, the data-flow diagram, and a decision log ("why we chose X") |
+| **Training** | For users (how to use it well, how to give feedback) and for the owning engineers (how it works, how to change it safely) |
+| **Support path** | How they reach your company for product issues, model updates and escalations |
+
+A good test: could the owning team handle a model migration (Module 9) on their own? If not, the handover isn't done.
+
+<FailureCard
+	title="The week-one verdict"
+	symptom="After a rocky first week, users decide the AI 'doesn't work', and later improvements don't change their minds."
+	cause="The pilot launched to all users at once, on untested real-world inputs, without a small group of early users finding the rough edges first."
+	detect="Adoption curves that drop in week one and never recover."
+	fix="Stage the rollout: champions first (on real data), then the pilot group. Set expectations explicitly ('it will be wrong sometimes; here's how to tell us')."
+/>
+
+<ThinkFirst question="At the go/no-go meeting, the pilot hit the handle-time target (−19%, interval −24% to −14%) but adoption was 48%, below the 60% target. The sponsor asks for your recommendation.">
+
+Don't hide the miss, and don't reduce the decision to the headline number:
+
+1. **Report both honestly:** the effect where it's used is strong and clearly real; adoption is below target.
+2. **Explain the adoption gap with data:** adoption per agent, per ticket type, and the feedback. Often a few causes dominate (one ticket subtype with poor drafts, a few agents who never started, a workflow friction).
+3. **Recommend a conditional go:** roll out to the next team with two specific fixes for the main adoption causes, a new adoption target, and a check-in date, or extend the pilot by four weeks with the fixes if the causes are unclear.
+4. **Restate the ROI** at the observed adoption (the ROI sketch from lesson 2): if it still pays back, say so.
+
+The sponsor gets an evidence-based recommendation instead of a pass/fail verdict, and the agreed criteria stay meaningful.
+
+</ThinkFirst>
+
+## 🧪 Module 12 lab: an FDE simulation
+
+Do this with a friend or colleague playing the customer (they get a short brief: their business, their pain, their constraints, and a few surprises to reveal only if asked).
+
+**Deliverables:**
+
+1. **Discovery notes:** the workflow map with timings, scored use cases, the chosen one, and the baseline numbers.
+2. **The one-page design doc**, explicitly agreed by your "customer".
+3. **A data and access audit** and a day-one request email.
+4. **A working POC** on realistic synthetic data, with an eval set and documented failure modes (this is where Modules 1–11 come in).
+5. **A demo** to your "customer", including one deliberate failure.
+6. **A simulated pilot analysis:** generate plausible pilot data, analyse it with confidence intervals, and write a go/no-go recommendation.
+7. **A handover pack:** runbooks, the eval change process, and a decision log.
+8. **A post-mortem** of the engagement: what you'd do differently.
+
+<Practice title="Build it yourself: Module 12 wrap-up">
+
+- **Warm-up:** run the pilot analysis above with different sample sizes and effect sizes. How many tickets do you need to detect a 1-minute improvement reliably?
+- **Stretch:** script a 10-minute demo of Relay for a support director, including a deliberate failure and the human controls.
+- **Boss level:** complete the FDE simulation lab. It's the closest thing to a real engagement you can do alone, and an excellent portfolio and interview story.
+
+</Practice>
+
+<Quiz
+	id="m12-pilots"
+	questions={[
+		{
+			q: 'Why show a failure in a demo?',
+			options: ['To be modest', 'It sets accurate expectations and shows you understand the system\'s limits, which builds trust', 'It\'s required', 'To lower the price'],
+			answer: 1,
+			why: 'Overselling is the fastest way to lose users in week one.',
+		},
+		{
+			q: 'What does a control group protect against?',
+			options: ['Model errors', 'Attributing seasonal effects, policy changes or extra effort to the AI', 'Security issues', 'High costs'],
+			answer: 1,
+			why: 'Same period, comparable people, only the AI differs.',
+		},
+		{
+			q: 'After one week (40 tickets), handle time is 1 minute lower, with a 95% interval of −2.8 to +2.7 minutes. What can you conclude?',
+			options: ['It works', 'Nothing yet: the interval includes both large improvements and slowdowns', 'It doesn\'t work', 'Stop the pilot'],
+			answer: 1,
+			why: 'Too little data. Report the uncertainty, and keep measuring.',
+		},
+		{
+			q: 'Why do many AI pilots fail commercially?',
+			options: ['Model quality only', 'Low adoption by the people who are supposed to use it', 'Too much data', 'Latency'],
+			answer: 1,
+			why: 'Co-design, workflow fit and fast feedback loops drive adoption.',
+		},
+	]}
+/>
+
+<LessonComplete id="fde/demos-pilots-handover" />

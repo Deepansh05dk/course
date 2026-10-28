@@ -1,0 +1,56 @@
+---
+// Cost and latency of one deep-research query as the fan-out grows.
+---
+
+<section class="calc fanout not-content" data-fanout>
+	<p class="calc__badge">🌐 Fan-out calculator: one research question, end to end</p>
+	<div class="calc__grid">
+		<label>Sub-questions from the planner: <output name="subOut"></output><input type="range" name="sub" min="1" max="12" value="5" /></label>
+		<label>Searches per sub-question: <output name="searchOut"></output><input type="range" name="search" min="1" max="5" value="2" /></label>
+		<label>Pages read per sub-question: <output name="pagesOut"></output><input type="range" name="pages" min="1" max="15" value="6" /></label>
+		<label>Tokens per page (after cleaning): <output name="tokOut"></output><input type="range" name="tok" min="500" max="20000" step="500" value="4000" /></label>
+		<label class="fanout__check"><input type="checkbox" name="reader" /> Read pages with a small model first (Haiku 5.5 extracts ~400-token notes per page)</label>
+		<label class="fanout__check"><input type="checkbox" name="cache" /> Serve repeated pages from a page cache (assume 40% hits)</label>
+	</div>
+	<div class="calc__out">
+		<div><span>Cost per question</span><strong data-o="cost"></strong></div>
+		<div><span>Per 10,000 questions / day, monthly</span><strong data-o="month"></strong></div>
+		<div><span>Synthesis input</span><strong data-o="ctx"></strong></div>
+		<div><span>Latency (parallel waves)</span><strong data-o="lat"></strong></div>
+	</div>
+	<p class="calc__note fanout__note" aria-live="polite"></p>
+	<p class="calc__note">Assumptions: planner and synthesizer on Claude Opus 5.5 ($4/$20 per M tokens), reader on Claude Haiku 5.5 ($0.10/$0.50), web search at $10 per 1,000 searches, 2,500-token synthesis answer, 1.5 s per search, 2 s per page fetch, all sub-questions in parallel. Replace them with your measurements.</p>
+</section>
+
+<script>
+	const fmtK = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : `${Math.round(n / 1000)}K`);
+	for (const box of document.querySelectorAll<HTMLElement>('[data-fanout]')) {
+		const v = (n: string) => Number(box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.value);
+		const on = (n: string) => box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.checked;
+		const render = () => {
+			for (const n of ['sub', 'search', 'pages']) box.querySelector<HTMLOutputElement>(`[name="${n}Out"]`)!.value = String(v(n));
+			box.querySelector<HTMLOutputElement>('[name="tokOut"]')!.value = fmtK(v('tok'));
+			const pages = v('sub') * v('pages');
+			const fetched = on('cache') ? pages * 0.6 : pages;
+			const searches = v('sub') * v('search');
+			const plannerCost = (2000 * 4 + 500 * 20) / 1e6;
+			const readerCost = on('reader') ? (fetched * v('tok') * 0.1 + fetched * 400 * 0.5) / 1e6 : 0;
+			const ctx = 3000 + pages * (on('reader') ? 400 : v('tok'));
+			const synthCost = (ctx * 4 + 2500 * 20) / 1e6;
+			const cost = plannerCost + searches * 0.01 + readerCost + synthCost;
+			const lat = 3 + v('search') * 1.5 + 2 + (on('reader') ? 3 : 0) + 25 + ctx / 40000;
+			box.querySelector('[data-o="cost"]')!.textContent = `$${cost.toFixed(3)}`;
+			box.querySelector('[data-o="month"]')!.textContent = `$${Math.round(cost * 10000 * 30).toLocaleString('en')}`;
+			box.querySelector('[data-o="ctx"]')!.textContent = `${fmtK(ctx)} tokens`;
+			box.querySelector('[data-o="lat"]')!.textContent = `~${Math.round(lat)} s`;
+			const synthShare = synthCost / cost;
+			box.querySelector('.fanout__note')!.textContent = !on('reader') && ctx > 100000
+				? `${pages} full pages go into one synthesis call: ${fmtK(ctx)} tokens, ${Math.round(synthShare * 100)}% of the cost. Long contexts also dilute attention. Try the small-model reader.`
+				: on('reader')
+					? `The reader pass turns ${pages} pages into compact notes, so synthesis reads ${fmtK(ctx)} tokens instead of ${fmtK(3000 + pages * v('tok'))}. More model calls, less cost, and every note keeps its source URL for citations.`
+					: `Synthesis is ${Math.round(synthShare * 100)}% of the cost. Searches are cheap; reading is where the tokens go.`;
+		};
+		box.addEventListener('input', render);
+		render();
+	}
+</script>

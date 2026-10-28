@@ -1,0 +1,177 @@
+---
+title: Interview prep
+description: How FDE, applied AI and GenAI engineer interviews work, and how to prepare. A framework for LLM system design questions with a worked example, take-home projects that stand out, customer role-plays, and how to tell your course projects as stories.
+sidebar:
+  order: 6
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+Interview processes vary by company, but for these roles they usually combine some of: a coding round, an **LLM system design** round, a **take-home** or live build, a **customer role-play** (especially for FDE roles), and conversations about past projects. This lesson prepares you for each, using everything in the course.
+
+## LLM system design: a framework
+
+Interviewers want to see how you **think**: clarifying, choosing, trading off, and anticipating failure. A structure for 45 minutes:
+
+<Diagram
+	caption="Spend real time on the first and last boxes. Most candidates rush requirements and never get to failure modes, which is where senior judgment shows."
+	code={`flowchart LR
+    A["1. Clarify<br/>users, scale, risk,<br/>success metric"] --> B["2. Baseline<br/>simplest thing<br/>that could work"]
+    B --> C["3. Architecture<br/>data, retrieval,<br/>model calls, tools"]
+    C --> D["4. Quality<br/>evals, metrics,<br/>human review"]
+    D --> E["5. Production<br/>cost, latency,<br/>security, ops"]
+    E --> F["6. Failure modes<br/>and what you'd<br/>do about them"]`}
+/>
+
+| Step | What to say | Course modules |
+|---|---|---|
+| **1. Clarify** | Who uses it, how many, what's the worst mistake, how we'll know it works | 0, 12 |
+| **2. Baseline** | Start with the simplest design (one call, good prompt, maybe retrieval) and say why you'd add complexity only when evals demand it | 1, 6 |
+| **3. Architecture** | Data and ingestion, retrieval (hybrid, reranking, permissions), model choice, tools, workflow vs agent | 3, 4, 6, 7 |
+| **4. Quality** | The eval set, how it's built, which metrics, LLM judges and their calibration, online monitoring | 5 |
+| **5. Production** | Cost per request with numbers, caching, latency budget, streaming, security, observability | 8–11 |
+| **6. Failure modes** | Three or four concrete ways it fails, with detection and mitigation | Every lesson's failure cards |
+
+**Do the numbers out loud.** "40,000 tickets a month, about 3,000 input tokens each, so 120 million input tokens; with caching most of the prefix is cheap; that's roughly…" Estimation shows you've run real systems.
+
+## A worked example
+
+**"Design an assistant that answers employees' HR policy questions for a 20,000-person company."**
+
+1. **Clarify:** employees in 12 countries, policies differ per country and job level; the worst mistake is a confident wrong answer about benefits or leave; success = fewer HR tickets, high answer accuracy, employees trust it.
+2. **Baseline:** RAG over the policy documents with citations; no agent needed at first.
+3. **Architecture:** ingestion with country and effective-date metadata; **permission-aware retrieval** (an employee sees their country's and level's policies); hybrid search and reranking; answers must cite passages; "I don't know, here's how to reach HR" when retrieval is weak; SSO.
+4. **Quality:** 300 real questions from HR tickets with reference answers per country; faithfulness and correctness judges calibrated against HR experts; per-country slices; HR reviews a weekly sample.
+5. **Production:** volume and cost estimate; prompt caching; streaming; PII rules (questions can contain health data: redact in logs); audit trail.
+6. **Failure modes:** outdated policy versions (effective dates, superseded docs filtered); the wrong country's policy (metadata filters, eval cases per country); questions needing judgment (route to HR); prompt injection via uploaded documents (only HR can publish to the corpus).
+
+## Take-home projects that stand out
+
+Most take-homes get a working demo. The ones that stand out show **production thinking**:
+
+- **An eval set and results**, even a small one, with a short error analysis.
+- **Failure handling:** what happens on bad input, empty retrieval, tool errors, timeouts.
+- **A README with decisions and trade-offs:** what you chose, what you didn't, and what you'd do next with more time.
+- **Cost and latency numbers**, measured.
+- **Scope discipline:** a smaller thing done well beats a bigger thing that half-works. Say what you deliberately left out.
+
+## Customer role-plays
+
+FDE interviews often include a role-play: the interviewer plays a customer (a skeptical CTO, a frustrated sponsor, an over-enthusiastic VP). They're assessing whether you listen, ask good questions, stay honest, and steer toward a plan. Practise one:
+
+<IncidentDrill
+	id="roleplay-drill"
+	mode="decision"
+	title="Role-play: the skeptical CISO"
+	start="s1"
+	nodes={{
+		s1: {
+			text: '"I\'ve read that these models can be tricked into doing anything. Why would I connect one to our customer database?"',
+			choices: [
+				{ label: '"That\'s a fair concern, and it\'s true that models can be manipulated. Can I ask what data and actions you\'re most worried about?"', next: 's2', cost: 0 },
+				{ label: '"Our models are very safe, that\'s not really an issue anymore."', next: 's1b', cost: 30, note: 'Dismissing a valid concern loses a security leader immediately.' },
+			],
+		},
+		s1b: { text: '"That\'s exactly what the last vendor said." The CISO folds their arms. Recover?', choices: [{ label: '"You\'re right to push on it. Let me explain how we design for the model being fooled. What worries you most?"', next: 's2', cost: 5 }] },
+		s2: {
+			text: '"Customer records leaking, and the AI changing data it shouldn\'t."',
+			choices: [
+				{ label: 'Explain the design: the AI acts with each user\'s own permissions, read-only in the pilot, writes go through deterministic checks and human approval, every call is logged. Offer the test evidence', next: 's3', cost: 0 },
+				{ label: 'Explain how the model was trained to refuse bad instructions', next: 'end_ok', cost: 10, note: 'True but not reassuring: it depends on the model never being fooled.' },
+			],
+		},
+		s3: {
+			text: '"And if your design has a bug?"',
+			choices: [
+				{ label: '"Then we want to find it before an attacker does: we\'d welcome your red team testing the pilot, and we\'ll share our own red-team results and the audit logs."', next: 'end_good', cost: 0 },
+				{ label: '"It won\'t, we test everything."', next: 'end_ok', cost: 10, note: 'Overclaiming again. Invite scrutiny instead.' },
+			],
+		},
+		end_good: { text: 'You acknowledged the risk, asked before answering, described controls that don\'t depend on the model, and invited verification. That\'s the pattern.', end: 'good' },
+		end_ok: { text: 'You stayed in the conversation, but leaned on assurances instead of verifiable controls.', end: 'ok' },
+	}}
+/>
+
+The pattern that works in every role-play: **acknowledge, ask, explain with specifics, propose a next step, and never overclaim.**
+
+## Telling your project stories
+
+Your capstones and labs are your best interview material. Tell each as a short story:
+
+1. **The problem and constraints** (one sentence each).
+2. **One key decision** and its trade-off ("I chose a workflow over an agent because…").
+3. **Something that went wrong** and how you found and fixed it (evals, traces, a red-team test).
+4. **A number** (quality before and after, cost per request, latency).
+
+"Something that went wrong" is the part interviewers remember. This course has given you dozens of them: the canary that leaked half a prompt, the semantic cache that served another customer's shipment, the `hash()` idempotency bug. Use them.
+
+<FailureCard
+	title="The architecture-only answer"
+	symptom="The candidate draws a detailed architecture in 20 minutes and gets a lukewarm review."
+	cause="No clarifying questions, no success metric, no evals, no failure modes. The design might be fine, but nothing showed judgment."
+	detect="Ask yourself at minute 5: have I asked who uses it and what the worst failure is?"
+	fix="Follow the framework: clarify first, and save time for quality and failure modes."
+/>
+
+<ThinkFirst question="An interviewer asks: 'Tell me about a time an AI system you built didn't work.' Draft a 60-second answer from one of your course labs.">
+
+An example from the Module 10 lab:
+
+"I added a semantic cache to a support assistant to cut costs. Before shipping, I built a small set of labeled near-miss question pairs, and the test showed that a question about a different shipment ID scored a similarity of 1.0 with a cached one: the cache would have served one customer another customer's shipment status. Negations like 'how do I NOT cancel' also scored higher than real paraphrases, so there was no safe threshold. I fixed the leak by scoping the cache by tenant and by the exact entities in the question, and in the end I mostly relied on prompt caching and exact-match caching instead, which got about the same savings without the risk. The lesson I took away: measure the failure cases before you measure the savings."
+
+Problem, what went wrong, how it was found (a test, not a customer), the fix, and the lesson, all in about a minute.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** do the worked example above yourself in 45 minutes, out loud, with a timer. Record it and listen back.
+- **Stretch:** write the "something went wrong" story for three of your labs, each under 60 seconds.
+- **Boss level:** do a mock interview with a friend: one system design question (they pick from: a contract-review assistant, a sales-call summarizer, an IT helpdesk agent, a deep-research tool) and one customer role-play. Ask for blunt feedback against the framework.
+
+</Practice>
+
+<Quiz
+	id="m12-final"
+	title="Module 12 final quiz"
+	questions={[
+		{
+			q: 'What should the first minutes of an LLM system design interview cover?',
+			options: ['The vector database choice', 'Clarifying users, scale, worst failure and the success metric', 'Model fine-tuning', 'The UI colors'],
+			answer: 1,
+			why: 'Requirements drive every later trade-off.',
+		},
+		{
+			q: 'What makes a take-home project stand out?',
+			options: ['More features', 'An eval set with results, failure handling, measured cost and latency, and a README explaining trade-offs', 'A fancy UI', 'Using the newest framework'],
+			answer: 1,
+			why: 'Production thinking is what these roles hire for.',
+		},
+		{
+			q: 'A skeptical customer says the model can be tricked. Best response pattern?',
+			options: ['Deny it', 'Acknowledge, ask what worries them, explain controls that don\'t depend on the model, and invite verification', 'Change the subject', 'Promise it can\'t happen'],
+			answer: 1,
+			why: 'Honesty plus verifiable controls builds trust.',
+		},
+		{
+			q: 'What part of a project story do interviewers remember most?',
+			options: ['The tech stack', 'What went wrong, how you found it, and how you fixed it', 'The timeline', 'The team size'],
+			answer: 1,
+			why: 'It shows judgment and real experience.',
+		},
+		{
+			q: 'Which stage of an engagement has the highest leverage?',
+			options: ['Production', 'Discovery: choosing the right workflow and agreeing how success is measured', 'Handover', 'The demo'],
+			answer: 1,
+			why: 'Everything later builds on what discovery decides.',
+		},
+	]}
+/>
+
+<LessonComplete id="fde/interview-prep" />

@@ -3,7 +3,7 @@ interface Choice {
 	label: string;
 	next: string;
 	note?: string;
-	/** Minutes of user impact this choice adds. */
+	/** Minutes of user impact (incident mode) or points of wasted time/trust (decision mode) this choice adds. */
 	cost?: number;
 }
 interface Node {
@@ -16,16 +16,20 @@ interface Props {
 	title: string;
 	start: string;
 	nodes: Record<string, Node>;
+	/** "incident" (default) scores user impact in minutes; "decision" is for scenarios that aren't outages. */
+	mode?: 'incident' | 'decision';
 }
 
-const { id, title, start, nodes } = Astro.props;
+const { id, title, start, nodes, mode = 'incident' } = Astro.props;
+const label = mode === 'incident' ? 'User impact' : 'Cost of detours';
+const unit = mode === 'incident' ? 'min' : 'pts';
 ---
 
-<section class="drill not-content" data-drill={id} data-start={start} data-nodes={JSON.stringify(nodes)}>
+<section class="drill not-content" data-drill={id} data-start={start} data-nodes={JSON.stringify(nodes)} data-mode={mode} data-label={label} data-unit={unit}>
 	<header class="drill__head">
-		<span class="drill__badge">🔥 Incident drill</span>
+		<span class="drill__badge">{mode === 'incident' ? '🔥 Incident drill' : '🧭 Decision drill'}</span>
 		<strong>{title}</strong>
-		<span class="drill__impact" aria-live="polite">User impact: 0 min</span>
+		<span class="drill__impact" aria-live="polite">{label}: 0 {unit}</span>
 	</header>
 	<ol class="drill__log"></ol>
 	<div class="drill__stage">
@@ -40,9 +44,16 @@ const { id, title, start, nodes } = Astro.props;
 	type Node = { text: string; choices?: Choice[]; end?: 'good' | 'ok' | 'bad' };
 
 	const endings = {
-		good: '🟢 Incident resolved well.',
-		ok: '🟡 Resolved, with avoidable damage.',
-		bad: '🔴 This went badly. Replay and try another path.',
+		incident: {
+			good: '🟢 Incident resolved well.',
+			ok: '🟡 Resolved, with avoidable damage.',
+			bad: '🔴 This went badly. Replay and try another path.',
+		},
+		decision: {
+			good: '🟢 Well handled.',
+			ok: '🟡 You got there, with avoidable detours.',
+			bad: '🔴 This went badly. Replay and try another path.',
+		},
 	};
 
 	for (const drill of document.querySelectorAll<HTMLElement>('[data-drill]')) {
@@ -52,6 +63,9 @@ const { id, title, start, nodes } = Astro.props;
 		const choices = drill.querySelector<HTMLElement>('.drill__choices')!;
 		const impact = drill.querySelector<HTMLElement>('.drill__impact')!;
 		const restart = drill.querySelector<HTMLButtonElement>('.drill__restart')!;
+		const mode = drill.dataset.mode === 'decision' ? 'decision' : 'incident';
+		const label = drill.dataset.label!;
+		const unit = drill.dataset.unit!;
 		let minutes = 0;
 
 		const show = (key: string) => {
@@ -61,7 +75,7 @@ const { id, title, start, nodes } = Astro.props;
 			if (node.end) {
 				const p = document.createElement('p');
 				p.className = `drill__end drill__end--${node.end}`;
-				p.textContent = `${endings[node.end]} Total user impact: ${minutes} min.`;
+				p.textContent = `${endings[mode][node.end]} Total ${label.toLowerCase()}: ${minutes} ${unit}.`;
 				choices.append(p);
 				restart.hidden = false;
 				return;
@@ -73,7 +87,7 @@ const { id, title, start, nodes } = Astro.props;
 				btn.textContent = choice.label;
 				btn.addEventListener('click', () => {
 					minutes += choice.cost ?? 0;
-					impact.textContent = `User impact: ${minutes} min`;
+					impact.textContent = `${label}: ${minutes} ${unit}`;
 					const li = document.createElement('li');
 					li.innerHTML = '<strong></strong><span></span>';
 					li.querySelector('strong')!.textContent = `You: ${choice.label}`;
@@ -87,7 +101,7 @@ const { id, title, start, nodes } = Astro.props;
 
 		restart.addEventListener('click', () => {
 			minutes = 0;
-			impact.textContent = 'User impact: 0 min';
+			impact.textContent = `${label}: 0 ${unit}`;
 			log.replaceChildren();
 			restart.hidden = true;
 			show(drill.dataset.start!);

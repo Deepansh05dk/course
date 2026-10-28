@@ -435,3 +435,5 @@
 .semtune__row--miss { border-left-color: var(--c-warn); }
 .cascade__table { width: 100%; display: table; font-size: 0.9rem; margin-top: 0.5rem; }
 .calc .calc__grid input[type='range'] { padding: 0; }
+.fanout__check { display: block !important; }
+.roi__note, .fanout__note { font-weight: 600; color: var(--sl-color-text); }
