@@ -1,0 +1,70 @@
+---
+title: How the capstones work
+description: Four portfolio projects that prove you can build and run AI systems in production. What each proves, how they build on each other, the shared rubric, and what to publish.
+sidebar:
+  order: 1
+---
+
+import Diagram from '../../../components/Diagram.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+The modules taught you the pieces, and the labs had you build them into Relay. The capstones are where you build **complete systems on your own**, make your own design decisions, and end with something you can show: a public URL, an eval report, and an honest post-mortem.
+
+## The four projects
+
+| # | Project | Proves | Main modules |
+|---|---|---|---|
+| 1 | [**Enterprise knowledge assistant**](/capstones/knowledge-assistant/): messy documents, permissions, citations, evals | You can make RAG trustworthy | 1–5, 8 |
+| 2 | [**Operations agent**](/capstones/operations-agent/): MCP tools against mock CRM and ticketing systems, approvals, durability | You can give an agent real power safely | 6–8 |
+| 3 | [**Eval and observability platform**](/capstones/eval-platform/) for projects 1 and 2 | You can measure and operate AI systems | 5, 9, 10 |
+| 4 | [**FDE simulation**](/capstones/fde-simulation/): customer brief → discovery → shipped pilot → ROI report + post-mortem | You can deliver for a customer end to end | 12, and everything else |
+
+<Diagram
+	caption="The capstones build on each other: project 3 measures projects 1 and 2, and project 4 reuses all three for a simulated customer."
+	code={`flowchart LR
+    C1["1. Knowledge assistant"] --> C3["3. Eval and observability platform"]
+    C2["2. Operations agent"] --> C3
+    C1 --> C4["4. FDE simulation"]
+    C2 --> C4
+    C3 --> C4`}
+/>
+
+You can do them in order (recommended), or pick the ones closest to the roles you're applying for: knowledge-heavy roles value 1 and 3; agent and platform roles value 2 and 3; FDE roles value 4 most, built on any of the others.
+
+## The shared rubric
+
+Every capstone is assessed on the same six dimensions. Use it to review your own work, or ask a friend to review it with you.
+
+| Dimension | Not yet | Solid | Excellent |
+|---|---|---|---|
+| **Works end to end** | A demo path works | Real inputs, error paths handled | Deployed, used by someone other than you |
+| **Evals** | Manual testing | An eval set with metrics, run in CI | Calibrated judges, segment analysis, error analysis that drove changes |
+| **Safety and security** | Not considered | Threat model, deterministic checks at boundaries | Attack suite with before/after results |
+| **Operability** | Logs | Traces, dashboards, cost tracking | SLO, alerts, runbooks, a game-day post-mortem |
+| **Engineering judgment** | Choices unexplained | Key decisions documented | Trade-offs measured (cost, latency, quality) and explained |
+| **Communication** | README with setup | Architecture diagram, decision log | A write-up a hiring manager would read to the end |
+
+## What to publish for each project
+
+1. **A public URL** (or a recorded walkthrough if it can't be public), running on synthetic or public data only.
+2. **The repository**, with a README covering: the problem, the architecture diagram, how to run it, and the key decisions.
+3. **An eval report**: the dataset, metrics, results, and what changed because of them.
+4. **A post-mortem of what failed**: at least one real problem you hit, how you found it, and what you changed. This is the part that sets your project apart from tutorials.
+
+Never use real customer or employer data in a public portfolio. Every capstone works with synthetic data; capstone 1 includes a generator for it.
+
+<ThinkFirst question="Why does every capstone require a post-mortem of what failed, rather than just a polished result?">
+
+Because that's what the job is. Anyone can build a demo that works on the happy path; production AI engineering is mostly finding out how things fail and designing around it. A post-mortem shows:
+
+- that you **tested** seriously enough to find real problems,
+- how you **diagnose** (traces, evals, error analysis),
+- that you fix at the **right layer** (a deterministic check, not just a prompt tweak),
+- and that you're **honest** about limitations, the trait that customers and teams trust most.
+
+In interviews, "here's what broke and how I found it" is the story people remember (Module 12).
+
+</ThinkFirst>
+
+<LessonComplete id="capstones/overview" />

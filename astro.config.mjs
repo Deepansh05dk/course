@@ -30,6 +30,7 @@ export default defineConfig({
 				{ label: '11 · Deployment & Models', items: [{ autogenerate: { directory: 'deployment' } }] },
 				{ label: '12 · Forward Deployed Engineering', items: [{ autogenerate: { directory: 'fde' } }] },
 				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
+				{ label: 'Capstone Projects', items: [{ autogenerate: { directory: 'capstones' } }] },
 			],
 		}),
 	],

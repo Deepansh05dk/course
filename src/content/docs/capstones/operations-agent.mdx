@@ -1,0 +1,113 @@
+---
+title: "Capstone 2: Operations agent"
+description: Build an agent that resolves damage claims end to end through MCP tools on mock CRM, ticketing and payments systems, with a policy layer, human approvals, durable execution, and an attack suite that proves it stays safe.
+sidebar:
+  order: 3
+---
+
+import Diagram from '../../../components/Diagram.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import CapstoneChecklist from '../../../components/CapstoneChecklist.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+## The scenario
+
+Acme's claims team handles 300 damage claims a week: read the customer's email and photos, check the shipment, check the policy and the customer's history, decide, issue a credit (with approval above a limit), and reply. Build the agent that does the routine 80%, **asks a human when it should, survives restarts, and can't be talked into paying anyone**.
+
+## What this proves
+
+That you can give an agent **real power safely**: tools with side effects, deterministic limits, approvals that survive days, idempotency, and evidence that attacks fail.
+
+## Mock systems to build first
+
+You need systems with realistic behaviour, including failures. Build each as a small service with its own MCP server (Module 7):
+
+| System | Tools | Realistic behaviours to include |
+|---|---|---|
+| **Ticketing** | `get_ticket`, `add_note`, `send_reply(template, ticket_id)` | Threads with attachments; some tickets in German |
+| **CRM** | `get_customer_overview(customer_id)` | Tiers, past claims; 10% of calls slow (3 s), 2% fail |
+| **Shipments** | `get_shipment(shipment_id)` | Delivery dates, fragile flag, insured flag |
+| **Payments** | `issue_credit(claim_id, amount, idempotency_key)` | Deduplicates by idempotency key; records every credit for reconciliation |
+
+Then generate 100 synthetic claims across categories: clear-cut approvals, clear rejections (reported after 48 hours, no photos), ambiguous ones, duplicates (the same claim sent twice), high-value claims, and 10 adversarial ones (hidden instructions in the email, fake "approved by finance" notes, claims for someone else's shipment).
+
+## Architecture starting point
+
+<Diagram
+	caption="A workflow-shaped agent: deterministic steps where possible, model judgment where needed, approvals and side effects behind a policy layer, all checkpointed."
+	code={`flowchart TB
+    E["New claim email"] --> Q["Quarantined reader<br/>(no tools): structured facts"]
+    Q --> A["Claims agent<br/>(LangGraph or your own loop)"]
+    A --> T["MCP tools via host<br/>(allow-list, logging)"]
+    T --> P{"Policy layer"}
+    P -- "allow" --> X["Ticketing / CRM /<br/>shipments / payments"]
+    P -- "needs approval" --> H["Approval queue<br/>(durable pause)"]
+    H -- "approved / denied" --> A
+    A --> CK[("Checkpoints")]
+    A --> R["Reply + note"]`}
+/>
+
+## Requirements
+
+**Must:**
+
+1. MCP servers for all four mock systems, with task-shaped tools, bounded outputs and errors that teach (Module 7).
+2. A policy layer: strict schemas, ownership checks, credit caps, approval above 100 EUR, replies only to the customer on file (Module 8).
+3. The claim email read by a quarantined model that returns constrained facts (Module 8's dual-LLM pattern).
+4. Durable execution: checkpoints after each step; approvals that survive a restart and expire after a set time; preconditions re-checked before acting (Module 6).
+5. Idempotent credits: a chaos test that kills the worker at random points across 50 claims and proves exactly one credit per approved claim.
+6. An eval suite over the 100 claims: decision accuracy against labels, policy violations (must be zero), tool calls per claim, cost per claim.
+7. An attack suite (the 10 adversarial claims plus at least 20 more) with a pass rate reported.
+
+**Should:**
+
+- An approval UI showing the evidence (photos, policy passage, customer history) behind each proposed credit.
+- Tool-definition fingerprinting that blocks drift (Module 7).
+- Traces for every claim (Module 9).
+
+**Stretch:**
+
+- Parallel tool calls where safe (shipment and customer lookups together).
+- A cascade: a small model handles clear-cut claims, the larger model handles ambiguous ones (Module 10), with the cost and accuracy compared.
+
+## Milestones
+
+<CapstoneChecklist
+	id="capstone-2"
+	title="Capstone 2 milestones"
+	items={[
+		{ label: 'Mock systems and their MCP servers, with in-process tests', detail: 'Include the slow and failing CRM calls.' },
+		{ label: '100 labeled synthetic claims, including adversarial ones' },
+		{ label: 'A first agent that resolves clear-cut claims', detail: 'Record its accuracy and failure modes: your baseline.' },
+		{ label: 'Policy layer in front of every tool, with unit tests for each denial path' },
+		{ label: 'Quarantined reader for claim emails', detail: 'The adversarial "approved by finance" email must not change any decision.' },
+		{ label: 'Durable approvals with expiry and re-validation' },
+		{ label: 'Chaos test: exactly one credit per approved claim, under random crashes' },
+		{ label: 'Eval and attack suites in CI, with before/after results' },
+		{ label: 'Deployed demo with the approval UI; post-mortem written' },
+	]}
+/>
+
+## Traps you'll probably hit
+
+<FailureCard
+	title="The double credit"
+	symptom="The chaos test finds three claims with two credits each."
+	cause="The idempotency key was generated inside the retried step, or derived from something that changes between attempts."
+	detect="The chaos test and daily reconciliation against approved claims."
+	fix="Derive the key from the logical action (claim ID + amount) or generate it once and checkpoint it before the call (Module 6)."
+/>
+
+<FailureCard
+	title="The agent that asked about everything"
+	symptom="80% of claims end up in the approval queue; the claims team is busier than before."
+	cause="Thresholds and uncertainty rules were set conservatively, and nobody measured the approval rate against the value of each approval."
+	detect="Approval rate per claim category, and how often humans change the agent's proposal."
+	fix="Auto-approve categories where humans agreed with the agent on, say, 99% of past proposals; keep humans on the rest (Module 2)."
+/>
+
+## Deliverables
+
+A public demo (synthetic data) including the approval flow, the repository with architecture and decision log, the eval and attack reports, the chaos-test results, and a post-mortem.
+
+<LessonComplete id="capstones/operations-agent" />

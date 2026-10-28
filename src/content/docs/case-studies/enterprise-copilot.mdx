@@ -1,0 +1,418 @@
+---
+title: "Case study: a multi-tenant enterprise support copilot"
+description: A full system-design breakdown of an AI support copilot sold to many enterprise customers and deployed by FDEs. Tenant isolation (with a tested canary harness), per-customer configuration, connectors, approvals, per-tenant evals, deployment topologies including customer VPCs, and safe rollouts across tenants.
+sidebar:
+  order: 3
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+Imagine Relay grows up: instead of serving Acme alone, it becomes a **product** that 40 companies use, each with its own helpdesk, CRM, policies, languages, compliance rules and expectations. Some run it in your cloud, a few demand it inside their own network. FDEs onboard each new customer.
+
+This is the most common shape of real applied-AI work, and it combines nearly everything in the course. The new problems are the ones that come from **many customers at once**: isolation, configuration, connectors, per-customer quality, and rolling out changes without breaking anyone.
+
+## 1. The design problem
+
+| Requirement | Why it's hard |
+|---|---|
+| **Strict isolation** between customers | Data flows through many stores (chunks, embeddings, caches, traces, memory, eval sets); one missed filter is a breach |
+| **Each customer is different** | Different systems, policies, tone, languages, approval rules, without 40 forks of the code |
+| **Integrates with their systems** | Zendesk at one, Salesforce at another, a homegrown ticketing system at a third |
+| **Quality per customer** | An average score hides the customer whose documents are scanned PDFs in Dutch |
+| **Some customers need it in their own cloud** | The same product must run in your SaaS and inside a customer's VPC |
+| **Changes must not surprise anyone** | A prompt or model change that helps 39 customers can break the 40th |
+
+## 2. The big picture
+
+<Diagram
+	caption="A control plane (shared, yours) manages configuration, versions, evals and rollouts. Data planes do the work per tenant, with every store partitioned by tenant. Dedicated data planes can run inside a customer's cloud."
+	code={`flowchart TB
+    subgraph CP["Control plane (shared)"]
+      direction LR
+      TC["Tenant registry<br/>+ layered config"] --- RV["AI config versions<br/>+ rollout rings"]
+      RV --- EV["Per-tenant eval suites<br/>+ results"]
+    end
+    subgraph DP["Multi-tenant data plane (your cloud)"]
+      direction LR
+      GW["API + auth<br/>(tenant from SSO)"] --> AG["Copilot agent<br/>(tenant context everywhere)"]
+      AG --> RET[("Retrieval<br/>RLS by tenant")]
+      AG --> CON["Connectors<br/>(MCP per system)"]
+      AG --> MOD["LLM gateway<br/>per-tenant budgets"]
+    end
+    subgraph DD["Dedicated data plane (customer VPC)"]
+      direction LR
+      GW2["Same services,<br/>one tenant"] --> SYS["Customer systems"]
+    end
+    CP --> DP
+    CP -. "config + versions only,<br/>no customer data" .-> DD`}
+/>
+
+The key split: the **control plane** holds configuration, versions and aggregate metrics; the **data plane** holds customer data. A dedicated data plane in a customer's VPC receives configuration and new versions from the control plane, but customer data never flows back. That separation is what makes the "inside our network" deployment possible without a separate product.
+
+## 3. Tenant isolation, everywhere
+
+Tenant ID comes from **authentication** (the user's SSO identity), never from the model or the request body, and is carried as context through every layer:
+
+| Store | Isolation mechanism |
+|---|---|
+| Documents, chunks, embeddings | Row-level security with a fail-closed tenant setting (Module 4), or a separate index per tenant |
+| Tickets, CRM data | Fetched live through the tenant's own connector credentials |
+| Caches (answers, retrieval, pages) | Tenant in every cache key (Module 10) |
+| Agent memory | Per tenant and per user; extraction filters (Module 6) |
+| Traces and logs | Tenant attribute on every span; access control per tenant for support staff |
+| Eval datasets | Per tenant, redacted, never mixed into other tenants' prompts |
+| Prompt cache | Separate by design (prefix match), but **don't put another tenant's examples into a shared prompt** |
+| Fine-tuned or few-shot artifacts | Never trained on one customer's data for another's use without explicit agreement |
+
+The problem is that isolation is a property of **every** read path, including ones added next year. So test it as a property, with **canaries**: plant a unique string in every store for every tenant, run every read path as every other tenant, and fail the build if a canary appears. The harness:
+
+```python
+"""Tenant isolation as a test: plant canaries per tenant, run every read path as another tenant, look for leaks."""
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+@dataclass(frozen=True)
+class Ctx:
+    tenant_id: str
+    user_id: str
+
+
+@dataclass
+class Stores:
+    """Stand-ins for the real stores: documents/chunks, tickets, the answer cache, and traces."""
+    docs: list[dict] = field(default_factory=list)
+    tickets: list[dict] = field(default_factory=list)
+    cache: dict[str, str] = field(default_factory=dict)
+    traces: list[dict] = field(default_factory=list)
+
+
+def canary(tenant: str) -> str:
+    return f"CANARY-{tenant}-7f3a"   # a unique string that must never appear outside its tenant
+
+
+def seed(stores: Stores, tenants: list[str]) -> None:
+    for t in tenants:
+        stores.docs.append({"tenant_id": t, "text": f"Refund policy for {t}. Internal code {canary(t)}."})
+        stores.tickets.append({"tenant_id": t, "text": f"Customer reports a damaged pallet. Ref {canary(t)}."})
+        stores.cache[f"{t}|refund policy"] = f"Cached answer for {t} ({canary(t)})"
+        stores.traces.append({"tenant_id": t, "summary": f"answered refund question {canary(t)}"})
+
+
+def probe(stores: Stores, read_paths: dict[str, Callable[[Stores, Ctx, str], list[str]]],
+          tenants: list[str], queries: list[str]) -> list[str]:
+    """Run every read path as every tenant; report any output containing another tenant's canary."""
+    leaks = []
+    for me in tenants:
+        ctx = Ctx(me, f"user-of-{me}")
+        others = [canary(t) for t in tenants if t != me]
+        for name, read in read_paths.items():
+            for q in queries:
+                for out in read(stores, ctx, q):
+                    for c in others:
+                        if c in out:
+                            leaks.append(f"{name}: tenant {me} saw {c} (query {q!r})")
+    return leaks
+```
+
+Run against five read paths, two of which contain realistic bugs we planted to check that the harness catches them:
+
+```text
+8 leaks found
+  search_docs          ok
+  similar_tickets      LEAKS 6
+  cached_answer        ok
+  cached_answer_v1     LEAKS 2
+  admin_trace_search   ok
+example: similar_tickets: tenant acme saw CANARY-globex-7f3a (query 'damaged pallet')
+```
+
+- `similar_tickets` is the classic: a new feature ("show similar past tickets") written months after the original retrieval code, without the tenant filter. Six leaks.
+- `cached_answer_v1` keyed the answer cache by question only. Note **how** it leaked: the first tenant to ask "refund policy" had its answer served to the other two. Bugs like this pass every single-tenant test.
+- The correct paths filter by tenant **before** ranking. Filtering after ranking (top-k first, then drop other tenants) leaks less obviously and returns too few results (Module 4).
+
+Run the canary suite in CI on every change, and periodically in production against synthetic canary tenants.
+
+## 4. One request, end to end
+
+<AgentStepper
+	title="Trace: a Globex support agent asks for a draft reply"
+	steps={[
+		{ kind: 'user', title: 'Request', body: 'A Globex support agent clicks "Draft reply" on ticket #88213 in Globex\'s helpdesk.' },
+		{ kind: 'harness', title: 'Auth and tenant context', body: 'SSO token → tenant=globex, user=maria, roles=[support_agent]. Tenant config resolved (version 41): Globex tone, Globex policies index, Globex helpdesk connector, refund auto-limit 50 EUR.' },
+		{ kind: 'tool_call', title: 'Connector: fetch ticket', body: 'Globex\'s helpdesk MCP server, called with Globex\'s own credentials. Returns the ticket thread (redacted copy goes to the trace).' },
+		{ kind: 'tool_call', title: 'Retrieve policies', body: 'Hybrid search over the Globex index, RLS enforced by the database with tenant=globex. Top 6 chunks with section and effective date.' },
+		{ kind: 'model', title: 'Draft', body: 'Claude (via the gateway, Globex budget) writes a draft in Globex\'s tone, citing two policy sections. It proposes a 75 EUR goodwill credit.' },
+		{ kind: 'harness', title: 'Policy layer', body: '75 EUR > Globex\'s 50 EUR auto-limit → the credit becomes an approval request for Maria\'s team lead; the draft text says "pending approval".' },
+		{ kind: 'harness', title: 'Output checks', body: 'Citation check passes; no external URLs; the canary token is absent.' },
+		{ kind: 'user', title: 'Maria edits and sends', body: 'The edit distance and her thumbs-up are recorded as feedback in the Globex eval pipeline.' },
+	]}
+/>
+
+## 5. Per-customer configuration without forks
+
+Customers differ in tone, tools, limits, languages and retention. The answer isn't per-customer code; it's **layered configuration**: platform defaults, then an industry pack, then tenant overrides, with **locked keys** that tenants can tighten but never loosen. Tested:
+
+```python
+"""Per-tenant configuration as layers: platform defaults -> industry pack -> tenant overrides, with locked keys."""
+import copy
+
+PLATFORM = {
+    "model": "claude-sonnet-5-5",
+    "tools": ["get_shipment", "search_policies", "draft_reply"],
+    "approval": {"refund_auto_limit_eur": 100},
+    "guardrails": {"pii_redaction_in_logs": True, "output_url_allowlist": True, "canary": True},
+    "retention_days": 30,
+    "tone": "friendly, concise",
+}
+LOCKED = {"guardrails", "retention_days"}          # tenants may tighten these, never loosen them
+TIGHTEN_ONLY = {"approval.refund_auto_limit_eur": min}
+
+INDUSTRY = {
+    "healthcare": {"tools": ["get_shipment", "search_policies", "draft_reply"], "retention_days": 14,
+                   "guardrails": {"phi_redaction": True}},
+    "retail": {"tone": "warm, upbeat"},
+}
+
+
+def _get(d, path):
+    for part in path.split("."):
+        d = d[part]
+    return d
+
+
+def resolve(industry: str | None, overrides: dict) -> tuple[dict, list[str]]:
+    cfg = copy.deepcopy(PLATFORM)
+    rejected = []
+    for layer_name, layer in [("industry", INDUSTRY.get(industry, {})), ("tenant", overrides)]:
+        for key, value in layer.items():
+            if key in LOCKED and layer_name == "tenant":
+                if key == "retention_days" and value <= cfg[key]:
+                    cfg[key] = value                  # shorter retention is a tightening: allowed
+                elif key == "guardrails" and all(v for v in value.values()):
+                    cfg[key] = {**cfg[key], **value}  # adding or keeping guardrails: allowed
+                else:
+                    rejected.append(f"{key}: locked (tenants can tighten, not loosen)")
+                continue
+            if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+                for sub, v in value.items():
+                    rule = TIGHTEN_ONLY.get(f"{key}.{sub}")
+                    if rule and layer_name == "tenant" and rule(v, cfg[key][sub]) != v:
+                        rejected.append(f"{key}.{sub}: can only be lowered (asked {v}, limit {cfg[key][sub]})")
+                        continue
+                    cfg[key][sub] = v
+            elif key == "tools" and layer_name == "tenant":
+                extra = set(value) - set(cfg["tools"])
+                if extra:
+                    rejected.append(f"tools: {sorted(extra)} not enabled for this tenant's tier")
+                cfg["tools"] = [t for t in value if t in cfg["tools"]]
+            else:
+                cfg[key] = value
+    return cfg, rejected
+```
+
+```text
+acme (retail, custom tone, lower refund limit)
+  tone: formal | refund limit: 50 | retention: 30 | tools: ['get_shipment', 'search_policies', 'draft_reply']
+  guardrails: {"pii_redaction_in_logs": true, "output_url_allowlist": true, "canary": true}
+medco (healthcare, asks for longer retention)
+  tone: friendly, concise | refund limit: 100 | retention: 14 | tools: ['get_shipment', 'search_policies', 'draft_reply']
+  guardrails: {"pii_redaction_in_logs": true, "output_url_allowlist": true, "canary": true, "phi_redaction": true}
+  REJECTED retention_days: locked (tenants can tighten, not loosen)
+globex (tries to switch off redaction, raise limit, add a tool)
+  tone: friendly, concise | refund limit: 100 | retention: 30 | tools: ['get_shipment']
+  guardrails: {"pii_redaction_in_logs": true, "output_url_allowlist": true, "canary": true}
+  REJECTED guardrails: locked (tenants can tighten, not loosen)
+  REJECTED approval.refund_auto_limit_eur: can only be lowered (asked 1000, limit 100)
+  REJECTED tools: ['issue_refund'] not enabled for this tenant's tier
+```
+
+- Acme gets its own tone and a **lower** refund limit (tightening is self-service).
+- MedCo's healthcare pack adds PHI redaction and shortens retention to 14 days. Its request for 90 days is rejected: longer retention of logs with personal data is a contract decision for the platform team, not a config toggle.
+- Globex tried to turn off log redaction, raise its refund limit tenfold and enable a refund tool its tier doesn't include. All three are rejected and reported, so the FDE can have the right conversation instead of finding out in an audit.
+
+The resolved config is **versioned** (Module 9): every trace records the tenant's config version, so "what changed for Globex on Tuesday?" has an answer.
+
+## 6. Connectors
+
+Every customer has different systems. Connectors are **MCP servers** (Module 7), one per system type, configured per tenant:
+
+- **Build a small number of good connectors** (the top helpdesks and CRMs cover most customers), with task-shaped tools and per-tenant credentials stored in a secrets manager.
+- **Customer-specific systems** get a connector built during onboarding by the FDE, on the same SDK and test harness, so it's maintainable by the product team afterwards.
+- **Per-tenant rate limits** toward their systems: one tenant's agents shouldn't overload their own 15-year-old ticketing system (Module 7), and one tenant's traffic must never consume another's capacity.
+
+## 7. Quality per customer
+
+| Practice | Why |
+|---|---|
+| **A per-tenant eval suite** built during onboarding (50–200 real, redacted cases, labeled with the customer's experts) | Their documents, language and policies, not your demo data |
+| **A shared core suite** for behaviour every tenant relies on | Catches platform-wide regressions |
+| **Dashboards sliced by tenant** (Module 9) | The struggling customer is invisible in averages |
+| **Feedback signals per tenant** (edit distance, thumbs, escalations) | Online quality between eval runs |
+| **Tenant health reviews** with the account team | FDEs and customer success see the same numbers |
+
+## 8. Rolling out changes across tenants
+
+A new prompt version, model or retrieval setting goes through **rings**:
+
+<Diagram
+	caption="Rollout rings. Each ring requires the change to pass every affected tenant's eval suite, then holds while online metrics are watched. Dedicated deployments update on the customer's schedule."
+	code={`flowchart LR
+    A["Ring 0<br/>internal + canary tenants"] --> B["Ring 1<br/>5 opted-in tenants"]
+    B --> C["Ring 2<br/>all shared-plane tenants"]
+    C --> D["Ring 3<br/>dedicated deployments<br/>(customer change windows)"]
+    A -. "regression in any<br/>tenant's evals" .-> X["Stop, fix,<br/>or pin that tenant"]`}
+/>
+
+- **Per-tenant eval gates:** a change that improves the average but regresses one tenant beyond its noise band stops, or that tenant is **pinned** to the previous version while it's fixed.
+- **Pinning has a cost:** every pinned tenant is a version you maintain. Pins get an owner and an expiry date.
+- **Contractual change windows** for some customers (Module 9's two-weeks-notice example) are part of the ring schedule.
+
+## 9. Deployment topologies
+
+| Topology | Isolation | Cost to run | Upgrade speed | When |
+|---|---|---|---|---|
+| **Shared multi-tenant** (pooled) | Logical (RLS, keys, context) | Lowest | Fastest | Most customers |
+| **Dedicated in your cloud** (silo per tenant) | Separate databases and services | Higher | Fast | Large or regulated customers who want separation without running it |
+| **Customer-hosted** (their VPC) | Physical: data never leaves | Highest (for both sides) | Slowest (their change process) | Banks, healthcare, public sector |
+
+Design so that **the same artifacts** (containers, config, connectors, eval suites) deploy to all three; only the infrastructure templates differ (Module 11). For customer-hosted deployments, plan for: their model route (often their cloud platform), their observability stack, no inbound access for you, and a support process that works through their engineers.
+
+## 10. What breaks
+
+<IncidentDrill
+	id="tenant-leak-drill"
+	title="Another customer's ticket in a draft"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Globex reports that a draft reply mentioned an order number and a company name that aren\'t theirs. First move?',
+			choices: [
+				{ label: 'Treat it as a potential cross-tenant data incident: disable the feature that produced it for all tenants, preserve traces, involve security', next: 's2', cost: 5 },
+				{ label: 'Assume the model hallucinated the details and tune the prompt', next: 's1b', cost: 60, note: 'If it was a real leak, it\'s still happening, to every tenant.' },
+			],
+		},
+		s1b: { text: 'Two more tenants report the same. The details match real orders at other customers. Now?', choices: [{ label: 'Disable the feature everywhere, preserve traces, involve security', next: 's2', cost: 10 }] },
+		s2: {
+			text: 'Traces show the draft used the new "similar past tickets" feature. Scoping?',
+			choices: [
+				{ label: 'Query traces for every call to that feature since release; for each, compare the tenant of the request with the tenants of the returned tickets', next: 's3', cost: 0 },
+				{ label: 'Estimate from the number of complaints', next: 'end_bad', cost: 60, note: 'Complaints are a fraction of exposures. Customers and regulators will ask for the exact scope.' },
+			],
+		},
+		s3: {
+			text: '212 drafts across 9 tenants included another tenant\'s ticket text. Fix and prevention?',
+			choices: [
+				{ label: 'Fix the query (tenant filter enforced by the database, not the code path), notify affected customers per contract, and add the canary isolation suite to CI for every read path', next: 'end_good', cost: 0 },
+				{ label: 'Fix the query and move on', next: 'end_ok', cost: 0, note: 'The next new read path can make the same mistake. Make isolation a tested property.' },
+			],
+		},
+		end_good: { text: 'Treated as a data incident, scoped exactly, fixed at the database layer, and prevented with a canary suite.', end: 'good' },
+		end_ok: { text: 'Fixed for now; the class of bug remains possible.', end: 'ok' },
+		end_bad: { text: 'An unscoped cross-tenant leak is a contractual and legal problem, not just a bug.', end: 'bad' },
+	}}
+/>
+
+<FailureCard
+	title="The noisy neighbour"
+	symptom="Every tenant's latency doubles each Monday morning."
+	cause="One large tenant runs a weekly bulk re-processing job through the same gateway budget and rate limits as everyone's interactive traffic."
+	detect="Per-tenant traffic and latency dashboards; correlation of the spike with one tenant's batch job."
+	fix="Per-tenant rate limits and fair queuing in the gateway, separate budgets for background work, and the Batch API for bulk jobs (Module 10)."
+/>
+
+<FailureCard
+	title="The offboarded customer who wasn't"
+	symptom="Months after a customer left, their documents still appear in a shared evaluation dataset and a few cached answers."
+	cause="Offboarding deleted the tenant's database rows, but not their copies in caches, traces, eval datasets and backups."
+	detect="The canary deletion test (Module 8): offboard a synthetic tenant and search every store for its canaries."
+	fix="A per-tenant data inventory and an offboarding pipeline that covers every store, verified by the canary test."
+/>
+
+## 11. Trade-offs at a glance
+
+| Decision | Option A | Option B | This design |
+|---|---|---|---|
+| Isolation | Separate stack per tenant | Shared stack, logical isolation | Shared by default, dedicated on demand, same artifacts |
+| Customization | Per-customer code | Layered config with locked keys | Config; code only for connectors |
+| Quality | One global eval suite | Per-tenant suites | Shared core suite + per-tenant suites as gates |
+| Rollouts | Everyone at once | Rings with per-tenant gates and pins | Rings, pins with owners and expiry |
+| Model access | Your API keys for everyone | Customer's own platform route | Gateway routes per tenant; customer route for dedicated deployments |
+
+## 12. Build your own mini version
+
+1. Add `tenant_id` to every table and store in your Relay codebase, with Postgres row-level security (Module 4) and the tenant taken from auth.
+2. Add the canary harness above, wired to your **real** read paths, in CI.
+3. Implement layered config with locked keys, versioned, recorded in traces.
+4. Create two synthetic tenants with different policies, tone and languages, each with a 30-case eval suite, and show a change that helps one and hurts the other being caught by the per-tenant gate.
+
+<ThinkFirst question="A bank wants the copilot inside its own cloud, with its own model route, and says 'your engineers get no access to our environment'. What has to be true about your product for this to work, and what changes about how you support them?">
+
+**What must be true about the product:**
+
+1. **Everything ships as artifacts** (containers, infrastructure templates, config, connectors) that their engineers can deploy with their pipeline.
+2. **The model route is configurable:** the gateway's client factory supports their cloud platform (Module 11), and the product only uses features available on that route.
+3. **Observability works with their stack:** OpenTelemetry out to their backend (Module 9), with dashboards and alerts delivered as code.
+4. **Evals run inside their environment,** on their data, with only aggregate results (if anything) shared back.
+5. **Control-plane updates are pull-based:** they fetch new versions and apply them in their change windows; nothing pushes into their network.
+
+**What changes about support:**
+
+- Diagnosis happens **through their engineers**, so runbooks must be excellent and written for people who didn't build the system.
+- Support bundles (redacted logs, config versions, eval results) that their team can generate and share on request.
+- Release notes with **behavioural** changes and eval evidence for every version, because they'll ask before upgrading.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** list every store in your Relay codebase that holds customer data. For each, write how it's isolated by tenant.
+- **Stretch:** wire the canary harness to your real read paths and run it in CI. Then deliberately remove one tenant filter and confirm the build fails.
+- **Boss level:** build the mini version in section 12, including the per-tenant eval gate, and write a one-page "how we isolate tenants" document with test evidence, the kind a customer's security team asks for.
+
+</Practice>
+
+<Quiz
+	id="c3-enterprise-copilot"
+	questions={[
+		{
+			q: 'Where must the tenant ID come from?',
+			options: ['The request body', 'The authenticated identity (SSO), carried as context through every layer', 'The model\'s output', 'The URL'],
+			answer: 1,
+			why: 'Anything the client or model supplies can be wrong or manipulated.',
+		},
+		{
+			q: 'Why test isolation with canaries instead of reviewing code?',
+			options: ['Reviews are slow', 'Isolation must hold for every read path, including ones written later; a canary suite checks it as a property on every change', 'Canaries are cheaper', 'Reviews are not allowed'],
+			answer: 1,
+			why: 'The planted bugs passed single-tenant tests and were caught only by cross-tenant probing.',
+		},
+		{
+			q: 'How did the question-only cache key leak?',
+			options: ['Randomly', 'The first tenant to ask a question had its answer served to every other tenant asking the same question', 'It didn\'t', 'Through logs'],
+			answer: 1,
+			why: 'Tenant belongs in every cache key.',
+		},
+		{
+			q: 'A tenant config tries to disable PII redaction in logs. What should happen?',
+			options: ['Allow it; it\'s their data', 'Reject it: guardrails are locked keys that tenants can tighten, not loosen', 'Ask the model', 'Disable logging entirely'],
+			answer: 1,
+			why: 'Some settings are platform guarantees, not preferences.',
+		},
+		{
+			q: 'A change improves the average eval score but regresses one tenant beyond its noise band. What happens?',
+			options: ['Ship it to everyone', 'Stop the rollout or pin that tenant to the previous version, with an owner and expiry for the pin', 'Ignore the tenant', 'Delete their eval suite'],
+			answer: 1,
+			why: 'Per-tenant gates protect the customers that averages hide.',
+		},
+	]}
+/>
+
+<LessonComplete id="case-studies/enterprise-copilot" />

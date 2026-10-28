@@ -195,16 +195,16 @@ Each case study takes a **hard, real-world-scale system** and breaks it down wit
 |---|---|---|
 | **C1** | [**Claude Code: anatomy of an agentic coding tool**](/case-studies/claude-code/) | The agent loop, tools, context engineering without a vector index, compaction, subagents, permissions, hooks, MCP, and skills: a production agent harness end to end |
 | **C2** | [**A deep-research answer engine**](/case-studies/deep-research/) | Query planning, parallel web search/fetch, source ranking, citation-grounded synthesis, cost control on fan-out, freshness and abuse at scale |
-| **C3** | **A multi-tenant enterprise support copilot** (an FDE deployment) | Tenant isolation, permission-aware RAG over customer systems, MCP connectors, approval workflows, per-customer evals, and rollout inside a customer VPC |
+| **C3** | [**A multi-tenant enterprise support copilot**](/case-studies/enterprise-copilot/) (an FDE deployment) | Tenant isolation, permission-aware RAG over customer systems, MCP connectors, approval workflows, per-customer evals, and rollout inside a customer VPC |
 
 ## 7. Capstone projects
 
 | # | Project | Proves |
 |---|---|---|
-| 1 | **Enterprise knowledge assistant**: messy docs, permissions, citations, evals | RAG, evals, UX |
-| 2 | **Operations agent** using MCP against mock CRM/ticketing systems, with approvals and durability | Agents, MCP, HITL |
-| 3 | **Eval & observability platform** for projects 1–2 | Evals, LLMOps |
-| 4 | **FDE simulation**: customer brief → discovery doc → shipped pilot → ROI report + post-mortem | End-to-end FDE |
+| 1 | [**Enterprise knowledge assistant**](/capstones/knowledge-assistant/): messy docs, permissions, citations, evals | RAG, evals, UX |
+| 2 | [**Operations agent**](/capstones/operations-agent/) using MCP against mock CRM/ticketing systems, with approvals and durability | Agents, MCP, HITL |
+| 3 | [**Eval & observability platform**](/capstones/eval-platform/) for projects 1–2 | Evals, LLMOps |
+| 4 | [**FDE simulation**](/capstones/fde-simulation/): customer brief → discovery doc → shipped pilot → ROI report + post-mortem | End-to-end FDE |
 
 Every capstone ships with a public URL, an eval report, and a **post-mortem of what failed**.
 
@@ -229,4 +229,6 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 | Module 12 · Forward Deployed Engineering | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
 | Case study C2 · Deep-research answer engine | ✅ Ready |
-| Electives, C3, capstones | 📝 Planned (outlined above) |
+| Case study C3 · Multi-tenant enterprise copilot | ✅ Ready |
+| Capstone projects 1–4 | ✅ Ready ([how they work](/capstones/overview/)) |
+| Electives E1–E3 | 📝 Planned (outlined above) |

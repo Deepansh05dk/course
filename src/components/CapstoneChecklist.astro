@@ -1,0 +1,62 @@
+---
+// A milestone checklist for a capstone. Progress is saved in this browser only.
+import { inline } from './fmt';
+
+interface Item {
+	label: string;
+	detail?: string;
+}
+interface Props {
+	id: string;
+	title?: string;
+	items: Item[];
+}
+const { id, title = 'Your progress', items } = Astro.props;
+---
+
+<section class="calc capcheck not-content" data-capcheck={id}>
+	<p class="calc__badge">✅ {title} <small class="capcheck__count"></small></p>
+	<div class="capcheck__bar"><i></i></div>
+	<ol class="capcheck__list">
+		{
+			items.map((item, i) => (
+				<li>
+					<label>
+						<input type="checkbox" data-i={i} />
+						<span>
+							<strong set:html={inline(item.label)} />
+							{item.detail && <small set:html={inline(item.detail)} />}
+						</span>
+					</label>
+				</li>
+			))
+		}
+	</ol>
+	<p class="calc__note">Saved in this browser only.</p>
+</section>
+
+<script>
+	for (const box of document.querySelectorAll<HTMLElement>('[data-capcheck]')) {
+		const key = `capstone:${box.dataset.capcheck}`;
+		const boxes = [...box.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+		let saved: number[] = [];
+		try {
+			saved = JSON.parse(localStorage.getItem(key) ?? '[]');
+		} catch {
+			saved = [];
+		}
+		boxes.forEach((b, i) => (b.checked = saved.includes(i)));
+		const render = () => {
+			const done = boxes.filter((b) => b.checked).length;
+			box.querySelector('.capcheck__count')!.textContent = `${done} / ${boxes.length}`;
+			box.querySelector<HTMLElement>('.capcheck__bar i')!.style.width = `${(done / boxes.length) * 100}%`;
+			try {
+				localStorage.setItem(key, JSON.stringify(boxes.flatMap((b, i) => (b.checked ? [i] : []))));
+			} catch {
+				/* storage unavailable: progress just isn't saved */
+			}
+		};
+		box.addEventListener('change', render);
+		render();
+	}
+</script>

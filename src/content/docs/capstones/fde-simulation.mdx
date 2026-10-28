@@ -1,0 +1,89 @@
+---
+title: "Capstone 4: FDE simulation"
+description: Run a complete forward-deployed engagement against a simulated customer. Customer brief, discovery, a one-page design doc, a shipped pilot, an ROI report with confidence intervals, a handover, and a post-mortem.
+sidebar:
+  order: 5
+---
+
+import Diagram from '../../../components/Diagram.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import CapstoneChecklist from '../../../components/CapstoneChecklist.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+## The scenario
+
+You'll run an engagement from first meeting to handover, against a customer played by a friend, colleague or mentor. It's the closest thing to the real job you can do on your own, and the strongest single portfolio piece for FDE roles.
+
+## Setting it up
+
+Give your "customer" one of these briefs (they read it; you don't), or have them write their own:
+
+| Brief | The customer | What they say they want | What they don't say up front (reveal only if asked) |
+|---|---|---|---|
+| **A: Freight forwarder** | 200-person company, overloaded customer service | "An AI chatbot for our customers" | Most volume is status questions answered from a slow legacy system; their biggest pain is the 2-day backlog of emails, not chat |
+| **B: Insurance claims** | Mid-size insurer, strict compliance | "Automate claims decisions" | Regulators require a human decision; documents are scanned PDFs; their real goal is faster first response |
+| **C: IT helpdesk** | 3,000-employee company | "Something like ChatGPT for IT questions" | 30% of tickets are password resets already solvable with self-service nobody finds; security forbids sending tickets to external services without review |
+
+The customer player should also introduce **two surprises** during the engagement (for example: the data is in a different system than they said; a stakeholder who must approve appears late; the budget is half what was assumed).
+
+## The engagement
+
+<Diagram
+	caption="The engagement in five sessions with your customer. Each session ends with an artifact they react to."
+	code={`flowchart LR
+    S1["Session 1<br/>Discovery interview"] --> S2["Session 2<br/>Design doc review"]
+    S2 --> S3["Session 3<br/>POC demo<br/>(with a failure)"]
+    S3 --> S4["Session 4<br/>Pilot results +<br/>go/no-go"]
+    S4 --> S5["Session 5<br/>Handover"]`}
+/>
+
+| Session | You bring | Module |
+|---|---|---|
+| **1. Discovery** | Questions; afterwards a workflow map with timings, scored use cases, baseline numbers, and a data-access audit | 12 (lessons 2–3) |
+| **2. Design** | A one-page design doc with goals, metrics, non-goals, risks; get explicit agreement | 12 (lesson 4) |
+| **3. POC demo** | A working system on realistic synthetic data (reuse capstones 1–3), its eval results, and a deliberate failure | 1–11 |
+| **4. Pilot results** | Simulated pilot data analysed with confidence intervals, an ROI estimate at observed adoption, and a recommendation | 12 (lesson 5) |
+| **5. Handover** | Runbooks, the eval change process, a decision log, and a support plan | 9, 12 |
+
+## Milestones
+
+<CapstoneChecklist
+	id="capstone-4"
+	title="Capstone 4 milestones"
+	items={[
+		{ label: 'Customer recruited and brief chosen' },
+		{ label: 'Discovery session done; workflow map, baseline and access audit written' },
+		{ label: 'One-page design doc explicitly agreed by the customer' },
+		{ label: 'POC built on synthetic data, with an eval report' },
+		{ label: 'Demo delivered, including a deliberate failure' },
+		{ label: 'Both surprises handled and documented', detail: 'What changed in the plan, and how you communicated it.' },
+		{ label: 'Pilot analysis with confidence intervals and an ROI estimate' },
+		{ label: 'Go/no-go recommendation presented' },
+		{ label: 'Handover pack and post-mortem written' },
+	]}
+/>
+
+## What "excellent" looks like
+
+| Area | Excellent |
+|---|---|
+| **Discovery** | Found the problem behind the request (each brief has one), with numbers |
+| **Scope** | A narrow first use case, explicit non-goals, agreed success criteria |
+| **Build** | Reuses your capstones sensibly; evals on data shaped like the customer's |
+| **Communication** | Every session ends with a clear artifact and next step; surprises handled calmly and transparently |
+| **Results** | Honest uncertainty; a recommendation that follows from the evidence |
+| **Reflection** | A post-mortem that names your own mistakes and what you'd do differently |
+
+<FailureCard
+	title="Building the stated request"
+	symptom="You deliver a polished chatbot for brief A, and the customer's backlog doesn't change."
+	cause="Discovery accepted the stated solution instead of finding the workflow where time goes."
+	detect="Ask in session 1: where does your team's time go? What's measured? What happens to an email today?"
+	fix="Shadow (or role-play shadowing) before designing; propose the use case that moves their metric."
+/>
+
+## Deliverables
+
+A write-up of the engagement (discovery notes, design doc, demo recording, pilot analysis, recommendation, handover pack) and a post-mortem. Ask your customer for a short written review of how the engagement felt from their side; it's valuable feedback and a strong addition to a portfolio.
+
+<LessonComplete id="capstones/fde-simulation" />

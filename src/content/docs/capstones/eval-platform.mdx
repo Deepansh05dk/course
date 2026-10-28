@@ -1,0 +1,102 @@
+---
+title: "Capstone 3: Eval and observability platform"
+description: Build the platform that measures and operates capstones 1 and 2. Datasets from production traces, calibrated judges, CI gates, online monitoring, dashboards and alerts, cost tracking, and a game day with a real post-mortem.
+sidebar:
+  order: 4
+---
+
+import Diagram from '../../../components/Diagram.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import CapstoneChecklist from '../../../components/CapstoneChecklist.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+## The scenario
+
+Acme now runs two AI systems (the knowledge assistant and the claims agent). The head of engineering asks three questions nobody can answer well: "Are they getting better or worse?", "What do they cost, and why?", and "Would we know within minutes if one broke?" Build the platform that answers all three, for both systems, and for the next ones.
+
+## What this proves
+
+That you can **measure and operate** AI systems: the skills behind every "LLMOps" and "AI platform" job description, and the ones FDEs use to prove value to customers.
+
+## Architecture starting point
+
+<Diagram
+	caption="One platform, two feedback loops: offline (datasets, judges, CI gates) and online (traces, monitors, alerts). Traces feed new eval cases."
+	code={`flowchart LR
+    subgraph Apps["Capstone apps"]
+      A1["Knowledge assistant"]
+      A2["Claims agent"]
+    end
+    Apps -- "OTel spans" --> TR[("Trace store")]
+    TR --> DB["Dashboards:<br/>latency, cost, errors,<br/>quality, safety"]
+    TR --> MON["Online monitors<br/>(sampled judges)"]
+    MON --> AL["Alerts + runbooks"]
+    TR -- "flagged traces" --> DS[("Datasets<br/>(redacted)")]
+    DS --> EV["Eval runner +<br/>calibrated judges"]
+    EV --> CI["CI gate on every<br/>prompt / model / config change"]`}
+/>
+
+## Requirements
+
+**Must:**
+
+1. **Tracing** in both apps with OpenTelemetry GenAI attributes plus tenant, feature and config version; content capture off by default, redacted when on (Module 9).
+2. **A trace backend** (Langfuse, Phoenix or your observability stack) and dashboards for latency (with time to first token), errors, cost per request and per outcome, cache hit rate, and safety signals.
+3. **Datasets from traces:** a workflow that turns flagged or sampled production traces into redacted, labeled eval cases.
+4. **Judges calibrated against human labels:** at least two LLM judges with measured true-positive and true-negative rates, and corrected pass rates with confidence intervals (Module 5).
+5. **A CI gate:** every prompt, model or config change runs both apps' eval suites and blocks on critical failures and significant regressions.
+6. **Online monitoring:** sampled judges on production traffic, per-segment, with alerts that page on symptoms only (Module 9).
+7. **An SLO** for each app with a burn-rate alert, and runbooks for every alert.
+8. **A game day:** inject a provider outage and a quality regression; write blameless post-mortems.
+
+**Should:**
+
+- A model-migration dry run on one app using the platform (Module 9's playbook), with a written go/no-go.
+- A cost report that explains spend by feature, model and cache behaviour, with one optimization implemented and measured (Module 10).
+
+**Stretch:**
+
+- A comparison view: two config versions side by side on the same dataset, with diffs of individual answers.
+- Drift detection: alerts when the distribution of question topics or languages shifts.
+
+## Milestones
+
+<CapstoneChecklist
+	id="capstone-3"
+	title="Capstone 3 milestones"
+	items={[
+		{ label: 'Both apps emit OTel spans with GenAI and business attributes' },
+		{ label: 'Trace backend running, one request = one trace tree' },
+		{ label: 'Dashboards for latency, errors, cost, cache, safety, sliced by version' },
+		{ label: 'Trace-to-dataset workflow with redaction' },
+		{ label: 'Two judges calibrated on 100+ human labels each', detail: 'Report TPR, TNR and corrected pass rates with intervals.' },
+		{ label: 'CI gate blocking a deliberately bad prompt change', detail: 'Prove it: open a PR that should fail.' },
+		{ label: 'Online monitors and symptom-based alerts with runbooks' },
+		{ label: 'SLO and burn-rate alert per app' },
+		{ label: 'Game day run; two blameless post-mortems written' },
+	]}
+/>
+
+## Traps you'll probably hit
+
+<FailureCard
+	title="The judge you never checked"
+	symptom="The dashboard says quality is 96%; users say otherwise."
+	cause="The judge was lenient and never compared with human labels."
+	detect="Judge agreement with 100+ human labels, re-checked after any judge change."
+	fix="Calibrate, report corrected pass rates, and re-calibrate when the judge, the app or the traffic changes (Module 5)."
+/>
+
+<FailureCard
+	title="The platform that costs more than the apps"
+	symptom="Online evaluation and trace storage cost more than the two apps they monitor."
+	cause="Every request scored by several frontier-model judges; full content stored for every span, forever."
+	detect="Platform cost as its own line on the cost dashboard."
+	fix="Sampling, cheaper calibrated judges, code checks first, content capture only where needed, and retention limits."
+/>
+
+## Deliverables
+
+The platform running against both apps (screenshots or a recorded walkthrough of the dashboards), the CI gate demonstrated on a pull request, the judge calibration report, and the game-day post-mortems.
+
+<LessonComplete id="capstones/eval-platform" />
