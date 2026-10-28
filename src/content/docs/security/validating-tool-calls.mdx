@@ -1,0 +1,251 @@
+---
+title: Validating tool calls
+description: A deterministic policy layer between the model and your tools. Strict schemas with Pydantic, allow-lists per feature, ownership checks, permission tiers, caps and approval thresholds, and fixing "excessive agency".
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Someone else's shipment" severity="SEV2">
+A customer asked Relay: "What's the status of ACM-2025-000777? It's my colleague's, she asked me to check." Relay looked it up and replied with the delivery address, contents and contact phone number. The shipment belonged to a different company. The `get_shipment` tool did exactly what it was asked. Nothing checked whether **this conversation** was allowed to see **that shipment**.
+</Incident>
+
+The model proposes tool calls; **your code decides** whether they run. That decision point, between "the model wants to call X with Y" and "X runs", is the most important security boundary in an agent. In OWASP terms, it's where you prevent **excessive agency** (LLM06).
+
+<Diagram
+	caption="Every tool call passes through the policy layer. It knows things the model doesn't control: which feature is running, who the user is, and which customer the conversation is about."
+	code={`flowchart LR
+    M["Model proposes<br/>tool call"] --> V{"Policy layer"}
+    S["Session from auth:<br/>feature, user, customer"] --> V
+    V -- "allow" --> T["Execute tool"]
+    V -- "needs approval" --> H["Approval queue<br/>(Module 6)"]
+    V -- "deny + reason" --> R["is_error tool result<br/>back to the model"]`}
+/>
+
+## What the policy layer checks
+
+| Check | Question | Relay example |
+|---|---|---|
+| **Allow-list per feature** | May this feature use this tool at all? | The public tracking bot can't call `issue_refund`, whatever the prompt says |
+| **Strict schema** | Are the arguments well-formed, with no extras? | Shipment IDs match `ACM-dddd-dddddd`; unknown fields are rejected |
+| **Ownership / authorization** | Is this user allowed to touch this object? | The shipment must belong to the conversation's customer (from auth, not from the model) |
+| **Permission tier** | Read, write or destructive? | Reads auto-run; writes are checked further; destructive tools aren't exposed at all |
+| **Caps and rate limits** | Is the amount or frequency within limits? | Max 5,000 EUR per refund, 1,000 EUR per customer per day |
+| **Approval threshold** | Does a human need to see this first? | Refunds over 100 EUR go to the approval queue |
+| **Constrained targets** | Can the model choose where data goes? | `send_email` takes `"customer_on_file"`, not an address |
+
+## A policy layer in Python
+
+Tested with the calls below (including several an attacker would try):
+
+```python
+"""A deterministic policy layer between the model's tool calls and execution."""
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+ShipmentId = Annotated[str, Field(pattern=r"^ACM-\d{4}-\d{6}$")]
+
+
+class Tier(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    DESTRUCTIVE = "destructive"
+
+
+class Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # unknown arguments are an error, not ignored
+
+
+class GetShipment(Strict):
+    shipment_id: ShipmentId
+
+
+class IssueRefund(Strict):
+    shipment_id: ShipmentId
+    amount_eur: Annotated[Decimal, Field(gt=0, le=5000, decimal_places=2)]
+    reason: Annotated[str, Field(min_length=10, max_length=500)]
+
+
+class SendEmail(Strict):
+    to: Literal["customer_on_file"]  # the model can't choose a recipient; the server resolves it
+    template: Literal["delay_update", "claim_received", "refund_issued"]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    args: type[BaseModel]
+    tier: Tier
+
+
+TOOLS = {
+    "get_shipment": ToolSpec(GetShipment, Tier.READ),
+    "issue_refund": ToolSpec(IssueRefund, Tier.WRITE),
+    "send_email": ToolSpec(SendEmail, Tier.WRITE),
+}
+
+FEATURE_ALLOW = {  # which tools each product feature may use at all
+    "support_chat": {"get_shipment", "send_email", "issue_refund"},
+    "public_tracking_bot": {"get_shipment"},
+}
+
+AUTO_APPROVE_REFUND_LIMIT = Decimal("100")
+
+
+@dataclass
+class Session:
+    feature: str
+    user_id: str
+    customer_id: str          # who this conversation is about, from auth, never from the model
+    refunded_today: Decimal = Decimal("0")
+
+
+@dataclass
+class Decision:
+    action: Literal["allow", "needs_approval", "deny"]
+    reason: str
+    args: BaseModel | None = None
+
+
+def owner_of(shipment_id: str) -> str:  # stand-in for a database lookup
+    return {"ACM-2025-000183": "CUST-42", "ACM-2025-000777": "CUST-99"}.get(shipment_id, "unknown")
+
+
+def check(session: Session, tool: str, raw_args: dict) -> Decision:
+    if tool not in FEATURE_ALLOW.get(session.feature, set()):
+        return Decision("deny", f"tool '{tool}' is not enabled for {session.feature}")
+    spec = TOOLS[tool]
+    try:
+        args = spec.args.model_validate(raw_args)
+    except ValidationError as e:
+        first = e.errors()[0]
+        return Decision("deny", f"invalid arguments: {'.'.join(map(str, first['loc']))}: {first['msg']}")
+
+    shipment_id = getattr(args, "shipment_id", None)
+    if shipment_id and owner_of(shipment_id) != session.customer_id:
+        return Decision("deny", "shipment does not belong to this conversation's customer")
+
+    if isinstance(args, IssueRefund):
+        if session.refunded_today + args.amount_eur > Decimal("1000"):
+            return Decision("deny", "daily refund cap for this customer reached")
+        if args.amount_eur > AUTO_APPROVE_REFUND_LIMIT:
+            return Decision("needs_approval", f"refund of {args.amount_eur} EUR exceeds auto-approve limit", args)
+    return Decision("allow", "ok", args)
+```
+
+The test calls and their decisions:
+
+```text
+get_shipment    allow           ok
+get_shipment    deny            shipment does not belong to this conversation's customer
+get_shipment    deny            invalid arguments: shipment_id: String should match pattern '^ACM-\d{4}-\d{6}$'
+issue_refund    allow           ok
+issue_refund    needs_approval  refund of 340.00 EUR exceeds auto-approve limit
+issue_refund    deny            invalid arguments: amount_eur: Input should be less than or equal to 5000
+send_email      deny            invalid arguments: to: Input should be 'customer_on_file'
+send_email      deny            invalid arguments: bcc: Extra inputs are not permitted
+delete_customer deny            tool 'delete_customer' is not enabled for support_chat
+(tracking bot)  deny            tool 'issue_refund' is not enabled for public_tracking_bot
+(980 EUR today) deny            daily refund cap for this customer reached
+```
+
+Read the design choices, because each one closes a hole:
+
+- **`customer_id` comes from the session**, which comes from authentication. The model never supplies it, so it can't be talked into another customer's data. That one line fixes the incident above.
+- **`extra="forbid"`** rejects unexpected arguments, like a sneaky `bcc`. By default, Pydantic silently **ignores** extra fields, which is exactly wrong here.
+- **`to: Literal["customer_on_file"]`**: the model can't pick a recipient at all. The server resolves the real address. This removes the "external communication" leg of the lethal trifecta for email.
+- **Amounts are `Decimal`, bounded in the schema**, and the daily cap is checked against state the model can't see or change.
+- **Denials come with reasons.** Return them as `is_error` tool results (Module 6) so the model can explain to the user ("I can't look up shipments for other accounts") instead of retrying blindly.
+
+## Permission tiers and the principle of least agency
+
+Before adding a tool, ask the questions in order:
+
+1. **Does the agent need it at all?** Leave out anything destructive (`delete_customer`), and anything general-purpose (`run_sql`, `http_request`) that would make every other check meaningless.
+2. **Can it be narrower?** `issue_refund(shipment_id, amount)` instead of `update_payment(record)`. `send_email(template)` instead of `send_email(to, subject, body)`.
+3. **Can it be read-only?** Many "agent" features only need to read and draft; a human does the write.
+4. **What's the blast radius if it's misused 100 times?** Caps, rate limits and approvals should bound that number to something you can live with.
+
+<FailureCard
+	title="Policy in the prompt"
+	symptom="Refund limits are 'enforced' inconsistently; an angry, persistent customer gets 2,000 EUR."
+	cause="The limit lived in the system prompt ('never refund more than 500 EUR'). A prompt is guidance the model weighs against everything else in the context."
+	detect="Red-team with social engineering ('my manager approved it', 'I'm a platinum customer'), and alert on refunds above the documented limit."
+	fix="Limits in code at the tool boundary. The prompt can explain the policy so the model communicates it well, but it isn't what enforces it."
+/>
+
+<FailureCard
+	title="Validated the format, not the meaning"
+	symptom="A perfectly well-formed refund was issued against a shipment that had been delivered on time, intact."
+	cause="The schema checked types and ranges, but no business rule checked that a refund was justified (an open claim, a delay over the SLA)."
+	detect="Reconcile refunds against claims and delivery data daily; alert on refunds with no matching claim."
+	fix="Add business preconditions to write tools: a refund requires an open, approved claim ID, verified server-side."
+/>
+
+<ThinkFirst question="Relay gets a new tool: `update_delivery_address(shipment_id, new_address)`. Customers often ask to redirect deliveries. Design the policy for it: what would you check, and what would you never allow the model to do alone?">
+
+- **Allow-list:** only the authenticated customer chat feature; never the public bot or the email-processing agent (an email is an easy way to inject "redirect this to…").
+- **Ownership:** the shipment belongs to the session's customer.
+- **State precondition:** only while the shipment hasn't left the last depot; the server checks this, not the model.
+- **Constrained target:** ideally the new address must be one of the customer's **saved addresses** (an enum resolved server-side), not free text.
+- **Approval or verification:** a new, unsaved address triggers a verification step to the customer's registered email or phone (an out-of-band confirmation), because redirecting goods is a classic fraud pattern.
+- **Audit:** log the old and new address, the conversation, and the user.
+
+The model can **propose** a redirect. It can never complete one to an unverified address on its own.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** list every tool your Relay agent has. Label each read, write or destructive. Remove one you don't strictly need.
+- **Stretch:** put the policy layer between your Module 6 agent loop and its tools. Denials return `is_error` results; approvals use your Module 6 approval queue.
+- **Boss level:** write a property-based test (for example with Hypothesis) that generates random tool calls and session contexts, and asserts that no call ever executes on a shipment the session's customer doesn't own.
+
+</Practice>
+
+<Quiz
+	id="m8-tool-validation"
+	questions={[
+		{
+			q: 'Where should the customer ID used for authorization come from?',
+			options: ['The model\'s tool arguments', 'The authenticated session, never from the model', 'The user\'s message text', 'The system prompt'],
+			answer: 1,
+			why: 'Anything the model supplies can be influenced by an attacker. Identity comes from authentication.',
+		},
+		{
+			q: 'What does Pydantic do with unexpected extra fields by default?',
+			options: ['Rejects them', 'Silently ignores them; you need extra="forbid" to reject them', 'Logs a warning', 'Crashes'],
+			answer: 1,
+			why: 'For tool arguments you want an error, so smuggled parameters are visible and denied.',
+		},
+		{
+			q: 'Why does send_email take "customer_on_file" instead of an email address?',
+			options: [
+				'It is shorter',
+				'So the model can\'t choose a recipient: an injected instruction can\'t send data to an attacker',
+				'Email addresses are PII',
+				'The API requires it',
+			],
+			answer: 1,
+			why: 'Constraining targets removes the external-communication leg of the lethal trifecta.',
+		},
+		{
+			q: 'Which tool should a customer-support agent most likely NOT have?',
+			options: ['get_shipment', 'run_sql(query)', 'search_policies', 'create_claim'],
+			answer: 1,
+			why: 'A general-purpose tool makes every other check meaningless. Expose narrow, task-shaped tools.',
+		},
+	]}
+/>
+
+<LessonComplete id="security/validating-tool-calls" />

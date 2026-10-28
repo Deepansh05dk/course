@@ -1,0 +1,196 @@
+---
+title: Versioned AI config and safe model migrations
+description: Treating model, prompt, parameters, tools and retrieval settings as one versioned release, pinning model versions, deprecation schedules, and a step-by-step playbook for migrating to a new model without surprises.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The upgrade that changed everything at once" severity="SEV2">
+A new model generation came out, scoring higher on every public benchmark. On Friday afternoon, Relay switched to it by changing one environment variable. By Monday: the reply drafts were 40% longer (agents complained), the JSON parser failed on 3% of triage outputs (a slightly different format around one field), and cost per conversation rose 25% because the new model called tools more often. Each change was small. Together, and all at once, with no way to tell which caused what, they took a week to untangle.
+</Incident>
+
+## The unit of release is the whole AI config
+
+Behaviour comes from **everything together**, not from the prompt alone:
+
+| Part | Example |
+|---|---|
+| Model and version | `claude-sonnet-5-5` |
+| Parameters | `max_tokens`, effort or thinking settings, temperature where used |
+| Prompt version | `reply_draft/system.v7` |
+| Tool set and tool descriptions | `support_tools@2026-10-01` |
+| Retrieval config | Embedding model, chunking, `k`, reranker on/off |
+| Policies and guardrails | Approval thresholds, output filters |
+
+Bundle them into one **versioned AI config** that's reviewed, evaluated, deployed, recorded in every trace, and rolled back together:
+
+```yaml
+# ai-configs/reply_draft.yaml
+id: reply_draft
+version: 23
+model: claude-sonnet-5-5
+max_tokens: 1200
+prompt: reply_draft/system.v7
+tools: support_tools@2026-10-01
+retrieval: {embedding: voyage-3.5, k: 8, rerank: true}
+eval_baseline: {faithfulness: 0.94, tone_pass: 0.91, cost_per_conv_usd: 0.021}
+```
+
+That gives you three properties you'll want in every incident:
+
+1. **"What changed?"** has an exact answer: version 22 → 23, and the diff.
+2. **Every trace records the config version** (lesson 1), so dashboards can compare versions side by side.
+3. **Rollback is one switch**, not a hunt through environment variables.
+
+Many teams store these configs in git and select the active version with a **feature flag** service, which also gives percentage rollouts and per-tenant targeting for free.
+
+## Model versions, aliases and deprecations
+
+- **Pin exact model versions in production.** If your provider offers moving aliases (an ID that always points at "the latest"), use them only in development. A silent model change in production is an unreviewed release.
+- **Track deprecation dates.** Providers retire older models on a published schedule. Keep a list of every model ID your systems use (including in evals, judges and batch jobs) with its retirement date, and plan migrations months ahead, not the week before.
+- **Judges are models too.** Upgrading the judge in your eval suite (Module 5) changes your metrics. Recalibrate it against human labels before trusting the new numbers.
+
+## What changes when the model changes
+
+New models are usually better overall, and different in the details:
+
+| What can shift | How to catch it |
+|---|---|
+| Output length and style | Track output tokens per feature; tone/format evals |
+| Format details (JSON fields, markdown, whitespace) | Structured outputs (Module 1) remove most of this risk; schema validation rates |
+| Tool-use behaviour (more or fewer calls, different choices) | Tool-call counts and trajectory evals (Module 5) |
+| Refusals and caution | Refusal rate on a set of legitimate edge cases |
+| Token counts for the same text (a different tokenizer) | Cost per request, context budget checks |
+| Latency profile | p50/p95 and time to first token per feature |
+| Supported parameters | API errors in staging; read the migration notes |
+
+## The migration playbook
+
+<Diagram
+	caption="A model migration as a sequence of gates. Each one can send you back; none of them is skipped because the new model 'is obviously better'."
+	code={`flowchart LR
+    A["1. Offline evals<br/>full suite, old vs new"] --> B["2. Adjust prompts<br/>and config, re-run"]
+    B --> C["3. Shadow traffic<br/>compare on real inputs"]
+    C --> D["4. Canary 5%<br/>watch dashboards"]
+    D --> E["5. Ramp<br/>25% → 50% → 100%"]
+    E --> F["6. Keep old config<br/>ready for rollback"]
+    D -. "regression" .-> R["Roll back<br/>(one switch)"]
+    E -. "regression" .-> R`}
+/>
+
+1. **Offline evals first.** Run the full suite on both models. Look at the per-segment results and read the diffs, not just the averages.
+2. **Adapt.** Prompts tuned for the old model may need changes (newer models often need fewer instructions and examples). Change **one thing at a time** and re-run.
+3. **Shadow.** Send a sample of real traffic to the new config in parallel; users see only the old one. Compare outputs with judges and sampling, and compare cost and latency.
+4. **Canary.** Route a small share of real users (or one internal team, or one friendly tenant) to the new config. Watch the dashboards (lesson 4) and online evals.
+5. **Ramp** in steps, with a hold period at each step long enough to see your slowest metric move.
+6. **Keep the old config deployable** until the new one has run cleanly for a full business cycle (often a week or two).
+
+<IncidentDrill
+	id="migration-drill"
+	title="Migrate Relay to a new model"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'The current model retires in 90 days. A newer model scores higher on public benchmarks. Your first step?',
+			choices: [
+				{ label: 'Run Relay\'s full eval suite on both models and compare per segment', next: 's2', cost: 2 },
+				{ label: 'Switch production now; benchmarks say it\'s better', next: 's1b', cost: 50, note: 'This is the incident at the top of the page.' },
+			],
+		},
+		s1b: { text: 'Monday: longer drafts, JSON failures, cost up 25%. What now?', choices: [{ label: 'Roll back, then start again with offline evals', next: 's2', cost: 10 }] },
+		s2: {
+			text: 'Evals: faithfulness +2 points, but reply length +38% and the "tone" eval drops for German-speaking customers. Next?',
+			choices: [
+				{ label: 'Adjust the prompt (length guidance, German style examples), one change at a time, and re-run', next: 's3', cost: 3 },
+				{ label: 'Ship it; faithfulness matters most', next: 'end_ok', cost: 20, note: 'German-speaking customers get a worse product, and you knew in advance.' },
+			],
+		},
+		s3: {
+			text: 'Evals now beat the old model in every segment. How do you go live?',
+			choices: [
+				{ label: 'Shadow on real traffic for a few days, then a 5% canary with dashboards, then ramp', next: 's4', cost: 2 },
+				{ label: 'Go to 100% with the rollback switch ready', next: 'end_ok', cost: 10, note: 'Evals never cover everything. Shadow and canary catch what they miss, at a fraction of the blast radius.' },
+			],
+		},
+		s4: {
+			text: 'At 5%, cost per conversation is +18%: the new model calls search_policies more often. Quality is up. Decide.',
+			choices: [
+				{ label: 'Investigate with traces: if the extra calls improve answers, accept and update the budget; if not, tune the tool description and re-test', next: 'end_good', cost: 0 },
+				{ label: 'Roll back; cost must not increase', next: 'end_ok', cost: 5, note: 'Possibly right, but decide from evidence (do the calls help?), not reflex.' },
+			],
+		},
+		end_good: { text: 'Evidence at every gate, small blast radius, and a cost trade-off decided with data. That\'s a professional migration.', end: 'good' },
+		end_ok: { text: 'You got there, but some users paid for a shortcut.', end: 'ok' },
+	}}
+/>
+
+<FailureCard
+	title="The judge upgrade that 'improved' quality"
+	symptom="Faithfulness jumped from 91% to 96% overnight, with no product change."
+	cause="The eval suite's judge model was upgraded at the same time. The new judge was more lenient; nothing in the product had improved."
+	detect="Version the judge like any other config; track judge agreement with human labels (Module 5)."
+	fix="Never change the product and the judge in the same step. Recalibrate a new judge on human-labeled data before using it."
+/>
+
+<ThinkFirst question="Relay serves 40 business customers. One large customer has a contract that forbids behaviour changes without two weeks' notice. How does that change your rollout design?">
+
+- **Per-tenant config targeting:** the AI config version is chosen per tenant (feature flags make this easy). That customer stays on the current version while others ramp.
+- **Advance notice with evidence:** share the eval results for **their** data (a per-customer eval set, Module 5) and the planned date.
+- **A tenant-specific canary:** offer them a staging tenant or a shadow comparison on their own traffic during the notice period.
+- **Model retirement still applies:** if the old model retires, their deadline is the provider's deadline, so start the conversation early. This is exactly the kind of planning FDEs own in enterprise accounts.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** write Relay's current AI config as a YAML file like the one above, and record its version in every trace.
+- **Stretch:** add a flag that routes a percentage of conversations (or chosen tenants) to config version N+1, with the version visible on your dashboards.
+- **Boss level:** run a full mock migration to a different model for one Relay feature: evals, prompt adjustments, a shadow comparison on replayed traffic, a written go/no-go decision with numbers, and the rollback test.
+
+</Practice>
+
+<Quiz
+	id="m9-migrations"
+	questions={[
+		{
+			q: 'What should be versioned and released together?',
+			options: ['Only the prompt', 'The whole AI config: model, parameters, prompt, tools, retrieval settings and policies', 'Only the model', 'Nothing; edit in place'],
+			answer: 1,
+			why: 'Behaviour comes from all of them together, so they ship and roll back together.',
+		},
+		{
+			q: 'Why pin exact model versions in production?',
+			options: ['It is cheaper', 'A moving alias can change behaviour without any review: an unplanned release', 'Aliases are slower', 'It is required by every provider'],
+			answer: 1,
+			why: 'Every behaviour change in production should be a decision you made.',
+		},
+		{
+			q: 'What is shadow mode?',
+			options: [
+				'Running the new version on real inputs in parallel, while users only see the old one',
+				'Deploying at night',
+				'A dark UI theme',
+				'Testing only on synthetic data',
+			],
+			answer: 0,
+			why: 'Real inputs, zero user risk: ideal for model migrations.',
+		},
+		{
+			q: 'Faithfulness rose 5 points the same day the judge model was upgraded. What do you conclude?',
+			options: ['The product improved', 'Nothing yet: the measurement changed. Recalibrate the judge against human labels first', 'The old judge was broken', 'Lower the threshold'],
+			answer: 1,
+			why: 'Change the product or the ruler, never both at once.',
+		},
+	]}
+/>
+
+<LessonComplete id="llmops/versioning-and-migrations" />

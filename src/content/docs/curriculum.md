@@ -136,24 +136,22 @@ You build one product the whole way through, like a real FDE engagement. *Acme L
 6. [MCP security and enterprise integration](/mcp/security-and-enterprise/): tool poisoning, rug pulls, cross-server exfiltration, legacy systems, A2A, and the Module 7 lab
 
 #### Module 8 · Safe Tool Execution & AI Security *(weeks 16–17)*
-- Why `exec()` on model output is a breach waiting to happen: fork bombs, credential theft, disk wipes
-- Validating tool calls (schemas, Pydantic, allow-lists) before execution
-- Sandboxes: containers vs **gVisor** vs **Firecracker microVMs**; network egress control
-- Permission tiers (read vs mutate), idempotency keys, approval thresholds
-- OWASP Top 10 for LLM applications; direct vs **indirect** prompt injection (PDFs, emails, web pages)
-- Jailbreaks and obfuscation (Base64, many-shot); **canary tokens** for system-prompt leaks
-- **Dual-LLM / quarantined-reader** architecture
-- Guardrails: Presidio PII redaction, Llama Guard / NeMo Guardrails, deterministic policy layers
-- Red-teaming your own system; compliance context (SOC 2, GDPR, EU AI Act)
-- 🎮 Injection lab: attack Relay, then defend it layer by layer
+1. [The AI threat model](/security/threat-model/): trust boundaries, the lethal trifecta, the OWASP Top 10 for LLM applications (2025), threat modelling in 20 minutes
+2. [Prompt injection and jailbreaks](/security/prompt-injection/): direct vs indirect, obfuscation, spotlighting, streaming-safe canary tokens (tested), and the 🎮 injection lab
+3. [Validating tool calls](/security/validating-tool-calls/): a deterministic policy layer with Pydantic, allow-lists, ownership from the session, caps, approvals (tested)
+4. [Sandboxing model-generated code](/security/sandboxing/): process limits (tested, and what they miss), containers, gVisor, Firecracker microVMs, egress control
+5. [The dual-LLM pattern](/security/dual-llm/): quarantined readers, constrained outputs, opaque references, data-flow rules (tested)
+6. [Guardrails and PII](/security/guardrails/): Presidio redaction (tested, with its misses), Llama Guard, NeMo Guardrails, latency and false positives
+7. [Red-teaming and compliance](/security/red-teaming-and-compliance/): promptfoo, garak, PyRIT, attack regression suites; SOC 2, GDPR, the EU AI Act; and the Module 8 lab
 
 ### Phase 5: Production
 
 #### Module 9 · LLMOps & Observability *(week 18)*
-- Tracing every LLM and tool call: OpenTelemetry GenAI conventions, Langfuse/Phoenix trace trees
-- Prompt/config versioning; safe model migrations; LLM gateways (abstraction, keys, budgets, fallbacks)
-- Cost, latency and quality dashboards; alerting without alert fatigue
-- Incident response and blameless post-mortems for AI features
+1. [Tracing LLM and agent calls](/llmops/tracing/): OpenTelemetry GenAI conventions, instrumenting model and tool calls (tested), an interactive trace viewer, what not to capture
+2. [Versioned AI config and safe model migrations](/llmops/versioning-and-migrations/): the AI config as the release unit, pinning, deprecations, the migration playbook
+3. [LLM gateways](/llmops/llm-gateway/): keys, budgets, retries, circuit breakers and fallback (tested), build vs buy
+4. [Dashboards and alerting](/llmops/dashboards-and-alerting/): AI signals, SLOs and burn-rate alerts, and the 🎮 alert tuner
+5. [Incident response for AI features](/llmops/incident-response/): kill switches, runbooks, blast-radius queries, blameless post-mortems, and the Module 9 lab
 
 #### Module 10 · Performance & Cost Optimization *(week 19)*
 - **Provider prompt caching** (the biggest safe win) and the silent things that break it
@@ -224,5 +222,7 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 | Module 5 · Evals & CI | ✅ Ready |
 | Module 6 · Tools, Workflows & Agents | ✅ Ready |
 | Module 7 · MCP & Enterprise Integrations | ✅ Ready |
+| Module 8 · Safe Tool Execution & AI Security | ✅ Ready |
+| Module 9 · LLMOps & Observability | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
-| Modules 8–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
+| Modules 10–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |

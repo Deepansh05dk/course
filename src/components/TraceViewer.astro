@@ -1,0 +1,85 @@
+---
+// A waterfall view of OpenTelemetry spans (as exported by the lesson's tracing demo). Click a span for its attributes.
+interface Span {
+	id: string;
+	parent: string | null;
+	name: string;
+	start: number;
+	duration: number;
+	status: string;
+	attributes: Record<string, unknown>;
+}
+interface Props {
+	spans: Span[];
+	title?: string;
+}
+const { spans, title = 'Trace viewer' } = Astro.props;
+---
+
+<section class="trace not-content" data-trace={JSON.stringify(spans)}>
+	<p class="trace__badge">🔎 {title} <small>(click a span)</small></p>
+	<div class="trace__stats"></div>
+	<ol class="trace__rows"></ol>
+	<dl class="trace__attrs" aria-live="polite"></dl>
+</section>
+
+<script>
+	type Span = {
+		id: string;
+		parent: string | null;
+		name: string;
+		start: number;
+		duration: number;
+		status: string;
+		attributes: Record<string, unknown>;
+	};
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-trace]')) {
+		const spans: Span[] = JSON.parse(box.dataset.trace!);
+		const total = Math.max(...spans.map((s) => s.start + s.duration));
+		const depth = (s: Span): number => (s.parent ? 1 + depth(spans.find((p) => p.id === s.parent)!) : 0);
+		const op = (s: Span) => String(s.attributes['gen_ai.operation.name'] ?? '');
+
+		const sum = (f: (s: Span) => number) => spans.reduce((a, s) => a + f(s), 0);
+		const llmMs = sum((s) => (op(s) === 'chat' ? s.duration : 0));
+		const toolMs = sum((s) => (op(s) === 'execute_tool' ? s.duration : 0));
+		const tokensIn = sum((s) => Number(s.attributes['gen_ai.usage.input_tokens'] ?? 0));
+		const tokensOut = sum((s) => Number(s.attributes['gen_ai.usage.output_tokens'] ?? 0));
+		const cost = sum((s) => Number(s.attributes['relay.cost_usd'] ?? 0));
+		const errors = spans.filter((s) => s.status === 'ERROR').length;
+		const stats: [string, string][] = [
+			['Total', `${(total / 1000).toFixed(2)} s`],
+			['Model time', `${Math.round((llmMs / total) * 100)}%`],
+			['Tool time', `${Math.round((toolMs / total) * 100)}%`],
+			['Tokens in / out', `${tokensIn.toLocaleString('en')} / ${tokensOut.toLocaleString('en')}`],
+			['Cost', `$${cost.toFixed(4)}`],
+			['Errors', String(errors)],
+		];
+		box.querySelector('.trace__stats')!.innerHTML = stats.map(([k, v]) => `<div><span>${k}</span><strong>${v}</strong></div>`).join('');
+
+		const rows = box.querySelector('.trace__rows')!;
+		const attrs = box.querySelector('.trace__attrs')!;
+		const show = (s: Span, btn: HTMLButtonElement) => {
+			rows.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+			attrs.innerHTML =
+				`<dt>span</dt><dd>${s.name} · ${s.duration} ms · status ${s.status}</dd>` +
+				Object.entries(s.attributes)
+					.map(([k, v]) => `<dt>${k}</dt><dd>${Array.isArray(v) ? JSON.stringify(v) : String(v)}</dd>`)
+					.join('');
+		};
+		spans.forEach((s, i) => {
+			const li = document.createElement('li');
+			const btn = document.createElement('button');
+			btn.type = 'button';
+			btn.className = `trace__row trace__row--${op(s) || 'other'}${s.status === 'ERROR' ? ' is-error' : ''}`;
+			btn.innerHTML =
+				`<span class="trace__name" style="padding-left:${depth(s) * 0.9}rem">${s.status === 'ERROR' ? '⚠ ' : ''}${s.name}</span>` +
+				`<span class="trace__track"><i style="left:${(s.start / total) * 100}%;width:${Math.max((s.duration / total) * 100, 0.6)}%"></i></span>` +
+				`<span class="trace__ms">${s.duration} ms</span>`;
+			btn.addEventListener('click', () => show(s, btn));
+			li.append(btn);
+			rows.append(li);
+			if (i === 0) show(s, btn);
+		});
+	}
+</script>

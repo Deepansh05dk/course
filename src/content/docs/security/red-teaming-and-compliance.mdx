@@ -1,0 +1,163 @@
+---
+title: Red-teaming and compliance
+description: Attacking your own system before others do (process, tools like promptfoo, garak and PyRIT, regression suites), and the compliance context an FDE meets in enterprise deals (SOC 2, GDPR, the EU AI Act). Plus the Module 8 lab.
+sidebar:
+  order: 7
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Fixed in March, broken again in June" severity="SEV2">
+In March, a security researcher showed that Relay could be tricked into revealing other customers' shipment addresses. The team fixed it with an ownership check. In June, a refactor moved shipment lookups into a new MCP server (Module 7), and the ownership check didn't come along. The same attack worked again for six weeks. Nobody had turned the March report into a **test**.
+</Incident>
+
+## Red-teaming: attack yourself, continuously
+
+Red-teaming means deliberately trying to make your system misbehave, the way a real attacker would. For AI systems it covers security (injection, data leaks, abuse of tools) and safety (harmful or embarrassing outputs, wrong advice).
+
+<Diagram
+	caption="Red-teaming as a loop, not an event. Every successful attack becomes a regression test, exactly like an eval case in Module 5."
+	code={`flowchart LR
+    A["Threat model<br/>(lesson 1)"] --> B["Generate attacks<br/>manual + automated"]
+    B --> C["Run against<br/>the real system"]
+    C --> D["Triage findings<br/>severity, root cause"]
+    D --> E["Fix at the right layer<br/>(prefer deterministic)"]
+    E --> F["Add to the attack<br/>regression suite in CI"]
+    F --> B`}
+/>
+
+### Who and how
+
+| Approach | Strength | Weakness |
+|---|---|---|
+| **Your team, by hand** | Knows the system's weak spots and business context | Blind spots, limited time |
+| **Automated generation** | Hundreds of variants (encodings, languages, phrasings), every release | Shallow without good seeds; needs a judge to score results |
+| **External red team / bug bounty** | Fresh eyes, real attacker creativity | Expensive, periodic |
+| **Production monitoring** | Real attacks, real distribution | You learn after the fact |
+
+### Tools you'll meet
+
+| Tool | What it is |
+|---|---|
+| **promptfoo** (red-team mode) | Generates attacks from plugins (injection, PII leaks, excessive agency, jailbreak strategies such as encodings and multi-turn) against your app's endpoint, and reports pass/fail. Fits naturally next to the promptfoo evals from Module 5 |
+| **garak** (NVIDIA, open source) | An LLM vulnerability scanner with many probes for jailbreaks, leaks and toxic output |
+| **PyRIT** (Microsoft, open source) | A framework for orchestrating red-team campaigns, including multi-turn attacks scored by another model |
+
+The tools are only as good as your targets: point them at the **whole application** (the API with tools and retrieval), not just the raw model, because that's where the vulnerabilities are.
+
+### What a finding should become
+
+1. **A reproduction:** the exact input(s), the context (user, data), and the observed effect.
+2. **A severity:** based on impact (data exposed, money moved, actions taken), not on how clever the attack was.
+3. **A fix at the right layer:** if a deterministic check would have stopped it, add that, not just a prompt tweak.
+4. **A regression test:** the attack and its expected safe behaviour join your CI suite, so March's fix can't silently break in June.
+
+## Compliance: what the FDE needs to know
+
+You're not the lawyer. But in enterprise deals, the security questionnaire arrives early, and the engineer who can answer it clearly moves the deal forward.
+
+| Framework | What it is | What it means for an AI feature |
+|---|---|---|
+| **SOC 2** | An audit report (US-origin, widely requested) on security controls: access, change management, monitoring, vendors | Your AI vendors (model providers, vector DBs, observability) become **sub-processors** to list and assess. Access to prompts, logs and traces must be controlled and auditable |
+| **GDPR** (EU) | Data protection law for personal data | A lawful basis for processing; **data minimization**; data processing agreements with providers; data residency questions; and the **right to erasure**, which includes your vector stores, agent memory, caches, logs and eval datasets |
+| **EU AI Act** | Risk-based regulation of AI systems | Prohibited practices have applied since February 2025 and general-purpose AI model obligations since August 2025. Transparency duties (telling people they're talking to an AI, marking AI-generated content) follow the August 2026 schedule. In July 2026 the "Digital Omnibus" amendment (Regulation (EU) 2026/1744) postponed the high-risk obligations: to **2 December 2027** for stand-alone high-risk uses (Annex III, such as employment and education) and **2 August 2028** for AI in regulated products. Most B2B support and operations tools aren't high-risk, but the classification must be checked |
+| **ISO/IEC 42001** | A management-system standard for AI, similar in spirit to ISO 27001 | Some enterprises ask for it from AI vendors |
+
+Regulations change, so check the current official text before making compliance commitments. The engineering work behind all of them is the same, and you've built most of it in this course:
+
+- **Know your data flows** (lesson 1's diagram), including every vendor that sees data.
+- **Minimize and redact** (lesson 6), and set retention for prompts, traces and memory.
+- **Make deletion work everywhere**: a customer deletion request must reach chunks, embeddings, memory, caches and eval sets. Test it.
+- **Log and audit** (Module 9): who did what, through which AI feature, with which result.
+- **Human oversight and transparency**: approvals for consequential actions (Module 6), and clear disclosure that users are interacting with AI.
+
+<FailureCard
+	title="The deletion that didn't delete"
+	symptom="After a GDPR erasure request, the assistant still answered questions using the customer's old support tickets."
+	cause="The deletion job removed database rows but not the RAG chunks, embeddings, agent memory entries, semantic cache, or the traces that had been copied into an eval dataset."
+	detect="A deletion test: create a canary customer, ingest their data everywhere, delete them, then search every store for their identifiers."
+	fix="A data inventory listing every store that holds personal data, and a deletion pipeline that covers all of them, verified by the canary test in CI."
+/>
+
+<ThinkFirst question="A bank's security team sends a 200-question AI security questionnaire for Relay's pilot. You have two days. Which five answers do you prepare first, because they decide the deal?">
+
+1. **Data flows and sub-processors:** where data goes (the model provider, region, retention and training-use terms; vector DB; observability), with a diagram.
+2. **Access control:** the AI acts with the user's own permissions (permission-aware retrieval, per-user tokens, no shared super-user accounts), with test evidence.
+3. **Prompt injection and tool safety:** the threat model, deterministic limits on every side effect, approvals for high-risk actions, and the red-team regression suite with its latest results.
+4. **Logging, audit and retention:** what is logged, PII redaction, who can access traces, retention periods, and deletion (including vector stores and memory).
+5. **Incident response:** how AI incidents are detected (Module 9), who is paged, the kill switch, and how the customer is notified.
+
+Strong, evidence-backed answers to these five usually make the remaining 195 straightforward.
+
+</ThinkFirst>
+
+## 🧪 Module 8 lab: harden Relay
+
+**Acceptance criteria:**
+
+1. **Threat model** (`docs/threat-model.md`): data-flow diagram with trust boundaries, at least ten threats mapped to OWASP LLM items, and a control for each.
+2. **Tool policy layer** in front of every tool: strict schemas (`extra="forbid"`), allow-lists per feature, ownership from the session, caps, approval thresholds, and constrained recipients. Unit tests for every denial path.
+3. **Dual-LLM** processing for inbound emails (or another untrusted channel), with constrained output schemas and opaque references for free text.
+4. **Output safety:** a streaming canary guard, and a URL/image allow-list applied server-side before rendering.
+5. **Sandboxed code execution** if Relay runs model-written code: isolated (gVisor, microVM or a managed sandbox), no network, no credentials, with a hostile-program test suite.
+6. **PII redaction** on logs and traces, tested on your business identifiers.
+7. **An attack regression suite** of at least 40 attacks (direct, indirect via each channel, obfuscated, output payloads, multi-turn), run in CI with an automated tool plus your own cases. Report the pass rate before and after your defences.
+8. **A deletion test** with a canary customer, proving erasure across every store.
+
+<Practice title="Build it yourself: Module 8 wrap-up">
+
+- **Warm-up:** run an automated red-team scan (promptfoo's red-team mode, for example) against a test deployment of Relay, and read every failure.
+- **Stretch:** turn the three worst findings into regression tests, fix them at the most deterministic layer possible, and re-run.
+- **Boss level:** complete the Module 8 lab. "Here's my threat model, my attack suite, and the pass rate going from 60% to 98%" is one of the strongest things you can show in an FDE or applied AI interview.
+
+</Practice>
+
+<Quiz
+	id="m8-final"
+	title="Module 8 final quiz"
+	questions={[
+		{
+			q: 'A red-team finding gets fixed. What else must happen?',
+			options: ['Nothing', 'It becomes a regression test in CI, so the fix can\'t silently break later', 'A blog post', 'The model is retrained'],
+			answer: 1,
+			why: 'Attacks are test cases. The incident above came back because the fix had no test.',
+		},
+		{
+			q: 'Where should automated red-teaming tools be pointed?',
+			options: ['At the raw model only', 'At the whole application, with its tools, retrieval and policies', 'At the database', 'At the UI only'],
+			answer: 1,
+			why: 'Most vulnerabilities live in how the model is connected to data and tools.',
+		},
+		{
+			q: 'A GDPR erasure request arrives. Which stores must the deletion reach?',
+			options: [
+				'Only the main database',
+				'Every store with personal data: database, RAG chunks and embeddings, agent memory, caches, logs/traces, eval datasets',
+				'Only backups',
+				'None, AI systems are exempt',
+			],
+			answer: 1,
+			why: 'AI systems copy data into many places. A data inventory and a canary deletion test keep you honest.',
+		},
+		{
+			q: 'Which control best addresses "excessive agency" (OWASP LLM06)?',
+			options: ['A longer system prompt', 'Least-privilege tools with deterministic limits and approvals for high-impact actions', 'A bigger model', 'More temperature'],
+			answer: 1,
+			why: 'Limit what the agent can do, and gate what matters.',
+		},
+		{
+			q: 'Which defence stops a fooled model from sending customer data to an attacker by email?',
+			options: ['Spotlighting', 'A constrained recipient (customer on file only), enforced in the tool layer', 'A toxicity classifier', 'A lower temperature'],
+			answer: 1,
+			why: 'Remove the external channel, deterministically. The model\'s judgment is not involved.',
+		},
+	]}
+/>
+
+<LessonComplete id="security/red-teaming-and-compliance" />

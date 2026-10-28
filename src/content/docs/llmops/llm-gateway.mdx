@@ -1,0 +1,261 @@
+---
+title: LLM gateways
+description: One place for every model call. Provider abstraction, key management, per-tenant budgets, retries with backoff, circuit breakers and fallback, built and tested in Python, plus when to use an off-the-shelf gateway instead.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Eleven API keys and a 9,000 dollar weekend" severity="SEV2">
+By month six, Acme had eleven services calling model APIs, each with its own API key, its own retry logic, and no shared budget. A batch job in one of them had a bug: on a parse failure it retried the whole document, forever. It ran from Friday night to Monday morning. Nobody noticed until finance did, because no single place could answer "how much are we spending on models right now, and on what?"
+</Incident>
+
+An **LLM gateway** is a layer that every model call goes through. It can be a library in your codebase or a separate service. It's where you put everything that shouldn't be reimplemented in each feature.
+
+<Diagram
+	caption="Features call the gateway; the gateway owns keys, budgets, retries, fallback and telemetry."
+	code={`flowchart LR
+    A["Relay chat"] --> G["LLM gateway"]
+    B["Triage batch"] --> G
+    C["Eval jobs"] --> G
+    G --> P1["Primary provider<br/>(e.g. Anthropic API)"]
+    G --> P2["Fallback<br/>(e.g. same model via a cloud platform)"]
+    G --> O[("Traces, metrics,<br/>spend per tenant")]`}
+/>
+
+## What the gateway owns
+
+| Concern | Why centrally |
+|---|---|
+| **API keys** | One place to rotate; features never see provider keys |
+| **Budgets and quotas** | Per tenant, per feature, per environment; enforced **before** the money is spent |
+| **Retries with backoff and jitter** | Retry only what can succeed on retry (429, 5xx, overloaded, timeouts); never a 400 |
+| **Circuit breakers** | Stop hammering a failing provider; fail over fast instead of slowly |
+| **Fallback routes** | Another provider or region for the same model, or a different model with its own tested config |
+| **Telemetry** | Every call traced with the same attributes (lesson 1): cost, tokens, latency, route used |
+| **Policy** | Allowed models per feature, data-residency rules, content capture settings |
+
+## A gateway in Python
+
+A deliberately small version, to see how the pieces interact. Tested with fake providers and a fake clock:
+
+```python
+"""A minimal LLM gateway: budgets, retries, circuit breakers and fallback in one place."""
+import random
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Protocol
+
+
+class ProviderError(Exception):
+    def __init__(self, status: int, message: str = ""):
+        super().__init__(f"{status} {message}")
+        self.status = status
+
+    @property
+    def retryable(self) -> bool:
+        return self.status in (408, 429, 500, 502, 503, 504, 529)  # 400/401/403/404 won't fix themselves
+
+
+class BudgetExceeded(Exception):
+    pass
+
+
+class AllProvidersFailed(Exception):
+    pass
+
+
+class Provider(Protocol):
+    name: str
+    def complete(self, prompt: str, max_tokens: int) -> tuple[str, int, int]: ...  # text, input/output tokens
+
+
+@dataclass
+class Breaker:
+    """Stop calling a provider that keeps failing; try it again after a cooldown."""
+    threshold: int = 3
+    cooldown_s: float = 30.0
+    failures: int = 0
+    opened_at: float | None = None
+
+    def available(self, now: float) -> bool:
+        return self.opened_at is None or now - self.opened_at >= self.cooldown_s  # half-open after cooldown
+
+    def record(self, ok: bool, now: float) -> None:
+        if ok:
+            self.failures, self.opened_at = 0, None
+        else:
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.opened_at = now
+
+
+@dataclass
+class Route:
+    provider: Provider
+    price_in: float    # USD per million tokens
+    price_out: float
+
+
+@dataclass
+class Gateway:
+    routes: list[Route]                         # in order of preference
+    tenant_budgets_usd: dict[str, float]
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    spent: dict[str, float] = field(default_factory=dict)
+    breakers: dict[str, Breaker] = field(default_factory=dict)
+    log: list[str] = field(default_factory=list)
+
+    def complete(self, tenant: str, prompt: str, max_tokens: int = 1000, retries: int = 2) -> str:
+        worst_case = max(r.price_in * len(prompt) / 4 + r.price_out * max_tokens for r in self.routes) / 1e6
+        if self.spent.get(tenant, 0) + worst_case > self.tenant_budgets_usd.get(tenant, 0):
+            raise BudgetExceeded(f"{tenant} would exceed its budget")  # checked BEFORE spending money
+
+        for route in self.routes:
+            name = route.provider.name
+            breaker = self.breakers.setdefault(name, Breaker())
+            if not breaker.available(self.clock()):
+                self.log.append(f"{name}: circuit open, skipped")
+                continue
+            for attempt in range(retries + 1):
+                try:
+                    text, tokens_in, tokens_out = route.provider.complete(prompt, max_tokens)
+                except ProviderError as e:
+                    breaker.record(False, self.clock())
+                    self.log.append(f"{name}: {e} (attempt {attempt + 1})")
+                    if not e.retryable:
+                        raise                            # a bad request fails the same way everywhere
+                    if attempt < retries and breaker.available(self.clock()):
+                        self.sleep(min(8.0, 0.5 * 2 ** attempt) * random.uniform(0.5, 1.0))  # backoff + jitter
+                        continue
+                    break                                # give up on this provider, try the next
+                breaker.record(True, self.clock())
+                cost = (tokens_in * route.price_in + tokens_out * route.price_out) / 1e6
+                self.spent[tenant] = self.spent.get(tenant, 0) + cost
+                self.log.append(f"{name}: ok, {cost:.5f} USD")
+                return text
+        raise AllProvidersFailed("; ".join(self.log[-3:]))
+```
+
+The tests, covering the healthy path, overload and failover, the circuit breaker opening and recovering, a non-retryable error, a budget limit, and a full outage:
+
+```text
+1. healthy primary
+   answer from anthropic ['anthropic: ok, 0.00540 USD']
+2. primary overloaded (529) -> retries -> fallback
+   answer from bedrock
+     anthropic: 529 fake (attempt 1)
+     anthropic: 529 fake (attempt 2)
+     anthropic: 529 fake (attempt 3)
+     bedrock: ok, 0.00660 USD
+3. breaker is open now: the next request skips the primary immediately
+   answer from bedrock ['anthropic: circuit open, skipped', 'bedrock: ok, 0.00660 USD']
+4. after the cooldown, the primary is tried again
+   answer from anthropic ['anthropic: ok, 0.00540 USD']
+5. a 400 is not retried and not failed over
+   raised: 400 fake ['anthropic: 400 fake (attempt 1)']
+6. tenant budget
+   2 calls served, then: acme would exceed its budget; spent 0.0108 USD
+7. everything down
+   raised AllProvidersFailed: bedrock: 503 fake (attempt 1); bedrock: 503 fake (attempt 2); bedrock: 503 fake (attempt 3)
+```
+
+Things to notice in the output:
+
+- **Scenario 2:** three attempts on the primary (with backoff), then the fallback served the request. The user saw a slower answer, not an error.
+- **Scenario 3:** the breaker was now open, so the next request skipped the primary instantly instead of waiting through three more failures.
+- **Scenario 5:** a `400` means the request itself is wrong. Retrying it, or sending it to another provider, just repeats the error (and the cost).
+- **Scenario 6:** the budget check uses the **worst case** for the request (`max_tokens` of output), so the third call was refused **before** spending money that would exceed the budget.
+
+## Production details this version skips
+
+| Gap | What production needs |
+|---|---|
+| **Concurrency** | Two requests can both pass the budget check at the same moment. Reserve budget atomically (for example a Redis counter or a database row update), then settle the actual cost |
+| **Retry-After** | Honour the provider's `retry-after` header on 429s instead of your own backoff |
+| **Streaming** | Fail over only **before** the first token is sent; after that, a switch would show the user two different answers |
+| **Fallback quality** | A fallback **model** is a different AI config: it needs its own evals and possibly its own prompt (lesson 2). Same model through another platform is the safest fallback |
+| **Shared breaker state** | With many app instances, each has its own breaker unless state is shared |
+| **Retry budgets** | Cap retries across the whole system (for example ≤10% extra traffic), or retries amplify an outage |
+
+## Build or buy?
+
+Off-the-shelf gateways cover most of the table above: **LiteLLM** (open source, a proxy server or a Python library with a unified API across providers), **Portkey**, **Cloudflare AI Gateway**, and the gateway features of cloud platforms and API management products. The AI SDK (Module 2) also gives TypeScript apps a unified provider interface, with middleware for adding cross-cutting behaviour.
+
+A sensible rule: **buy the plumbing, own the policy.** Use a gateway product for keys, routing and spend tracking; keep the decisions that encode your business (which tenant may use which model, budgets, approval rules) in your own code and config.
+
+<FailureCard
+	title="The retry storm"
+	symptom="A 10-minute provider slowdown turns into a 45-minute outage for Relay."
+	cause="Every layer retried: the SDK (2 retries), the gateway (3), and the agent loop (3). One slow request became up to 36 calls, multiplying load exactly when the provider was struggling."
+	detect="Calls per user request in traces; retry counts on the dashboard."
+	fix="Retry in one layer only (usually the gateway; turn off SDK retries or set them to 0 there), with a global retry budget and a circuit breaker."
+/>
+
+<FailureCard
+	title="The silent downgrade"
+	symptom="For two days, answer quality was noticeably worse and nobody knew why."
+	cause="The primary route was failing, and the gateway quietly fell back to a smaller, cheaper model with a prompt that had never been evaluated on it."
+	detect="Route used, as an attribute on every span; an alert when the fallback share exceeds a few percent."
+	fix="Prefer same-model fallbacks; evaluate any fallback model as its own config; alert on sustained fallback."
+/>
+
+<ThinkFirst question="Acme's CFO wants a hard guarantee: 'No tenant can cost us more than their plan allows, ever.' The gateway enforces budgets. What can still break that guarantee, and how do you close each gap?">
+
+1. **Races:** concurrent requests passing the check together. Fix: atomic reservation of the worst-case cost before the call, settled afterwards.
+2. **Calls that bypass the gateway:** a team calling the provider directly. Fix: features don't get provider keys at all; only the gateway holds them (and network egress rules can enforce it).
+3. **Unbounded single requests:** a huge context or `max_tokens`. Fix: per-request caps on input size and `max_tokens`, enforced by the gateway.
+4. **Agent loops:** many small calls, each within budget (Module 6). Fix: per-task budgets in the agent, plus per-tenant rate limits in the gateway.
+5. **Costs outside model calls:** embeddings, reranking, sandboxes, web search. Fix: route them through the same metering, or track them in the same budget.
+
+A hard guarantee needs enforcement at every path money can flow through, not just the main one.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** route all of Relay's model calls through one function that records model, tokens, cost and latency.
+- **Stretch:** add per-tenant budgets with atomic reservation (Redis `INCRBYFLOAT`, or a single SQL `UPDATE … WHERE spent + :cost <= budget`), and a test with 50 concurrent requests proving no tenant overspends.
+- **Boss level:** run LiteLLM (or another gateway) as a proxy in front of Relay with two routes, simulate a provider outage, and compare its failover behaviour with your own gateway's. Write up which one you'd ship, and why.
+
+</Practice>
+
+<Quiz
+	id="m9-gateway"
+	questions={[
+		{
+			q: 'Which errors should the gateway retry?',
+			options: ['All errors', 'Transient ones: 429, 5xx, overloaded, timeouts. Not 400-class request errors', 'Only 400s', 'None'],
+			answer: 1,
+			why: 'A malformed request fails the same way every time, everywhere.',
+		},
+		{
+			q: 'What does a circuit breaker add on top of retries?',
+			options: ['Encryption', 'It stops calling a provider that keeps failing, so requests fail over immediately instead of waiting', 'More retries', 'Lower cost per token'],
+			answer: 1,
+			why: 'Fast failover, and less load on a provider that\'s already struggling.',
+		},
+		{
+			q: 'Why check the budget against the worst-case cost before the call?',
+			options: ['It is more accurate', 'So a request that could exceed the budget is refused before money is spent', 'Providers require it', 'To save latency'],
+			answer: 1,
+			why: 'Enforcement after the fact can only report an overspend, not prevent it.',
+		},
+		{
+			q: 'When is it unsafe to fail over to another provider during a streamed answer?',
+			options: ['Before the first token', 'After tokens have already been sent to the user', 'Never', 'Always'],
+			answer: 1,
+			why: 'Switching mid-stream would show the user parts of two different answers.',
+		},
+	]}
+/>
+
+<LessonComplete id="llmops/llm-gateway" />

@@ -24,6 +24,8 @@ export default defineConfig({
 				{ label: '5 · Evals & CI', items: [{ autogenerate: { directory: 'evals' } }] },
 				{ label: '6 · Tools, Workflows & Agents', items: [{ autogenerate: { directory: 'agents' } }] },
 				{ label: '7 · MCP & Integrations', items: [{ autogenerate: { directory: 'mcp' } }] },
+				{ label: '8 · AI Security', items: [{ autogenerate: { directory: 'security' } }] },
+				{ label: '9 · LLMOps & Observability', items: [{ autogenerate: { directory: 'llmops' } }] },
 				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
 			],
 		}),

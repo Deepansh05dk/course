@@ -1,0 +1,197 @@
+---
+title: Guardrails and PII
+description: Input and output guardrails that are worth their latency. PII redaction with Presidio (and what it misses), safety classifiers like Llama Guard, NeMo Guardrails, deterministic policy checks, and where each belongs in the request path.
+sidebar:
+  order: 6
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Redacted into uselessness" severity="SEV3">
+Acme's privacy review required PII redaction before any text reached the model or the logs. The team switched on a redaction library with default settings. The next morning, Relay could no longer look up shipments: the redactor had decided that part of every shipment number looked like a phone number, so the model received `ACM-<REDACTED>`. Support tickets doubled. The guardrail was "working".
+</Incident>
+
+**Guardrails** are checks that run around the model: on what goes in, on what comes out, and on tool calls. You've already built the most important ones (the tool policy layer, output filters, canaries). This lesson covers the rest of the toolbox, and how to keep guardrails from becoming the outage.
+
+## Where guardrails sit
+
+<Diagram
+	caption="Guardrails at three points. Each one adds latency and can be wrong in both directions, so choose them per risk, not by default."
+	code={`flowchart LR
+    U["User input"] --> I["Input guardrails<br/>PII redaction, injection<br/>classifier, topic check"]
+    I --> M["Model"]
+    M --> TC["Tool-call guardrails<br/>policy layer (lesson 3)"]
+    TC --> M
+    M --> O["Output guardrails<br/>safety classifier, PII leak check,<br/>URL allow-list, canary, grounding"]
+    O --> R["User / UI"]`}
+/>
+
+## PII redaction with Presidio
+
+Microsoft's open-source **Presidio** combines named-entity recognition (spaCy models) with pattern recognizers (emails, phones, IBANs, card numbers) and lets you add your own. Tested:
+
+```python
+"""Redact PII before text leaves your boundary (to a model, a log, or a trace)."""
+import re
+
+from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+
+analyzer = AnalyzerEngine()  # spaCy NER + built-in pattern recognizers
+analyzer.registry.add_recognizer(PatternRecognizer(  # Acme customer numbers are personal data too
+    supported_entity="ACME_CUSTOMER_ID",
+    patterns=[Pattern("acme customer id", r"\bCUST-\d{2,8}\b", 0.9)],
+))
+anonymizer = AnonymizerEngine()
+
+ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IBAN_CODE", "CREDIT_CARD", "ACME_CUSTOMER_ID"]
+KEEP = re.compile(r"\bACM-\d{4}-\d{6}\b")  # business IDs the agent needs; never redact these
+
+
+def redact(text: str) -> str:
+    keep = [m.span() for m in KEEP.finditer(text)]
+    results = [
+        r for r in analyzer.analyze(text=text, entities=ENTITIES, language="en")
+        if not any(r.start < end and start < r.end for start, end in keep)  # drop overlaps with kept IDs
+    ]
+    return anonymizer.anonymize(
+        text=text,
+        analyzer_results=results,
+        operators={"DEFAULT": OperatorConfig("replace", {"new_value": "<REDACTED>"}),
+                   "PERSON": OperatorConfig("replace", {"new_value": "<PERSON>"}),
+                   "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "<EMAIL>"})},
+    ).text
+```
+
+```text
+IN : Hi, I'm Maria Gonzalez (CUST-42). Email me at maria.g@example.com or call +1 415 555 0132.
+OUT: Hi, I'm <PERSON> (<REDACTED>). Email me at <EMAIL> or call <REDACTED>.
+IN : Please refund to IBAN DE89 3704 0044 0532 0130 00, my card 4111 1111 1111 1111 was charged twice.
+OUT: Please refund to IBAN <REDACTED>, my card <REDACTED> was charged twice.
+IN : shipment ACM-2025-000183 is late, ask for priya
+OUT: shipment ACM-2025-000183 is late, ask for priya
+```
+
+Two findings from testing this, both typical of real deployments:
+
+1. **The incident above happened here.** Before the `KEEP` rule, the third input came out as `shipment ACM-<REDACTED> is late`: Presidio's phone recognizer matched `2025-000183` (with a score of 0.4). Business identifiers that look like PII need explicit protection, and you need a **test set of your own data** to find them.
+2. **It missed "priya".** A lowercase first name without context isn't recognized by the NER model. Redaction **reduces** PII exposure; it doesn't guarantee zero. Design so that a miss isn't catastrophic (access-controlled logs, retention limits).
+
+Where to apply redaction:
+
+| Place | Why |
+|---|---|
+| **Logs and traces** | The most common leak: prompts with customer data copied into a logging system that half the company can read (Module 9) |
+| **Before third-party services** | Evaluation tools, analytics, external APIs that don't need the identity |
+| **Before the model** | Only when the model genuinely doesn't need the data. Often it does (it must say the customer's name), so the real control is your contract with the model provider (data retention, training use) |
+| **Eval datasets** | Production traces copied into datasets (Module 5) should be redacted or synthetic |
+
+## Safety classifiers and guardrail frameworks
+
+| Tool | What it does | Notes |
+|---|---|---|
+| **Llama Guard** (Meta, open weights) | An LLM fine-tuned to classify prompts and responses against a safety taxonomy (violence, self-harm, illegal activity…) | Self-hostable; adds a model call; good for content-safety policies |
+| **Provider-side safety** | Models' built-in refusals; some providers offer moderation endpoints or classifiers | Free or cheap; not configurable to your business rules |
+| **NeMo Guardrails** (NVIDIA, open source) | A framework for defining "rails" (allowed topics, dialogue flows, checks on input, output and retrieval) | Useful for keeping a bot on-topic and orchestrating several checks |
+| **Prompt injection classifiers** | Small models that score text for injection likelihood | Cheap first filter; misses obfuscated and novel attacks (lesson 2) |
+| **Your own deterministic checks** | Regexes, allow-lists, schema validation, business rules | Fast, predictable, testable. **Usually the most valuable guardrails you'll write** |
+
+A good default stack for a B2B product like Relay: deterministic checks everywhere, PII redaction on logs and traces, an output check for links and leaks, and a safety classifier only where users can steer the model toward harmful content.
+
+## The costs: latency and false positives
+
+Every guardrail has a **cost** that must be measured like a feature:
+
+- **Latency:** a classifier call might add 50–300 ms. Run input guardrails **in parallel** with the model call where possible, and cancel the model call if the guardrail fails.
+- **Streaming:** output guardrails must work on chunks (like the canary guard in lesson 2), or you lose streaming.
+- **False positives:** a guardrail that blocks 2% of legitimate requests blocks 2,000 customers a day at 100K requests. Measure its precision and recall on a labeled set, exactly like an LLM judge (Module 5).
+
+<FailureCard
+	title="The guardrail outage"
+	symptom="All Relay requests fail for 40 minutes."
+	cause="The safety classifier ran as a separate service with no timeout. It went down, and every request waited for it, then failed."
+	detect="Guardrail latency and error rate on the main dashboard (Module 9)."
+	fix="Timeouts and an explicit, risk-based failure mode per guardrail: fail closed for the refund policy check, fail open (with logging) for a low-risk topic classifier. Decide this up front, not during the outage."
+/>
+
+<FailureCard
+	title="Blocked: a legitimate complaint"
+	symptom="Angry customers describing damaged goods ('the forklift destroyed it, I'm furious') get a canned 'I can't help with that'."
+	cause="A generic toxicity filter flagged strong language and violence-adjacent words."
+	detect="Sample blocked requests weekly and label them; track the false-positive rate."
+	fix="Tune thresholds on your own data, use categories that matter for your product, and route borderline cases to a gentler path (answer, plus flag for review) instead of blocking."
+/>
+
+<ThinkFirst question="Relay is deployed for a healthcare logistics customer shipping medical samples. Their compliance team wants 'guardrails on everything'. Which guardrails do you actually propose, and which do you push back on?">
+
+**Propose:**
+
+- **PII and PHI redaction in logs, traces and eval datasets** (patient names, sample IDs linked to people), with a custom recognizer for their identifiers and a tested allow-list for shipment IDs.
+- **Deterministic tool policy** (as in lesson 3) and **output checks**: no external links, canary for prompt leaks, and no patient identifiers in responses to users who aren't authorized.
+- **Grounding checks** for answers about handling requirements (temperature limits, hazardous materials), where a wrong answer is dangerous: citations required, refuse when the policy isn't found.
+
+**Push back on:**
+
+- **A general toxicity or safety classifier on every message:** the users are logistics staff, the content is operational, and the false positives would block legitimate messages about "biohazards" and "dangerous goods".
+- **Redacting everything before the model:** the model needs shipment details to do its job. The right control there is the data-processing agreement and region choice with the model provider.
+
+Every guardrail you propose should come with its measured latency and false-positive rate.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run Presidio on 20 real-looking (synthetic) support messages from Relay. Count misses and false positives.
+- **Stretch:** add a redaction step to Relay's logging, with tests for your business identifiers (shipment IDs, claim IDs) and a few PII cases.
+- **Boss level:** measure one guardrail like a product: label 100 messages, compute precision and recall, measure p50/p95 latency, and write a one-paragraph recommendation (ship, tune or drop).
+
+</Practice>
+
+<Quiz
+	id="m8-guardrails"
+	questions={[
+		{
+			q: 'What did testing reveal about Presidio\'s default recognizers on Relay data?',
+			options: [
+				'They were perfect',
+				'A phone-number recognizer matched part of shipment IDs, and a lowercase name was missed',
+				'They didn\'t detect emails',
+				'They were too slow to use',
+			],
+			answer: 1,
+			why: 'Always test redaction on your own data: both false positives and misses are normal.',
+		},
+		{
+			q: 'Where is PII redaction most often essential?',
+			options: ['In the UI', 'In logs, traces and eval datasets, which many people can read', 'In the system prompt', 'Nowhere'],
+			answer: 1,
+			why: 'Observability data is the most common place customer data spreads.',
+		},
+		{
+			q: 'A guardrail service goes down. What should happen?',
+			options: [
+				'Every request should wait forever',
+				'It depends on a failure mode decided up front: fail closed for high-risk checks, fail open with logging for low-risk ones',
+				'Always fail open',
+				'Always fail closed',
+			],
+			answer: 1,
+			why: 'Decide per guardrail, based on risk, with timeouts.',
+		},
+		{
+			q: 'Which guardrails are usually the most valuable in a B2B agent?',
+			options: ['Generic toxicity filters', 'Deterministic checks: schemas, allow-lists, business rules at tool and output boundaries', 'Sentiment analysis', 'Language detection'],
+			answer: 1,
+			why: 'They are fast, predictable and testable, and they sit where harm happens.',
+		},
+	]}
+/>
+
+<LessonComplete id="security/guardrails" />

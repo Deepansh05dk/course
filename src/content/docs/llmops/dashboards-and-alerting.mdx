@@ -1,0 +1,141 @@
+---
+title: Dashboards and alerting
+description: The signals that matter for AI features (latency and time to first token, errors, cost, quality, safety), SLOs and error budgets, burn-rate alerts, slicing by tenant and version, and alerting without alert fatigue.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import AlertTuner from '../../../components/AlertTuner.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Muted" severity="SEV2">
+Relay's on-call channel received about 30 alerts a day: every transient `529 overloaded`, every slow request, every cost spike from a batch job. Within a month, the team muted the channel. When a prompt deploy broke JSON parsing for 4% of requests, the alert fired correctly, into a muted channel. Customers noticed first, three hours later.
+</Incident>
+
+## The signals for an AI feature
+
+Classic services watch the "golden signals": latency, traffic, errors and saturation. AI features need those, plus three more:
+
+| Signal | Metrics | Notes |
+|---|---|---|
+| **Latency** | p50 / p95 / p99 total; **time to first token** (TTFT) for streamed features; per-span latency from traces | Users feel TTFT for chat; total time for background jobs |
+| **Traffic** | Requests, conversations, model calls per request | A jump in calls per request often means a looping agent |
+| **Errors** | Provider errors by type, tool errors, schema validation failures, **fallback rate**, timeouts | Fallback rate is an early warning of provider trouble |
+| **Saturation** | Rate-limit headroom, queue depth, concurrency | You hit provider rate limits before you hit CPU limits |
+| **Cost** | Per request, per conversation, per tenant, per feature; cache hit rate | Cost per **successful outcome** is the number finance cares about |
+| **Quality** | Online eval scores (Module 5), user feedback (Module 2), edit ratio, escalation rate | Slower-moving, but it's what you're actually selling |
+| **Safety** | Guardrail blocks, canary hits, policy denials, injection-classifier scores | A spike in policy denials can mean an attack in progress |
+
+Every one of these should be **sliceable** by tenant, feature, AI config version, and model route. Averages hide the customer who's having a terrible week.
+
+## SLOs and error budgets
+
+A **service level objective** turns "Relay should be reliable" into a number you can manage:
+
+- **SLI** (indicator): the share of good events. For example, "chat requests that return a complete, valid answer in under 8 seconds".
+- **SLO** (objective): the target. For example, 99% over 28 days.
+- **Error budget:** what's left over. 1% of requests may be "bad" this month. If the budget is healthy, ship changes. If it's burning fast, slow down and fix reliability.
+
+Defining "good" for AI is the interesting part. "HTTP 200" isn't enough: a fast answer that fails schema validation, or that fell back to a degraded mode, may count as bad. Agree the definition with product (and, in FDE work, with the customer).
+
+## Alerting on what matters
+
+Good alerts are **urgent, actionable, and about user impact**. Rules of thumb:
+
+1. **Page on symptoms, not causes.** "Error rate above SLO" pages someone. "One provider returned a 529" doesn't; that's what retries and fallbacks are for.
+2. **Require duration.** Real incidents last; transient blips don't. A condition that must hold for 10–15 minutes filters most noise.
+3. **Use burn-rate alerts for SLOs.** Alert when the error budget is being spent much faster than sustainable, using two windows (for example: burning 14× too fast over both the last 1 hour and the last 5 minutes = page now; a slower burn over 6 hours = a ticket).
+4. **Everything else is a ticket or a dashboard**, not a page: cost drift, quality trends, slow decline.
+5. **Every page has a runbook link** (lesson 5).
+
+Try it. Tune the alert rule below on a week of Relay's error-rate data. Three real incidents are hidden in the noise:
+
+<AlertTuner />
+
+## Quality and cost alerts are different
+
+Quality and cost signals move slowly and need volume to be meaningful, so they rarely deserve a page:
+
+| Signal | Good alerting |
+|---|---|
+| Online eval score drops | Daily check per segment; a ticket when it drops beyond the noise band you measured in Module 5 |
+| User feedback (thumbs down rate) | Weekly trends per feature and tenant; spikes after a deploy compared against the previous config version |
+| Cost per conversation | Alert on a sustained rise (for example +30% over a day versus last week), and on **budget burn** per tenant |
+| Cost runaway (a looping job) | **This one pages**: spend per hour far above normal. Pair it with automatic limits in the gateway (lesson 3) |
+| Canary hits, policy-denial spikes | Page security on canary hits; a ticket for denial trends |
+
+<FailureCard
+	title="The healthy average"
+	symptom="Overall p95 latency is fine, but one enterprise tenant reports constant slowness."
+	cause="Their documents were five times longer, so their requests were slow; they were 4% of traffic and invisible in the global percentile."
+	detect="Per-tenant dashboards and per-tenant SLOs for key accounts."
+	fix="Slice everything by tenant. In FDE engagements, each major customer gets their own dashboard view, often shared with them."
+/>
+
+<FailureCard
+	title="The dashboard nobody opened"
+	symptom="A cost regression ran for three weeks. The chart showed it clearly, the whole time."
+	cause="Forty panels, no owner, no routine. Dashboards only help when someone looks at them."
+	detect="Ask: who looks at this dashboard, and when?"
+	fix="A small number of panels per audience (on-call, product, finance), a weekly review ritual with an owner, and alerts or tickets for the things that matter."
+/>
+
+<ThinkFirst question="Define an SLI for Relay's 'draft reply' feature (an internal tool where human agents get an AI draft for each ticket). What counts as a good event? And which one alert would you page on?">
+
+A reasonable SLI: **a draft request is good if** a complete draft is returned within 10 seconds, passes schema and guardrail checks, and was produced by the primary AI config (not a degraded fallback or an error message). Target: 99% over 28 days.
+
+What's deliberately **not** in the SLI: quality scores. They're tracked separately (daily online evals, edit ratio) because they need volume and judgment, not a pager.
+
+The one page: a **multi-window burn-rate alert** on that SLI, for example "burning the monthly error budget more than 14 times faster than sustainable, over both 1 hour and 5 minutes". It catches outages within minutes and ignores blips. Everything else (cost drift, quality trends, single-provider errors) goes to tickets and dashboards.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** in the alert tuner, find the cheapest rule (fewest false pages) that catches all three incidents. Then write down how long each incident went unnoticed.
+- **Stretch:** build Relay's dashboard from your traces and metrics: TTFT, p95, error and fallback rate, cost per conversation, online eval score, each sliceable by tenant and config version.
+- **Boss level:** define one SLO for Relay, implement a multi-window burn-rate alert for it, and replay a simulated outage (inject errors with your gateway's fake provider) to prove it pages within 5 minutes and stays quiet for blips.
+
+</Practice>
+
+<Quiz
+	id="m9-alerting"
+	questions={[
+		{
+			q: 'Which of these should usually page someone at night?',
+			options: [
+				'A single 529 from the provider',
+				'The SLO error budget burning far faster than sustainable, over both a short and a long window',
+				'A 5% drop in a daily quality score',
+				'Cost per conversation up 10% this week',
+			],
+			answer: 1,
+			why: 'Page on user-facing impact that needs action now. Trends go to tickets.',
+		},
+		{
+			q: 'In the alert tuner, what filters short blips without raising the threshold?',
+			options: ['A lower threshold', 'Requiring the condition to hold for a duration', 'More data', 'A different color'],
+			answer: 1,
+			why: 'Real incidents last; transient spikes don\'t. Duration is a powerful filter.',
+		},
+		{
+			q: 'Why slice dashboards by tenant and config version?',
+			options: ['It looks nicer', 'Averages hide a single customer or version having a bad time', 'It is required by OpenTelemetry', 'To reduce cost'],
+			answer: 1,
+			why: 'Segment-level problems are invisible in global averages.',
+		},
+		{
+			q: 'What is the most important outcome metric for cost?',
+			options: ['Cost per token', 'Cost per successful outcome (e.g. per resolved ticket)', 'Total monthly bill only', 'Number of API keys'],
+			answer: 1,
+			why: 'A cheaper call that fails more often can cost more per outcome.',
+		},
+	]}
+/>
+
+<LessonComplete id="llmops/dashboards-and-alerting" />

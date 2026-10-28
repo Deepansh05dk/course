@@ -1,0 +1,228 @@
+---
+title: Incident response for AI features
+description: The kinds of incidents AI features have, runbooks, kill switches and graceful degradation, the first 30 minutes of an incident, blameless post-mortems with a template, and the Module 9 lab.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The answer that went viral" severity="SEV1">
+On a Saturday, a customer posted a screenshot: Relay had told them Acme would "always refund 150% of the shipment value for any delay". It was wrong (the model had merged two policy passages), and the post was spreading. The on-call engineer had no runbook for "the AI is saying something wrong", no way to turn off one feature without turning off the whole chat, and no idea how many other customers had received the same answer. It took four hours to find out: 23.
+</Incident>
+
+AI features fail in all the usual ways (outages, latency, bugs) and in some new ones. Your incident process needs to cover both.
+
+## The kinds of AI incidents
+
+| Type | Example | First lever |
+|---|---|---|
+| **Availability** | Provider outage, rate limits, timeouts | Fallback route (lesson 3), degraded mode |
+| **Quality** | Wrong answers, hallucinated policy, broken formatting after a deploy | Roll back the AI config (lesson 2); disable the feature |
+| **Safety and security** | Prompt leak (canary hit), injection exploited, harmful output, data from another tenant | Kill switch, revoke tools, preserve evidence, involve security (Module 8) |
+| **Cost** | Looping agent or batch job, cache broken (Module 10) | Gateway budget cut-off, pause the job |
+| **Action** | Agent took a wrong real-world action (refund, email) | Stop the agent, reverse actions, reconcile (Module 6) |
+
+## Levers you need before the incident
+
+The worst time to build a kill switch is during the incident. Have these ready:
+
+| Lever | What it does |
+|---|---|
+| **Per-feature kill switch** | Turns one AI feature off (via a feature flag) without a deploy, showing a graceful fallback ("Our assistant is unavailable; here's how to reach support") |
+| **Tool revocation** | Removes one tool (for example `issue_refund`) from all agents instantly, keeping the rest working |
+| **Config rollback** | Switches to the previous AI config version in seconds (lesson 2) |
+| **Degraded modes** | Read-only agent, retrieval-only answers with citations and no generation, or "drafts only, human sends" |
+| **Blast-radius queries** | Saved queries over traces: "which conversations got an answer containing X?", "which tenants were affected between T1 and T2?" |
+| **Customer communication templates** | Pre-approved wording for status pages and account managers |
+
+<Diagram
+	caption="The first 30 minutes of an AI incident. Contain first, then scope, then fix. Root cause analysis waits until users are safe."
+	code={`flowchart LR
+    A["Detect<br/>alert, report, canary"] --> B["Declare<br/>incident lead, channel, severity"]
+    B --> C["Contain<br/>kill switch, revoke tool,<br/>roll back config"]
+    C --> D["Scope<br/>blast-radius queries<br/>over traces"]
+    D --> E["Communicate<br/>status page, affected customers"]
+    E --> F["Fix and verify<br/>evals + regression test"]
+    F --> G["Post-mortem<br/>blameless, within a week"]`}
+/>
+
+## Runbooks
+
+A runbook is a short, specific guide for one alert or incident type, written in advance for a tired person at 3 a.m. Each alert from lesson 4 links to one. A good AI runbook includes:
+
+1. **What this alert means** and how users are affected.
+2. **Dashboards and saved trace queries** to look at first.
+3. **Containment levers**, in order, with exact commands or flag names.
+4. **Who to involve:** security for canary hits and data exposure, the account team for enterprise customers, legal for data incidents.
+5. **How to verify recovery.**
+
+## Blameless post-mortems
+
+After the incident, write a **post-mortem** within a week. **Blameless** means it assumes people acted reasonably with the information and tools they had, and looks for the **system** changes that would have prevented or shortened the incident. If the answer is "someone should have been more careful", the system still allows the same mistake.
+
+A template that works well for AI incidents:
+
+```markdown
+# Post-mortem: <title>                                  Severity: SEV2
+
+## Summary
+Two or three sentences: what happened, impact, duration.
+
+## Impact
+Users/tenants affected, wrong answers or actions (with counts from traces), cost, customer communication.
+
+## Timeline (UTC)
+- 09:02 Prompt config v23 deployed (reply_draft)
+- 09:40 First customer report
+- 10:15 Alert fired (JSON validation failures > 2% for 15 min)
+- 10:21 Rolled back to v22; error rate normal by 10:24
+
+## Root cause and contributing factors
+What happened technically, and WHY the system allowed it
+(e.g. the eval set had no cases with multi-currency invoices).
+
+## What went well / what was hard
+Detection, containment levers, tooling gaps.
+
+## Action items
+| Action | Type (prevent / detect / mitigate) | Owner | Due |
+| Add 25 multi-currency cases to the eval set | prevent | … | … |
+| Alert on validation failures at 1% for 10 min | detect | … | … |
+
+## The eval or test that would have caught this
+Link to the new regression case(s).
+```
+
+The last section is specific to AI work: **every incident should leave behind at least one new eval case or attack test** (Modules 5 and 8). That's how your test suite comes to reflect production reality.
+
+<IncidentDrill
+	id="ai-incident-drill"
+	title="Saturday: the viral wrong answer"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Saturday 11:05. A screenshot shows Relay promising "150% refunds for any delay". It\'s spreading. You\'re on call. First action?',
+			choices: [
+				{ label: 'Declare an incident, and switch Relay\'s policy-answer feature to a degraded mode (answers with policy citations only, or "contact support")', next: 's2', cost: 5 },
+				{ label: 'Start debugging the prompt to find the cause', next: 's1b', cost: 30, note: 'While you debug, more customers get the same wrong promise.' },
+				{ label: 'Turn off the entire Relay chat', next: 's2', cost: 15, note: 'It works, but you\'ve taken out shipment tracking too. A per-feature switch would have been enough.' },
+			],
+		},
+		s1b: { text: '11:50: two more screenshots. Contain now?', choices: [{ label: 'Declare an incident and switch to the degraded mode', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'Contained. Legal asks: how many customers got a similar promise, and who?',
+			choices: [
+				{ label: 'Run a blast-radius query over traces: answers mentioning refund percentages above policy, in the last 30 days, grouped by tenant', next: 's3', cost: 0 },
+				{ label: 'Guess it\'s just this one customer', next: 'end_bad', cost: 60, note: 'There were 23. Legal and account managers find out from customers instead.' },
+			],
+		},
+		s3: {
+			text: '23 conversations, 11 tenants. Traces show the model merged the "delay compensation" and "damage refund" passages. How do you fix it?',
+			choices: [
+				{ label: 'Add the 23 cases and similar merges to the eval set, fix retrieval and the prompt, require citations for numeric policy claims, verify with evals, then re-enable via canary', next: 's4', cost: 0 },
+				{ label: 'Add "never promise more than 100%" to the prompt and re-enable', next: 'end_ok', cost: 0, note: 'It might stop this exact phrasing, but nothing proves it, and nothing prevents the next merge.' },
+			],
+		},
+		s4: {
+			text: 'Fixed and verified. What happens next week?',
+			choices: [
+				{ label: 'A blameless post-mortem with action items (a per-feature kill switch runbook, a numeric-claim check, the saved blast-radius query) and personal follow-up with the 11 tenants', next: 'end_good', cost: 0 },
+				{ label: 'Move on; the fix is in', next: 'end_ok', cost: 0, note: 'The organization learns nothing, and the 3-hour detection gap stays.' },
+			],
+		},
+		end_good: { text: 'Contained in minutes, scoped from traces, fixed with evidence, and the system got better. That\'s the job.', end: 'good' },
+		end_ok: { text: 'The fire is out, but the next one will burn just as long.', end: 'ok' },
+		end_bad: { text: 'Unscoped impact in a customer-facing promise is a legal and trust problem, not just a bug.', end: 'bad' },
+	}}
+/>
+
+<FailureCard
+	title="No evidence left"
+	symptom="After an injection incident, the team can't tell which conversations were affected or what data was exposed."
+	cause="Traces were sampled at 1% and kept for 3 days; tool calls weren't logged with arguments."
+	detect="Run the 'could we answer the blast-radius question?' test for each incident type before you need it."
+	fix="Log every tool call (name, redacted arguments, result status, user, tenant) at 100% with a sensible retention period; sample only the bulky content."
+/>
+
+<ThinkFirst question="Write the runbook outline (five steps) for one alert: 'Canary token detected in model output'.">
+
+1. **Meaning and impact:** someone extracted (part of) a system prompt. The prompt should contain no secrets, but internal rules are now visible, and the same conversation may be probing for more.
+2. **Look first:** the conversation's full trace (inputs, tool calls), the user and tenant, and any other recent conversations from the same user or IP. Saved query: "canary hits in the last 7 days".
+3. **Contain:** if it's a single curious user, rate-limit or block that account per policy. If there's a pattern (several accounts, automated), enable the stricter input classifier, and consider disabling tools for that tenant.
+4. **Involve:** security on-call (always for canary hits); the account team if a business customer's users are involved.
+5. **Recover and learn:** rotate the canary (it's now known), review the prompt for anything sensitive, add the attack to the red-team regression suite (Module 8), and verify the output guard stopped the stream.
+
+</ThinkFirst>
+
+## 🧪 Module 9 lab: operate Relay
+
+**Acceptance criteria:**
+
+1. **Tracing:** every model call, tool call, retrieval and agent run is an OTel span with GenAI attributes, plus tenant, feature and AI config version. One user request is one trace tree across services. Content capture is off by default, and redacted when on.
+2. **A tracing backend** (Langfuse, Phoenix or your observability stack) receiving Relay's traces via OTLP.
+3. **Versioned AI configs** for every feature, recorded in traces, with a flag-based percentage rollout and a one-switch rollback (demonstrated).
+4. **A gateway** for all model calls: keys, per-tenant budgets with atomic reservation, retries in exactly one layer, a circuit breaker and a same-model fallback route, with tests.
+5. **Dashboards** for latency (with TTFT), errors and fallback rate, cost per conversation and per tenant, online quality, and safety signals, all sliceable by tenant and config version.
+6. **One SLO** with a multi-window burn-rate alert, plus tickets (not pages) for cost and quality drift.
+7. **Runbooks** for at least four alerts, a per-feature kill switch, tool revocation, and saved blast-radius queries.
+8. **A game day:** simulate a provider outage and a quality regression (deploy a deliberately worse config to a canary). Write a blameless post-mortem for each, using the template above.
+
+<Practice title="Build it yourself: Module 9 wrap-up">
+
+- **Warm-up:** add a per-feature kill switch to Relay, behind a feature flag, with a friendly fallback message. Test that flipping it needs no deploy.
+- **Stretch:** write runbooks for the four alerts you're most likely to receive, each with saved trace queries.
+- **Boss level:** complete the Module 9 lab, including the game day. A real post-mortem from a simulated incident is a strong portfolio piece: it shows you think about running systems, not just building them.
+
+</Practice>
+
+<Quiz
+	id="m9-final"
+	title="Module 9 final quiz"
+	questions={[
+		{
+			q: 'During an AI incident, what comes first?',
+			options: ['Finding the root cause', 'Containing the impact (kill switch, rollback, tool revocation), then scoping, then fixing', 'Writing the post-mortem', 'Retraining the model'],
+			answer: 1,
+			why: 'Stop the harm first. Root cause analysis can wait until users are safe.',
+		},
+		{
+			q: 'What does "blameless" mean in a post-mortem?',
+			options: [
+				'Nobody is responsible for anything',
+				'It assumes people acted reasonably, and looks for system changes that prevent or shorten the next incident',
+				'It is anonymous',
+				'Only managers write it',
+			],
+			answer: 1,
+			why: '"Be more careful" is not a fix. Change the system so the mistake is harder to make or faster to catch.',
+		},
+		{
+			q: 'Which artifact should every AI incident leave behind?',
+			options: ['A new dashboard', 'At least one new eval case or attack test that would have caught it', 'A longer system prompt', 'A new model'],
+			answer: 1,
+			why: 'That\'s how your test suites come to reflect production reality.',
+		},
+		{
+			q: 'Why keep tool-call logs (redacted arguments, status, user, tenant) at 100% even when traces are sampled?',
+			options: ['They are free', 'So you can answer blast-radius questions ("who was affected?") during incidents', 'For training data', 'Regulators forbid sampling'],
+			answer: 1,
+			why: 'Without them, you can\'t scope an incident or notify the right customers.',
+		},
+		{
+			q: 'What is the safest fallback route for a provider outage?',
+			options: ['A smaller model with the same prompt', 'The same model through another platform or region, with the route recorded on every span', 'No fallback', 'A cached answer for everyone'],
+			answer: 1,
+			why: 'A different model is a different config that needs its own evals. Same-model fallbacks preserve behaviour.',
+		},
+	]}
+/>
+
+<LessonComplete id="llmops/incident-response" />

@@ -1,0 +1,130 @@
+---
+// Tune an alert rule on a simulated week of LLM error rates: catch the real incidents without paging people for noise.
+---
+
+<section class="alert not-content" data-alert>
+	<p class="alert__badge">🚨 Alert tuner: one week of Relay's LLM error rate (5-minute buckets)</p>
+	<div class="alert__controls">
+		<label>Page when error rate is above: <output name="thrOut"></output>
+			<input type="range" name="thr" min="1" max="20" step="0.5" value="2" />
+		</label>
+		<label>…for at least: <output name="forOut"></output>
+			<input type="range" name="for" min="1" max="12" value="1" />
+		</label>
+	</div>
+	<svg class="alert__chart" viewBox="0 0 1000 200" preserveAspectRatio="none" role="img" aria-label="Error rate over one week with alert markers"></svg>
+	<p class="alert__legend"><i class="alert__k alert__k--inc"></i>real incident <i class="alert__k alert__k--line"></i>threshold <i class="alert__k alert__k--page"></i>page sent</p>
+	<div class="alert__out">
+		<div><span>Pages this week</span><strong data-o="pages"></strong></div>
+		<div><span>Incidents caught</span><strong data-o="caught"></strong></div>
+		<div><span>False pages</span><strong data-o="false"></strong></div>
+		<div><span>Avg. time to page</span><strong data-o="delay"></strong></div>
+	</div>
+	<ul class="alert__incidents"></ul>
+	<p class="alert__note" aria-live="polite"></p>
+</section>
+
+<script>
+	const STEP_MIN = 5;
+	const N = (7 * 24 * 60) / STEP_MIN; // one week of 5-minute buckets
+
+	// Deterministic pseudo-random noise so everyone sees the same week.
+	function rng(seed: number) {
+		return () => {
+			seed |= 0;
+			seed = (seed + 0x6d2b79f5) | 0;
+			let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+			t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+			return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+		};
+	}
+
+	const INCIDENTS = [
+		{ name: 'Provider outage (Tue 14:10)', start: 1 * 288 + 170, len: 8, level: 32 },
+		{ name: 'Bad prompt deploy: JSON parse failures (Thu 09:00)', start: 3 * 288 + 108, len: 36, level: 4.2 },
+		{ name: 'Rate limit misconfigured after scaling (Sat 20:00)', start: 5 * 288 + 240, len: 4, level: 9 },
+	];
+
+	const rand = rng(42);
+	const series: number[] = [];
+	for (let i = 0; i < N; i++) {
+		const hour = ((i * STEP_MIN) / 60) % 24;
+		const traffic = 0.6 + 0.4 * Math.sin(((hour - 6) / 24) * 2 * Math.PI); // fewer requests at night = noisier rate
+		let v = 0.6 + rand() * 0.8 + (rand() < 0.02 / traffic ? 2 + rand() * 6 : 0); // baseline + transient 529 blips
+		series.push(v);
+	}
+	for (const at of [400, 1300, 1720]) {
+		series[at] = 5.5; // short, self-healing bursts: two buckets long
+		series[at + 1] = 4.8;
+	}
+	for (const inc of INCIDENTS) {
+		for (let i = inc.start - 3; i < inc.start; i++) series[i] = Math.min(series[i], 1.4); // a calm lead-in keeps delays readable
+		for (let i = inc.start; i < inc.start + inc.len; i++) series[i] = inc.level + rand() * inc.level * 0.15;
+	}
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-alert]')) {
+		const num = (n: string) => Number(box.querySelector<HTMLInputElement>(`[name="${n}"]`)!.value);
+		const setOut = (n: string, v: string) => (box.querySelector<HTMLOutputElement>(`[name="${n}Out"]`)!.value = v);
+		const svg = box.querySelector<SVGSVGElement>('.alert__chart')!;
+		const yMax = 20;
+		const y = (v: number) => 200 - (Math.min(v, yMax) / yMax) * 195;
+		const x = (i: number) => (i / (N - 1)) * 1000;
+
+		const base =
+			INCIDENTS.map((inc) => `<rect class="alert__inc" x="${x(inc.start)}" y="0" width="${Math.max(x(inc.len), 4)}" height="200"/>`).join('') +
+			`<polyline class="alert__line" points="${series.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ')}"/>` +
+			[1, 2, 3, 4, 5, 6].map((d) => `<line class="alert__day" x1="${x(d * 288)}" x2="${x(d * 288)}" y1="0" y2="200"/>`).join('');
+
+		const render = () => {
+			const thr = num('thr');
+			const forN = num('for');
+			setOut('thr', `${thr}%`);
+			setOut('for', `${forN * STEP_MIN} min`);
+
+			// Fire once per episode: when the rate has been above the threshold for forN buckets in a row.
+			// An episode lasts until the rate drops back below the threshold.
+			const episodes: { page: number; end: number }[] = [];
+			let run = 0;
+			for (let i = 0; i < N; i++) {
+				if (series[i] > thr) {
+					run++;
+					if (run === forN) episodes.push({ page: i, end: i });
+					if (run >= forN) episodes[episodes.length - 1].end = i;
+				} else {
+					run = 0;
+				}
+			}
+			const pages = episodes.map((e) => e.page);
+			const overlaps = (e: { page: number; end: number }, inc: (typeof INCIDENTS)[number]) => e.page < inc.start + inc.len && e.end >= inc.start;
+
+			const caught = INCIDENTS.map((inc) => episodes.find((e) => overlaps(e, inc)));
+			const falsePages = episodes.filter((e) => !INCIDENTS.some((inc) => overlaps(e, inc))).length;
+			// A page that started just before the incident (noise that ran into it) counts as paging at minute 0.
+			const delayOf = INCIDENTS.map((inc, k) => (caught[k] ? Math.max(0, caught[k]!.page - inc.start + 1) * STEP_MIN : null));
+			const delays = delayOf.filter((d) => d !== null) as number[];
+
+			svg.innerHTML =
+				base +
+				`<line class="alert__thr" x1="0" x2="1000" y1="${y(thr)}" y2="${y(thr)}"/>` +
+				pages.map((p) => `<circle class="alert__page" cx="${x(p)}" cy="${y(Math.min(series[p], yMax)) - 6}" r="5"/>`).join('');
+
+			const nCaught = caught.filter((c) => c !== undefined).length;
+			box.querySelector('[data-o="pages"]')!.textContent = String(pages.length);
+			box.querySelector('[data-o="caught"]')!.textContent = `${nCaught} / ${INCIDENTS.length}`;
+			box.querySelector('[data-o="false"]')!.textContent = String(falsePages);
+			box.querySelector('[data-o="delay"]')!.textContent = delays.length ? `${Math.round(delays.reduce((a, b) => a + b, 0) / delays.length)} min` : '–';
+			box.querySelector('.alert__incidents')!.innerHTML = INCIDENTS.map(
+				(inc, k) => `<li>${delayOf[k] !== null ? '✅' : '❌'} ${inc.name}: ${inc.len * STEP_MIN} min at ~${inc.level}%${delayOf[k] !== null ? `, paged after ${delayOf[k]} min` : ', missed'}</li>`,
+			).join('');
+
+			let note = '';
+			if (falsePages > 10) note = `${falsePages} false pages in a week. On-call will mute this alert by Wednesday, and then miss the real outage. That's alert fatigue.`;
+			else if (nCaught < INCIDENTS.length && falsePages <= 1) note = 'Quiet, but blind: a real incident went unnoticed until customers complained. Lower the threshold or the duration.';
+			else if (nCaught === INCIDENTS.length && falsePages <= 1) note = `🏆 All three incidents caught with ${falsePages} false page${falsePages === 1 ? '' : 's'}. Notice how the duration did most of the work: it filters short blips without raising the threshold.`;
+			else note = 'Getting closer. Real incidents last; blips don\'t. Which control filters by duration?';
+			box.querySelector('.alert__note')!.textContent = note;
+		};
+		box.addEventListener('input', render);
+		render();
+	}
+</script>

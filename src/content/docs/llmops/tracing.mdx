@@ -1,0 +1,245 @@
+---
+title: Tracing LLM and agent calls
+description: Why logs aren't enough for AI systems, trace trees for agents, OpenTelemetry's GenAI semantic conventions, instrumenting model and tool calls in Python, what to capture (and what not to), and the tools that store and show traces.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import TraceViewer from '../../../components/TraceViewer.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+import relayTrace from '../../../data/relay-trace.json';
+
+<Incident title="'Relay is slow' (and nobody knew why)" severity="SEV3">
+Customers complained that Relay sometimes took 15 seconds to answer. The logs showed one line per request: `POST /chat 200 14,812ms`. Was it the model? Retrieval? A tool? A retry loop? The team guessed "the model is slow" and switched to a smaller one. Answers got worse; the latency didn't change. Two weeks later, tracing showed the real culprit: the CRM tool timing out after 10 seconds on one in five requests, followed by a retry.
+</Incident>
+
+A single AI request can involve several model calls, retrieval, a handful of tools, retries and a fallback. A log line per request tells you **that** something was slow or wrong. A **trace** tells you **where** and **why**.
+
+## Traces, spans and the agent tree
+
+A **trace** is the full story of one request. It's made of **spans**: timed operations with a name, a parent, a status and attributes. For an agent, the spans form a tree:
+
+<Diagram
+	caption="One agent run as a trace tree. Each box is a span with its own timing, status and attributes. The tree is what makes multi-step behaviour debuggable."
+	code={`flowchart TD
+    A["invoke_agent relay-support<br/>5.4 s"] --> B["chat claude-sonnet-5-5<br/>0.83 s · tool_use"]
+    A --> C["execute_tool get_shipment<br/>0.09 s"]
+    A --> D["execute_tool search_policies<br/>0.31 s"]
+    A --> E["chat claude-sonnet-5-5<br/>0.69 s · tool_use"]
+    A --> F["execute_tool get_customer_overview<br/>1.4 s · ERROR"]
+    A --> G["chat claude-sonnet-5-5<br/>2.1 s · end_turn"]`}
+/>
+
+## OpenTelemetry and the GenAI semantic conventions
+
+**OpenTelemetry (OTel)** is the vendor-neutral standard for traces, metrics and logs. Its **GenAI semantic conventions** define standard span names and attributes for model calls, agents and tools, so any OTel-compatible backend can understand your traces. They are still marked "Development" (names can change), and in 2026 they moved into their own repository, but the core is widely used:
+
+| Span | Name format | Key attributes |
+|---|---|---|
+| Model call | `chat {model}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.finish_reasons`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` |
+| Agent run | `invoke_agent {agent}` | `gen_ai.agent.name`, `gen_ai.conversation.id` |
+| Tool call | `execute_tool {tool}` | `gen_ai.tool.name`, `gen_ai.tool.call.id` |
+| Any failure | | `error.type`, plus span status `ERROR` |
+
+Two details from the spec that are easy to get wrong:
+
+- `gen_ai.usage.input_tokens` should include **all** input tokens, cached ones too. Anthropic's API reports cache reads and writes **separately** from `input_tokens`, so you add them back.
+- **Message content is opt-in.** Instrumentations shouldn't capture prompts and responses by default, because they routinely contain customer data. More on that below.
+
+## Instrumenting Relay
+
+Three small helpers wrap the agent run, each model call, and each tool call. They plug into the Module 6 agent loop:
+
+```python
+"""OpenTelemetry tracing for LLM and tool calls, using the GenAI semantic conventions."""
+import json
+from contextlib import contextmanager
+
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+tracer = trace.get_tracer("relay")
+
+PRICES = {"claude-sonnet-5-5": (2.00, 10.00)}  # USD per million input / output tokens
+
+
+@contextmanager
+def agent_span(agent_name: str, conversation_id: str, **attrs):
+    with tracer.start_as_current_span(f"invoke_agent {agent_name}", kind=SpanKind.INTERNAL) as span:
+        span.set_attributes({
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.provider.name": "anthropic",
+            "gen_ai.agent.name": agent_name,
+            "gen_ai.conversation.id": conversation_id,
+            **attrs,  # your own dimensions: tenant, feature, prompt version...
+        })
+        yield span
+
+
+def traced_chat(client, **request):
+    model = request["model"]
+    with tracer.start_as_current_span(f"chat {model}", kind=SpanKind.CLIENT) as span:
+        span.set_attributes({
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": "anthropic",
+            "gen_ai.request.model": model,
+            "gen_ai.request.max_tokens": request["max_tokens"],
+        })
+        try:
+            response = client.messages.create(**request)
+        except Exception as e:
+            span.set_attribute("error.type", type(e).__name__)
+            span.set_status(Status(StatusCode.ERROR, str(e)[:200]))
+            raise
+        usage = response.usage
+        cache_read = usage.cache_read_input_tokens or 0
+        cache_write = usage.cache_creation_input_tokens or 0
+        price_in, price_out = PRICES.get(model, (0, 0))
+        span.set_attributes({
+            "gen_ai.response.id": response.id,
+            "gen_ai.response.model": response.model,
+            "gen_ai.response.finish_reasons": [response.stop_reason or "unknown"],
+            # The spec counts ALL input tokens; Anthropic reports cached ones separately, so add them back.
+            "gen_ai.usage.input_tokens": usage.input_tokens + cache_read + cache_write,
+            "gen_ai.usage.cache_read.input_tokens": cache_read,
+            "gen_ai.usage.output_tokens": usage.output_tokens,
+            "relay.cost_usd": round((usage.input_tokens * price_in + cache_read * price_in * 0.1
+                                     + cache_write * price_in * 1.25 + usage.output_tokens * price_out) / 1e6, 6),
+        })
+        return response
+
+
+def traced_tool(name: str, call_id: str, handler, args: dict):
+    with tracer.start_as_current_span(f"execute_tool {name}", kind=SpanKind.INTERNAL) as span:
+        span.set_attributes({
+            "gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": name,
+            "gen_ai.tool.call.id": call_id,
+            "relay.tool.args_size": len(json.dumps(args)),  # sizes, not contents: arguments may hold PII
+        })
+        try:
+            result = handler(**args)
+        except Exception as e:
+            span.set_attribute("error.type", type(e).__name__)
+            span.set_status(Status(StatusCode.ERROR, str(e)[:200]))
+            return {"content": f"Error: {e}", "is_error": True}
+        span.set_attribute("relay.tool.result_size", len(str(result)))
+        return {"content": str(result), "is_error": False}
+```
+
+The demo runs a scripted agent turn (fake model responses with realistic timing, real SDK objects, real OpenTelemetry SDK) and exports the spans:
+
+```text
+invoke_agent relay-support                 +    0ms  5425ms UNSET
+  chat claude-sonnet-5-5                     +    0ms   831ms UNSET
+  execute_tool get_shipment                  +  831ms    90ms UNSET
+  execute_tool search_policies               +  922ms   310ms UNSET
+  chat claude-sonnet-5-5                     + 1232ms   692ms UNSET
+  execute_tool get_customer_overview         + 1924ms  1400ms ERROR
+  chat claude-sonnet-5-5                     + 3325ms  2100ms UNSET
+total cost USD: 0.01521
+```
+
+Explore the exported trace. Click spans to see their attributes:
+
+<TraceViewer spans={relayTrace} title="Relay agent run (real OpenTelemetry export)" />
+
+In production, replace the in-memory exporter with a `BatchSpanProcessor` and an **OTLP exporter** pointing at your tracing backend. Then propagate the trace context across services (your API, the MCP server, the worker queue), so a single request is one trace end to end.
+
+## What to capture, and what not to
+
+| Capture | Why |
+|---|---|
+| Model, parameters, token counts, cost, finish reason | Cost and quality analysis; spotting `max_tokens` truncation |
+| Latency per span, time to first token | Finding the slow part |
+| Tool names, call IDs, status, **sizes** of arguments and results | Debugging agents without storing data |
+| Your dimensions: tenant, feature, **prompt version**, model route, experiment arm | Slicing dashboards; comparing versions (lesson 2) |
+| User ID (hashed or pseudonymous) | Per-user debugging and abuse detection |
+
+| Be careful with | Approach |
+|---|---|
+| **Prompts and responses** | Off by default. Where you need them (debugging, building eval sets), capture them **redacted** (Module 8), with restricted access, a retention limit, and sampling |
+| Tool arguments and results | Same: sizes and statuses by default, contents only with redaction and access control |
+| Secrets | Never. Scrub headers and environment values in your exporters |
+
+## Where traces go
+
+| Tool | Type |
+|---|---|
+| **Langfuse** | Open-source LLM observability (self-host or cloud): traces, prompt management, evals, datasets; OTel-based SDK |
+| **Arize Phoenix** | Open-source tracing and evaluation, built on OTel and the OpenInference conventions |
+| **LangSmith** | LangChain's hosted tracing and evaluation platform; works without LangChain too |
+| **General observability** (Datadog, Grafana/Tempo, Honeycomb, New Relic…) | Ingest OTel GenAI spans next to the rest of your system's traces |
+
+Because you instrument with OpenTelemetry, you can switch backends without touching your code. That matters in FDE work: the customer's existing observability stack often decides the backend.
+
+<FailureCard
+	title="The trace that leaked"
+	symptom="A contractor with access to the tracing tool searched for a celebrity customer's name and found their full support conversation."
+	cause="Full prompts and responses were captured by default in every span, and the tracing tool had broad access."
+	detect="Audit what your spans contain; search a sample of traces for emails and phone numbers."
+	fix="Content capture off by default; redaction before export; role-based access and retention limits on the tracing backend."
+/>
+
+<FailureCard
+	title="Broken trees"
+	symptom="Tool calls and model calls show up as separate, unrelated traces; nobody can follow a request."
+	cause="Trace context wasn't propagated: thread pools, async tasks and queue workers started new root spans."
+	detect="Count root spans per request: there should be one."
+	fix="Use OTel context propagation (contextvars in async code, explicit context passing for thread pools and queues, W3C trace headers between services)."
+/>
+
+<ThinkFirst question="Look at the trace above. Name two concrete improvements to Relay that the trace suggests, and how you'd confirm each worked.">
+
+1. **The two tools in the first turn ran one after the other** (`get_shipment`, then `search_policies`), though the model requested them together. Running them **in parallel** (Module 6) saves about 90 ms here, more with slower tools. Confirm: the two tool spans should overlap in time in new traces.
+2. **`get_customer_overview` took 1.4 s and then failed** (a CRM timeout), and the model had to answer without it. Options: a shorter timeout with a cached fallback, or fetching the customer overview **before** the agent starts (it's needed in almost every conversation). Confirm: the error rate on that span, and p95 latency of the whole trace, on the dashboard (lesson 4).
+
+Also visible: the final answer took 2.1 s for 318 output tokens. If that's user-facing, make sure it **streams** (Module 1) so time to first token stays low.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** add the three helpers to your Module 6 agent loop and print spans with the console exporter.
+- **Stretch:** run Langfuse or Phoenix locally (both have Docker setups), send Relay's traces with an OTLP exporter, and find your slowest span type.
+- **Boss level:** propagate trace context through Relay's whole path: the FastAPI endpoint, the agent loop, the MCP server (Module 7) and a background worker. One user request, one trace tree.
+
+</Practice>
+
+<Quiz
+	id="m9-tracing"
+	questions={[
+		{
+			q: 'What does a trace give you that a per-request log line doesn\'t?',
+			options: ['Nothing', 'The timing, status and attributes of every step (model calls, tools, retrieval), as a tree', 'Lower latency', 'Encryption'],
+			answer: 1,
+			why: 'Traces show where the time and the errors are, step by step.',
+		},
+		{
+			q: 'Under the OTel GenAI conventions, what should gen_ai.usage.input_tokens include?',
+			options: ['Only uncached tokens', 'All input tokens, including cached ones (add Anthropic\'s cache reads and writes back in)', 'Output tokens too', 'Only system prompt tokens'],
+			answer: 1,
+			why: 'The spec counts all input; Anthropic reports cached tokens in separate fields.',
+		},
+		{
+			q: 'Should prompts and responses be captured in spans by default?',
+			options: ['Yes, always', 'No: content capture is opt-in, and when used it should be redacted, access-controlled and time-limited', 'Only for errors', 'Only in production'],
+			answer: 1,
+			why: 'Traces are a common route for customer data to spread inside a company.',
+		},
+		{
+			q: 'Why instrument with OpenTelemetry instead of a vendor SDK only?',
+			options: ['It is required by law', 'Your code stays the same when the tracing backend changes, which often happens in customer deployments', 'It is faster', 'It encrypts data'],
+			answer: 1,
+			why: 'Vendor neutrality matters when the customer\'s stack picks the backend.',
+		},
+	]}
+/>
+
+<LessonComplete id="llmops/tracing" />
