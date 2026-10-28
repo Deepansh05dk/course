@@ -1,9 +1,18 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import baseLinks from './src/plugins/base-links.mjs';
+
+// GitHub Pages serves this repo at https://deepansh05dk.github.io/course/ (the deploy workflow sets
+// BASE_PATH=/course). Locally the site runs at the root, so `npm run dev` works at localhost:4321/.
+const site = process.env.SITE_URL ?? 'https://deepansh05dk.github.io';
+const base = process.env.BASE_PATH ?? '/';
 
 export default defineConfig({
+	site,
+	base,
 	integrations: [
+		baseLinks(),
 		starlight({
 			title: 'AI in Production',
 			description:
