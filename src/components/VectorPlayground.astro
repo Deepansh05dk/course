@@ -1,0 +1,137 @@
+---
+---
+
+<section class="vec not-content" data-vec>
+	<p class="vec__badge">📐 Vector playground: drag the arrow tips</p>
+	<div class="vec__wrap">
+		<svg class="vec__svg" viewBox="-5.5 -5.5 11 11" role="img" aria-label="Two draggable 2-D vectors">
+			<defs>
+				<marker id="vec-arrow-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+					<path d="M0 0L10 5L0 10z" fill="#6366f1"></path>
+				</marker>
+				<marker id="vec-arrow-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+					<path d="M0 0L10 5L0 10z" fill="#f59e0b"></path>
+				</marker>
+			</defs>
+			<g class="vec__grid"></g>
+			<circle class="vec__unit" cx="0" cy="0" r="2.5"></circle>
+			<line class="vec__l2" x1="0" y1="0" x2="0" y2="0"></line>
+			<path class="vec__angle" d=""></path>
+			<line class="vec__line vec__line--a" x1="0" y1="0" x2="0" y2="0" marker-end="url(#vec-arrow-a)"></line>
+			<line class="vec__line vec__line--b" x1="0" y1="0" x2="0" y2="0" marker-end="url(#vec-arrow-b)"></line>
+			<circle class="vec__handle vec__handle--a" data-h="a" r="0.35"></circle>
+			<circle class="vec__handle vec__handle--b" data-h="b" r="0.35"></circle>
+		</svg>
+		<div class="vec__stats">
+			<label class="vec__norm"><input type="checkbox" /> Normalize both to length 1 (the dashed circle)</label>
+			<dl>
+				<dt>Cosine similarity</dt><dd data-s="cos"></dd>
+				<dt>Angle</dt><dd data-s="angle"></dd>
+				<dt>Dot product</dt><dd data-s="dot"></dd>
+				<dt>Euclidean (L2) distance</dt><dd data-s="l2"></dd>
+				<dt>Lengths</dt><dd data-s="len"></dd>
+			</dl>
+			<p class="vec__hint" aria-live="polite"></p>
+		</div>
+	</div>
+</section>
+
+<script>
+	for (const box of document.querySelectorAll<HTMLElement>('[data-vec]')) {
+		const svg = box.querySelector<SVGSVGElement>('.vec__svg')!;
+		const grid = svg.querySelector('.vec__grid')!;
+		for (let i = -5; i <= 5; i++) {
+			grid.insertAdjacentHTML('beforeend', `<line x1="${i}" y1="-5" x2="${i}" y2="5"></line><line x1="-5" y1="${i}" x2="5" y2="${i}"></line>`);
+		}
+		const state = { a: [4, 1], b: [2, 3] } as Record<'a' | 'b', number[]>;
+		const normBox = box.querySelector<HTMLInputElement>('.vec__norm input')!;
+		const UNIT = 2.5; // drawn radius of a unit vector
+		const stat = (k: string) => box.querySelector<HTMLElement>(`[data-s="${k}"]`)!;
+
+		const render = () => {
+			const view = (v: number[]) => {
+				if (!normBox.checked) return v;
+				const n = Math.hypot(v[0], v[1]) || 1;
+				return [(v[0] / n) * UNIT, (v[1] / n) * UNIT];
+			};
+			const a = view(state.a);
+			const b = view(state.b);
+			for (const [key, v] of [['a', a], ['b', b]] as const) {
+				const line = svg.querySelector<SVGLineElement>(`.vec__line--${key}`)!;
+				line.setAttribute('x2', String(v[0]));
+				line.setAttribute('y2', String(-v[1]));
+				const h = svg.querySelector<SVGCircleElement>(`.vec__handle--${key}`)!;
+				h.setAttribute('cx', String(v[0]));
+				h.setAttribute('cy', String(-v[1]));
+			}
+			const l2line = svg.querySelector<SVGLineElement>('.vec__l2')!;
+			l2line.setAttribute('x1', String(a[0]));
+			l2line.setAttribute('y1', String(-a[1]));
+			l2line.setAttribute('x2', String(b[0]));
+			l2line.setAttribute('y2', String(-b[1]));
+
+			// Numbers are computed on the (possibly normalized) vectors, in "units" where the dashed circle is 1.
+			const s = normBox.checked ? 1 / UNIT : 1;
+			const [ax, ay, bx, by] = [a[0] * s, a[1] * s, b[0] * s, b[1] * s];
+			const la = Math.hypot(ax, ay);
+			const lb = Math.hypot(bx, by);
+			const d = ax * bx + ay * by;
+			const cos = d / (la * lb || 1);
+			const angle = (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
+			stat('cos').textContent = cos.toFixed(3);
+			stat('angle').textContent = `${angle.toFixed(1)}°`;
+			stat('dot').textContent = d.toFixed(2);
+			stat('l2').textContent = Math.hypot(ax - bx, ay - by).toFixed(2);
+			stat('len').textContent = `a = ${la.toFixed(2)}, b = ${lb.toFixed(2)}`;
+
+			const r = 0.9;
+			const t1 = Math.atan2(a[1], a[0]);
+			const t2 = Math.atan2(b[1], b[0]);
+			let diff = t2 - t1;
+			while (diff > Math.PI) diff -= 2 * Math.PI;
+			while (diff < -Math.PI) diff += 2 * Math.PI;
+			svg.querySelector('.vec__angle')!.setAttribute(
+				'd',
+				`M0 0L${r * Math.cos(t1)} ${-r * Math.sin(t1)}A${r} ${r} 0 0 ${diff > 0 ? 0 : 1} ${r * Math.cos(t2)} ${-r * Math.sin(t2)}Z`,
+			);
+
+			box.querySelector('.vec__hint')!.textContent = normBox.checked
+				? 'Normalized: dot product = cosine, and L2 distance depends only on the angle. That is why many vector DBs normalize once and use the fast dot product.'
+				: Math.abs(la - lb) > 1.5 && cos > 0.9
+					? 'Same direction, very different lengths: cosine says "similar", L2 says "far apart". Which one you want depends on whether length means anything.'
+					: 'Try: make the arrows point the same way with different lengths, then tick "Normalize".';
+		};
+
+		let dragging: 'a' | 'b' | null = null;
+		const toSvg = (e: PointerEvent) => {
+			const pt = svg.createSVGPoint();
+			pt.x = e.clientX;
+			pt.y = e.clientY;
+			const p = pt.matrixTransform(svg.getScreenCTM()!.inverse());
+			return [Math.max(-5, Math.min(5, p.x)), Math.max(-5, Math.min(5, -p.y))];
+		};
+		svg.addEventListener('pointerdown', (e) => {
+			const h = (e.target as Element).closest<SVGElement>('[data-h]');
+			if (!h) return;
+			dragging = h.dataset.h as 'a' | 'b';
+			svg.setPointerCapture(e.pointerId);
+		});
+		svg.addEventListener('pointermove', (e) => {
+			if (!dragging) return;
+			const p = toSvg(e);
+			if (Math.hypot(p[0], p[1]) < 0.3) return;
+			if (normBox.checked) {
+				// Keep the drag feeling natural: move direction, keep the original length.
+				const n = Math.hypot(state[dragging][0], state[dragging][1]);
+				const m = Math.hypot(p[0], p[1]);
+				state[dragging] = [(p[0] / m) * n, (p[1] / m) * n];
+			} else state[dragging] = p;
+			render();
+		});
+		const end = () => (dragging = null);
+		svg.addEventListener('pointerup', end);
+		svg.addEventListener('pointercancel', end);
+		normBox.addEventListener('change', render);
+		render();
+	}
+</script>

@@ -18,6 +18,8 @@ export default defineConfig({
 				{ label: 'Research: roles & skills', link: '/research/' },
 				{ label: '0 · Start Here', items: [{ autogenerate: { directory: 'start' } }] },
 				{ label: '1 · LLM Foundations', items: [{ autogenerate: { directory: 'foundations' } }] },
+				{ label: '2 · AI-Native UX', items: [{ autogenerate: { directory: 'ai-ux' } }] },
+				{ label: '3 · Embeddings & Vector Search', items: [{ autogenerate: { directory: 'embeddings' } }] },
 				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
 			],
 		}),

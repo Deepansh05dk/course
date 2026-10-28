@@ -1,0 +1,99 @@
+---
+interface Props {
+	text?: string;
+	/** Simulated time to first token, in ms. */
+	ttft?: number;
+	/** Simulated output speed. */
+	tokensPerSecond?: number;
+}
+
+const {
+	text = 'Your shipment ACM-2025-000183 left Rotterdam this morning and is now with our partner carrier in Antwerp. Because of port congestion it is running about one day late, so the new estimated delivery is Thursday between 9:00 and 12:00. You will get an SMS with a two-hour window the evening before. If Thursday does not work, you can pick a different day or a nearby pickup point from the tracking page, and I can also flag the delay for a goodwill credit review.',
+	ttft = 900,
+	tokensPerSecond = 22,
+} = Astro.props;
+---
+
+<section class="sdemo not-content" data-sdemo={text} data-ttft={ttft} data-tps={tokensPerSecond}>
+	<p class="sdemo__badge">⏱️ Same model, same answer, different experience</p>
+	<button type="button" class="sdemo__run">▶ Send the same question to both</button>
+	<div class="sdemo__cols">
+		<div class="sdemo__pane">
+			<p class="sdemo__head">Blocking: wait for the full response <span class="sdemo__clock" data-c="block">0.0s</span></p>
+			<div class="sdemo__out" data-o="block"></div>
+		</div>
+		<div class="sdemo__pane">
+			<p class="sdemo__head">Streaming: render tokens as they arrive <span class="sdemo__clock" data-c="stream">0.0s</span></p>
+			<div class="sdemo__out" data-o="stream"></div>
+			<button type="button" class="sdemo__stop" hidden>■ Stop</button>
+		</div>
+	</div>
+	<p class="sdemo__verdict" aria-live="polite"></p>
+</section>
+
+<script>
+	for (const box of document.querySelectorAll<HTMLElement>('[data-sdemo]')) {
+		const words = box.dataset.sdemo!.split(/(?<=\s)/);
+		const ttft = Number(box.dataset.ttft);
+		const msPerToken = 1000 / Number(box.dataset.tps);
+		const out = (k: string) => box.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+		const clock = (k: string) => box.querySelector<HTMLElement>(`[data-c="${k}"]`)!;
+		const stopBtn = box.querySelector<HTMLButtonElement>('.sdemo__stop')!;
+		const verdict = box.querySelector<HTMLElement>('.sdemo__verdict')!;
+		let timers: number[] = [];
+
+		const run = () => {
+			timers.forEach(clearTimeout);
+			timers = [];
+			out('block').innerHTML = '<span class="sdemo__spin">Thinking…</span>';
+			out('stream').innerHTML = '<span class="sdemo__spin">Thinking…</span>';
+			verdict.textContent = '';
+			stopBtn.hidden = false;
+			const total = ttft + words.length * msPerToken;
+			const start = performance.now();
+			let streamDone = false;
+			let firstStream = 0;
+
+			const tick = () => {
+				const t = (performance.now() - start) / 1000;
+				if (!out('block').dataset.done) clock('block').textContent = `${t.toFixed(1)}s`;
+				if (!streamDone) clock('stream').textContent = `${t.toFixed(1)}s`;
+				if (!out('block').dataset.done || !streamDone) timers.push(window.setTimeout(tick, 100));
+			};
+			delete out('block').dataset.done;
+			tick();
+
+			words.forEach((w, i) => {
+				timers.push(
+					window.setTimeout(() => {
+						if (streamDone) return;
+						if (i === 0) {
+							out('stream').textContent = '';
+							firstStream = (performance.now() - start) / 1000;
+						}
+						out('stream').textContent += w;
+						if (i === words.length - 1) {
+							streamDone = true;
+							stopBtn.hidden = true;
+						}
+					}, ttft + i * msPerToken),
+				);
+			});
+			timers.push(
+				window.setTimeout(() => {
+					out('block').textContent = words.join('');
+					out('block').dataset.done = '1';
+					verdict.textContent = `Both took about ${(total / 1000).toFixed(1)}s in total. With streaming, the user started reading after ${firstStream.toFixed(1)}s, and could have stopped early.`;
+				}, total),
+			);
+
+			stopBtn.onclick = () => {
+				streamDone = true;
+				stopBtn.hidden = true;
+				out('stream').insertAdjacentHTML('beforeend', ' <em>[stopped: in production, make sure the server stops generating too]</em>');
+			};
+		};
+
+		box.querySelector('.sdemo__run')!.addEventListener('click', run);
+	}
+</script>

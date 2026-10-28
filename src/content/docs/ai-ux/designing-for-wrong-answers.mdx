@@ -1,0 +1,163 @@
+---
+title: Designing for wrong answers
+description: Citations, uncertainty cues, showing the work, and making correction effortless. UX patterns that keep users appropriately trusting.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The confident customs answer" severity="SEV2">
+An agent asked Relay whether lithium batteries could ship to Norway by sea. Relay answered "Yes, with standard packaging," in a calm, authoritative paragraph with no sources. The agent passed it on. The shipment was stopped at the port, because the policy requires a hazmat label. The model's answer was **wrong 5% of the time** on this kind of question, but the UI made it look **right 100% of the time**.
+</Incident>
+
+Your system **will** be wrong sometimes. Evals reduce how often; UX decides **how much damage** each wrong answer does. The goal isn't to make users trust the AI. It's **calibrated trust**: trust it where it's reliable, check it where it isn't, and make checking cheap.
+
+## Five patterns that limit the damage
+
+| Pattern | What it does | Relay example |
+|---|---|---|
+| **1. Show sources** | Every claim links to its evidence | "Batteries require a hazmat label [Policy §4.2]" with a click to open the excerpt |
+| **2. Say "I don't know"** | Honest refusal when the evidence is missing | "The policy library doesn't cover shipping to Norway by sea. Escalate to the compliance team." |
+| **3. Show the work** | Tool calls, searches and steps are visible | "Searched 'battery shipping rules' → 3 policy excerpts → checked shipment record" |
+| **4. Signal uncertainty honestly** | Cues based on **real signals**, not vibes | "Low confidence: sources disagree" when retrieval returns conflicting policies |
+| **5. Make correction effortless** | Edit, regenerate, report, undo, all one click | An inline "This is wrong" that captures the correct answer |
+
+## 1. Citations: the most powerful trust tool
+
+Citations change the user's job from "trust or don't" to "verify in two seconds". Good citation UX:
+
+- **Inline and specific:** the marker sits next to the claim it supports, not in a list at the end.
+- **One click to the evidence:** show the exact excerpt, highlighted, not just the document title.
+- **Verifiable by code, not just displayed:** check that every cited source was actually retrieved for this answer, and that quoted text exists in it (Module 4). A citation to a document the model never saw is worse than no citation.
+
+<Diagram
+	caption="Citations end to end: retrieval feeds source IDs to the model, the model cites them, code verifies them, and the UI renders verified sources only."
+	code={`flowchart LR
+    R["Retriever<br/>chunks with IDs"] --> M["Model<br/>answer with [S1] [S3] markers"]
+    M --> V{"Verify<br/>every cited ID was retrieved?<br/>quotes exist in source?"}
+    V -- yes --> UI["UI: inline citation chips<br/>click opens highlighted excerpt"]
+    V -- no --> F["Drop the claim or flag it,<br/>log as a grounding failure"]`}
+/>
+
+In the AI SDK protocol, sources are first-class parts (`source-url`, `source-document`), so a Python backend can emit them and the React UI can render them as chips.
+
+## 2. "I don't know" is a feature
+
+The model will try to be helpful, so refusing must be **designed in**:
+
+- In the prompt: "If the provided policy excerpts don't answer the question, say so and suggest escalation. Don't use general knowledge for policy questions."
+- In the pipeline: if retrieval returns nothing relevant (low scores), don't even ask the model to answer. Return the "not covered" response directly.
+- In the UI: make "not covered" a **useful** state, with a one-click "Escalate to compliance" button and the question pre-filled.
+- In evals: include unanswerable questions and score refusals as **correct** (Module 5).
+
+## 3–4. Show the work, signal uncertainty from real signals
+
+Never ask the model "how confident are you (0–100)?" and display the number. Self-reported confidence is poorly calibrated. Use **signals you can measure**:
+
+| Signal | Shows |
+|---|---|
+| Retrieval scores below a threshold, or no results | "Limited sources found" |
+| Retrieved sources conflict (different versions, dates) | "Sources disagree: check §4.2 (2025) vs §4.2 (2023)" |
+| Validation failed and the repair loop was used | Route to review, or show a soft warning |
+| The question category has a low eval score | "Answers about customs are often incomplete. Verify before sending." |
+| A tool errored and the answer is partial | "Shipment system unavailable: status may be outdated" |
+
+<FailureCard
+	title="Citations that point nowhere"
+	symptom="Answers show citation chips, but when clicked, half the excerpts don't contain the claim."
+	cause="The model was asked to 'add citations' and invented plausible-looking references. Nothing verified them."
+	detect="An automated check comparing cited IDs to retrieved IDs, plus an LLM-judge or string check that the excerpt supports the claim. Track the citation precision rate."
+	fix="Give the model numbered sources and require citations by ID; drop or flag any ID not in the retrieved set; verify quotes; show only verified chips."
+/>
+
+<FailureCard
+	title="The fake confidence meter"
+	symptom="A '92% confident' badge appears on answers that turn out to be wrong about as often as the '70%' ones."
+	cause="The number came from asking the model to rate itself. It looked scientific, but it wasn't calibrated."
+	detect="Plot accuracy against displayed confidence on your eval set (a calibration curve). A flat line means the number is meaningless."
+	fix="Remove numeric self-confidence. Use measurable signals (retrieval quality, source agreement, validation results, per-category eval accuracy) and phrase cues qualitatively."
+/>
+
+<FailureCard
+	title="Over-reliance after a good first month"
+	symptom="Agents stop reading sources. When quality dips after a model update, mistakes go straight to customers."
+	cause="Trust grew with early accuracy (automation complacency), and the UI never required verification for high-stakes answers."
+	detect="Track how often citations are opened over time, and edit rates per category."
+	fix="Require explicit confirmation for high-stakes categories (customs, refunds, legal), keep sampling outputs for review, and alert when eval scores drop after any change."
+/>
+
+<ThinkFirst question="Relay will answer customs questions, where a wrong answer can mean a seized shipment or a fine. Design the answer UI: what does the agent see, and what must they do before the answer goes to a customer?">
+
+A strong design adds friction **in proportion to the stakes**:
+
+1. **Answer with inline, verified citations** to specific policy sections, opening a highlighted excerpt on click.
+2. **A visible category banner:** "Customs: verify before sending", based on the category's measured error rate, not the model's self-confidence.
+3. **Explicit uncertainty states:** sources missing, so a "not covered" state with a pre-filled escalation to the compliance team. Sources conflicting, so both are shown with dates and the answer is withheld.
+4. **A confirmation step before sending to a customer:** the agent ticks "I checked the cited policy" (logged), or the draft routes to a compliance reviewer for specific high-risk sub-topics (dangerous goods).
+5. **One-click "This is wrong"** that captures the correct answer and source, feeding the eval set.
+
+Low-stakes categories (tracking status) get none of this friction. **Calibrated friction is the design goal.**
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** collect five AI answers from any assistant you use. For each, write down what in the UI made you trust or distrust it.
+- **Stretch:** in your Relay UI, render citation chips from a list of source IDs, with a side panel that shows the excerpt and highlights the cited sentence.
+- **Boss level:** implement **citation verification**: given an answer with `[S1]`-style markers and the retrieved chunks, check that every marker refers to a retrieved chunk and that each cited sentence overlaps meaningfully with its source (start with simple word overlap). Show unverified claims with a warning style, and report the citation precision on 20 test answers.
+
+</Practice>
+
+<Quiz
+	id="m2-wrong-answers"
+	questions={[
+		{
+			q: 'What is the goal of "designing for wrong answers"?',
+			options: [
+				'Maximize user trust in the AI',
+				'Calibrated trust: rely on it where it is reliable, and make verification cheap where it is not',
+				'Hide errors from users',
+				'Make every answer require approval',
+			],
+			answer: 1,
+			why: 'Blind trust causes incidents; blanket distrust wastes the tool. Calibrate friction to the stakes and the measured reliability.',
+		},
+		{
+			q: 'Why not display the model\'s self-reported confidence score?',
+			options: [
+				'It is expensive to compute',
+				'It is usually poorly calibrated, so it looks precise but doesn\'t predict correctness',
+				'Users don\'t like numbers',
+				'Providers forbid it',
+			],
+			answer: 1,
+			why: 'Use measurable signals instead (retrieval scores, source agreement, validation results, per-category eval accuracy), and check calibration on your eval set.',
+		},
+		{
+			q: 'Retrieval returns nothing relevant for a policy question. What is the best behaviour?',
+			options: [
+				'Let the model answer from general knowledge',
+				'Return a designed "not covered" response with an escalation path, without asking the model to guess',
+				'Show an error page',
+				'Retry the retrieval forever',
+			],
+			answer: 1,
+			why: 'No evidence means no answer. Short-circuit to an honest, useful refusal, and count it as correct in evals.',
+		},
+		{
+			q: 'A citation chip links to a document the model never retrieved. What does that indicate?',
+			options: ['A rendering bug', 'A hallucinated citation, which code should catch by checking cited IDs against retrieved IDs', 'A caching issue', 'Nothing important'],
+			answer: 1,
+			why: 'Citations must be verified, not just displayed. Unverifiable citations are worse than none, because they create false trust.',
+		},
+	]}
+/>
+
+<LessonComplete id="ai-ux/designing-for-wrong-answers" />

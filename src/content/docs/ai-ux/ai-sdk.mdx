@@ -1,0 +1,323 @@
+---
+title: Streaming UIs with the Vercel AI SDK
+description: What the AI SDK's useChat hook does for you, two production architectures (React + FastAPI, or full TypeScript), and the failure modes the abstraction hides.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import StreamDemo from '../../../components/StreamDemo.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The upgrade that broke every chat" severity="SEV2">
+A team ran `npm update` on a Friday. Their AI SDK jumped a major version, the build passed (the old option name was simply ignored), and on Monday every chat answer ignored the system prompt: no persona, no rules, no "never promise refunds." The option had been renamed between versions. Nothing in their tests checked behaviour.
+</Incident>
+
+In [Module 1](/foundations/streaming/) you hand-wrote SSE streaming: a FastAPI endpoint and a `fetch` + `ReadableStream` reader. That taught you what streaming really is. Now let's use the tool most TypeScript teams reach for: the **Vercel AI SDK**. It handles the message state, the stream protocol, tool-call rendering, stop/regenerate and errors.
+
+First, a reminder of why all this effort goes into streaming:
+
+<StreamDemo />
+
+## What the AI SDK gives you
+
+The SDK has two halves:
+
+| Part | Runs where | What it does |
+|---|---|---|
+| **AI SDK Core** (`ai`) | Server (Node, edge) | `streamText` / `generateText` across providers, tool calling, multi-step loops, structured outputs |
+| **AI SDK UI** (`@ai-sdk/react`, …) | Browser | `useChat`: message list, streaming updates, `status`, `stop`, `regenerate`, tool parts, approvals |
+
+They talk over the **UI message stream protocol**: SSE events like `text-delta`, `tool-input-available`, `tool-output-available` and `finish`. Because it's a documented protocol, **the server doesn't have to be TypeScript**. That matters for us, since Relay's brain is in Python.
+
+## Two architectures
+
+<Diagram
+	caption="Pattern A keeps the AI logic in Python. Pattern B puts everything in TypeScript. Both use the same React hook."
+	code={`flowchart LR
+    subgraph A["Pattern A: React + FastAPI"]
+        UA["React<br/>useChat"] -- "POST /api/chat<br/>UI messages" --> FA["FastAPI<br/>speaks the stream protocol"]
+        FA --> PA["Python AI stack<br/>RAG, agents, evals"]
+    end
+    subgraph B["Pattern B: full TypeScript"]
+        UB["React<br/>useChat"] -- "POST /api/chat" --> RB["Route handler<br/>streamText + tools"]
+        RB --> PB["Model provider"]
+    end`}
+/>
+
+| | Pattern A: React + FastAPI | Pattern B: full TypeScript |
+|---|---|---|
+| Where the AI logic lives | Python (your RAG, agents, evals, data tooling) | TypeScript route handlers |
+| Best for | Teams with a Python AI backend; heavy retrieval or data work | Smaller products, frontend-led teams, quick iterations |
+| You maintain | A small protocol adapter in Python | Everything in one language |
+| Watch out for | Protocol changes between SDK major versions | Serverless timeouts, Python ML ecosystem out of reach |
+
+**Relay uses Pattern A**: the policy RAG, agents and evals stay in Python, and React gets a first-class chat UI.
+
+## Pattern B: the full TypeScript version
+
+The smallest complete version, a Next.js route handler and a React component:
+
+```ts
+// app/api/chat/route.ts
+import { anthropic } from '@ai-sdk/anthropic';
+import { convertToModelMessages, createUIMessageStreamResponse, streamText, toUIMessageStream, type UIMessage } from 'ai';
+
+export const maxDuration = 60; // serverless platforms cut long streams off; set this deliberately
+
+export async function POST(req: Request) {
+	const { messages }: { messages: UIMessage[] } = await req.json();
+
+	const result = streamText({
+		model: anthropic('claude-opus-5-5'),
+		instructions: 'You are Relay, the support assistant for Acme Logistics. Be concise.',
+		messages: await convertToModelMessages(messages),
+		abortSignal: req.signal, // when the user clicks Stop, stop paying for tokens
+	});
+
+	return createUIMessageStreamResponse({ stream: toUIMessageStream({ stream: result.stream }) });
+}
+```
+
+```tsx
+// components/Chat.tsx
+'use client';
+import { useChat } from '@ai-sdk/react';
+import { DefaultChatTransport } from 'ai';
+import { useState } from 'react';
+
+export function Chat() {
+	const [input, setInput] = useState('');
+	const { messages, sendMessage, status, stop, error, regenerate } = useChat({
+		transport: new DefaultChatTransport({ api: '/api/chat' }),
+	});
+	const busy = status === 'submitted' || status === 'streaming';
+
+	return (
+		<div>
+			{messages.map((m) => (
+				<div key={m.id} className={`msg msg--${m.role}`}>
+					{m.parts.map((part, i) => (part.type === 'text' ? <p key={i}>{part.text}</p> : null))}
+				</div>
+			))}
+			{status === 'submitted' && <p className="typing">Relay is thinking…</p>}
+			{error && (
+				<p role="alert">
+					Something went wrong. <button onClick={() => regenerate()}>Retry</button>
+				</p>
+			)}
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					if (!input.trim() || busy) return;
+					sendMessage({ text: input });
+					setInput('');
+				}}
+			>
+				<input value={input} onChange={(e) => setInput(e.target.value)} />
+				{busy ? <button type="button" onClick={() => stop()}>Stop</button> : <button type="submit">Send</button>}
+			</form>
+		</div>
+	);
+}
+```
+
+Notice that messages have **`parts`**, not a single `content` string. A message can contain text, reasoning, tool calls, tool results, sources and files, each rendered differently. That's what makes generative UI possible (next lesson).
+
+## Pattern A: FastAPI speaking the AI SDK protocol
+
+`useChat` doesn't care what language the server is, as long as it speaks the protocol: SSE events, a `x-vercel-ai-ui-message-stream: v1` header, and a final `[DONE]`.
+
+```python
+# app/routes/ui_chat.py
+import json
+import uuid
+from collections.abc import AsyncIterator
+
+import anthropic
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict
+
+router = APIRouter()
+client = anthropic.AsyncAnthropic(timeout=30.0, max_retries=2)
+
+
+class UIMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")  # useChat sends extra fields (metadata, ...)
+    id: str
+    role: str
+    parts: list[dict]
+
+
+class ChatBody(BaseModel):
+    model_config = ConfigDict(extra="allow")  # also: id, trigger, messageId
+    messages: list[UIMessage]
+
+
+def to_model_messages(ui_messages: list[UIMessage]) -> list[dict]:
+    """UI messages carry 'parts'; the model API wants role + content."""
+    out = []
+    for m in ui_messages:
+        if m.role not in ("user", "assistant"):
+            continue
+        text = "".join(p.get("text", "") for p in m.parts if p.get("type") == "text")
+        if text:
+            out.append({"role": m.role, "content": text})
+    return out
+
+
+async def model_text(messages: list[dict]) -> AsyncIterator[str]:
+    async with client.messages.stream(
+        model="claude-opus-5-5",
+        max_tokens=4000,
+        system="You are Relay, Acme Logistics' support assistant. Be concise.",
+        messages=messages,
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text
+
+
+def sse(part: dict) -> str:
+    return f"data: {json.dumps(part)}\n\n"
+
+
+@router.post("/api/chat")
+async def chat(body: ChatBody, request: Request):
+    async def events():
+        text_id = "text-1"
+        yield sse({"type": "start", "messageId": f"msg_{uuid.uuid4().hex}"})
+        yield sse({"type": "text-start", "id": text_id})
+        try:
+            async for delta in model_text(to_model_messages(body.messages)):
+                if await request.is_disconnected():
+                    return  # leaving the generator closes the upstream model stream
+                yield sse({"type": "text-delta", "id": text_id, "delta": delta})
+        except anthropic.APIError:
+            yield sse({"type": "error", "errorText": "Relay is having trouble. Please retry."})
+        yield sse({"type": "text-end", "id": text_id})
+        yield sse({"type": "finish"})
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "x-vercel-ai-ui-message-stream": "v1",  # required for custom backends
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+```
+
+The React side is the same `Chat` component as Pattern B, pointed at the FastAPI URL. This adapter was tested end to end against the AI SDK's own `DefaultChatTransport` (AI SDK 7). Pin your SDK version and re-test the adapter whenever you upgrade.
+
+:::tip[Read the protocol docs once]
+The protocol also has events for reasoning, sources, custom `data-*` parts, tool inputs and outputs, and approvals. When your Python backend needs to show citations or tool progress in the UI, you emit those events, and `useChat` turns them into typed `parts`.
+:::
+
+## What the abstraction hides (and you must still own)
+
+<FailureCard
+	title="The silently renamed option"
+	symptom="After a dependency update, the assistant ignores its persona and rules. No errors anywhere."
+	cause="A major version renamed an option (in AI SDK 7, the system prompt option became `instructions`, and `stepCountIs` became `isStepCount`). Old code compiled or ran, but the setting no longer applied."
+	detect="**Behavioural** tests: an eval case like 'asks for a refund → must not promise one' fails immediately. Type checking catches some renames; evals catch the rest."
+	fix="Pin exact versions, upgrade deliberately with the official migration guide and codemods (`npx @ai-sdk/codemod v7`), and run your eval suite in CI on every dependency bump."
+/>
+
+<FailureCard
+	title="API key in the browser bundle"
+	symptom="Your provider bill shows usage from unknown origins. Someone found your key in the site's JavaScript."
+	cause="A developer called the model provider directly from client code to 'save a hop', bundling the key into public JS."
+	detect="Secret scanning on build output; provider usage by IP/origin; any `NEXT_PUBLIC_`-style env var holding a secret is a red flag."
+	fix="Model calls **only** from server routes. The browser talks to your API, which authenticates the user, applies quotas, and calls the provider."
+/>
+
+<FailureCard
+	title="Long answers die at 60 seconds"
+	symptom="Short chats work. Long agent runs stop mid-sentence at almost exactly the same duration every time."
+	cause="The serverless platform's function duration limit (`maxDuration`) killed the stream."
+	detect="Group failures by duration: a sharp cliff at one value is a platform limit, not a model problem."
+	fix="Set `maxDuration` deliberately; move long-running agents to a long-lived server or a background job with resumable streams (Module 1's design drill); keep chat turns short."
+/>
+
+<FailureCard
+	title="Stop that doesn't stop"
+	symptom="The UI stops instantly when users click Stop, but billed tokens don't drop."
+	cause="`stop()` aborts the browser request, but the server never forwarded the abort to the model call."
+	detect="Compare billed output tokens with tokens actually delivered to clients."
+	fix="Pattern B: pass `abortSignal: req.signal` to `streamText`. Pattern A: check `request.is_disconnected()` and exit the stream context. Then test it: click Stop and watch the server logs."
+/>
+
+<ThinkFirst question="A startup asks you: 'Should we build our AI features in Next.js with the AI SDK end to end, or keep a Python backend?' They have 2 frontend engineers, 1 data engineer, and the core feature is RAG over 100K contracts with nightly re-indexing. What do you recommend, and why?">
+
+**Pattern A (React + AI SDK UI in front of a Python backend)**, mainly because of the core feature:
+
+- **RAG over 100K contracts with nightly re-indexing** is data-pipeline work: PDF parsing, OCR, chunking, embeddings, background jobs, evals. The Python ecosystem is much stronger there, and the data engineer already lives in it.
+- **The frontend engineers still get `useChat`** and a great streaming UI. The Python side only needs the small protocol adapter.
+- **Long-running jobs** (re-indexing, batch analysis) don't fit serverless function limits anyway.
+
+When would Pattern B win? If the product were mostly chat with a few API tools, no heavy data processing, and a team that's all TypeScript. **Choose by where the hard part of your system lives.**
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** scaffold Pattern B in a fresh Next.js app and get a streaming chat working. Then click Stop and confirm in your server logs that the model call was aborted.
+- **Stretch:** build Pattern A: point `useChat` at your FastAPI adapter. Add a `data-usage` custom part at the end of each stream (`{"type": "data-usage", "data": {...}}`) and display tokens and cost under each answer.
+- **Boss level:** write a **protocol contract test** in your Python test suite: run the endpoint with a fake model, parse the SSE events, and assert the sequence (`start` → `text-start` → `text-delta`+ → `text-end` → `finish` → `[DONE]`). Add one test for the error path. Now an SDK upgrade can't silently break Relay's UI.
+
+</Practice>
+
+<Quiz
+	id="m2-aisdk"
+	questions={[
+		{
+			q: 'Why can a Python backend work with the AI SDK\'s `useChat` hook?',
+			options: [
+				'The AI SDK compiles to Python',
+				'useChat speaks a documented streaming protocol (SSE events), and any server that emits it is compatible',
+				'It only works with Next.js',
+				'Python can run React',
+			],
+			answer: 1,
+			why: 'The UI message stream protocol is the contract. Emit the right events and headers from FastAPI, and the hook can\'t tell the difference.',
+		},
+		{
+			q: 'Messages in AI SDK UI have a `parts` array instead of one `content` string. Why does that matter?',
+			options: [
+				'It saves bandwidth',
+				'A single message can hold text, reasoning, tool calls, tool results, sources and files, each rendered differently',
+				'It is required by React',
+				'Parts are encrypted',
+			],
+			answer: 1,
+			why: 'Parts let you render tool progress, citations and custom components inline. They\'re the foundation of generative UI.',
+		},
+		{
+			q: 'After a dependency bump, the assistant ignores its system prompt, with no errors. What would have caught it?',
+			options: [
+				'More logging',
+				'A behavioural eval in CI (e.g. "must not promise refunds") that runs on dependency updates',
+				'Using `npm update` more often',
+				'Disabling TypeScript',
+			],
+			answer: 1,
+			why: 'Silent behaviour changes need behavioural tests. Pin versions, follow migration guides, and let evals guard every upgrade.',
+		},
+		{
+			q: 'Which architecture fits "heavy document ingestion + RAG, Python data team, React frontend"?',
+			options: ['Pattern A: React + AI SDK UI talking to a FastAPI backend', 'Pattern B: everything in serverless TypeScript', 'Calling the model from the browser', 'No streaming'],
+			answer: 0,
+			why: 'Put the hard part where it\'s easiest to build: data and RAG in Python, UI in React, the protocol in between.',
+		},
+	]}
+/>
+
+<LessonComplete id="ai-ux/ai-sdk" />

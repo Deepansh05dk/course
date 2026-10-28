@@ -1,0 +1,253 @@
+---
+title: Human-in-the-loop approvals
+description: Approval flows for actions with real consequences. Thresholds, the AI SDK's toolApproval, approval cards, edit-before-send, undo, and avoiding approval fatigue.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Approve, approve, approve, approve" severity="SEV2">
+Relay's first agent version asked for approval on **every** tool call, including read-only lookups. Agents were shown 30 approval prompts a day, each with a raw JSON blob. Within a week they approved everything without reading. Then one approval was a $2,400 refund to the wrong customer, and it sailed through. The approval step existed. **It had stopped working as a control.**
+</Incident>
+
+When AI takes actions (refunds, emails, database changes), the human approval step is often your most important safety control. Like any control, it only works if it's **designed to be used well**.
+
+## Decide what needs approval
+
+Not everything should. Classify every action by **reversibility** and **blast radius**:
+
+| Action | Reversible? | Blast radius | Policy |
+|---|---|---|---|
+| Look up a shipment | Read-only | None | ✅ Auto |
+| Draft a reply (not sent) | Yes | None | ✅ Auto, since the human sends it |
+| Refund ≤ $100 | Partly | Small | ✅ Auto, with audit log and daily cap |
+| Refund > $100 | Partly | Money | 🟡 **Human approval** |
+| Email a customer | No | Reputation | 🟡 Human approval (or edit-before-send) |
+| Bulk action (> 10 customers) | No | Large | 🔴 Approval by a supervisor, plus a preview of every recipient |
+| Delete customer data | No | Legal | ⛔ Not available to the AI at all |
+
+**Principle:** auto-approve what's safe, require approval where it matters, and **don't give the AI tools it should never use**. The safest approval prompt is the one for a tool that doesn't exist.
+
+## Approvals with the AI SDK
+
+AI SDK 7 lets you attach an approval policy per tool with `toolApproval` on `streamText`. The decision can depend on the tool's input:
+
+```ts
+// app/api/chat/route.ts (excerpt)
+const result = streamText({
+	model: anthropic('claude-opus-5-5'),
+	instructions:
+		'You are Relay, the support assistant for Acme Logistics. ' +
+		'Never claim a refund was issued unless the issueRefund tool returned a refundId. ' +
+		'If a tool call is denied, do not retry it.',
+	messages: await convertToModelMessages(messages),
+	tools, // getShipment, issueRefund, ...
+	toolApproval: {
+		// Small refunds run directly; anything bigger waits for a human.
+		issueRefund: ({ amount }) =>
+			amount > 100 ? { type: 'user-approval', reason: `Refund of $${amount} needs agent approval` } : undefined,
+	},
+	stopWhen: isStepCount(5),
+	abortSignal: req.signal,
+});
+```
+
+```ts
+// src/ai/tools.ts (excerpt): the side effect carries an idempotency key
+issueRefund: tool({
+	description: 'Refund a customer for a shipment. Only after checking the refund policy.',
+	inputSchema: z.object({
+		shipmentId: z.string(),
+		amount: z.number().positive().max(5000), // hard upper bound, enforced by the schema
+		reason: z.string().describe('One sentence the agent can show the customer'),
+	}),
+	execute: async ({ shipmentId, amount }, { toolCallId }) =>
+		createRefund({ shipmentId, amount, idempotencyKey: `refund:${toolCallId}` }),
+}),
+```
+
+On the client, the tool part arrives in the `approval-requested` state, and you render an approval card:
+
+```tsx
+const { messages, addToolApprovalResponse } = useChat<RelayUIMessage>({
+	transport: new DefaultChatTransport({ api: '/api/chat' }),
+	// After the agent decides, continue the conversation automatically.
+	sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
+});
+
+// inside message.parts.map(...)
+case 'tool-issueRefund':
+	if (part.state === 'approval-requested' && !part.approval.isAutomatic) {
+		return (
+			<div key={part.toolCallId} className="approval">
+				<p>Refund <strong>${part.input.amount}</strong> on {part.input.shipmentId}?</p>
+				<p>{part.input.reason}</p>
+				<button onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: true })}>Approve</button>
+				<button onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: false })}>Deny</button>
+			</div>
+		);
+	}
+	if (part.state === 'output-available') return <p key={part.toolCallId}>✅ Refund issued ({part.output.refundId})</p>;
+	if (part.state === 'output-denied') return <p key={part.toolCallId}>Refund was not approved.</p>;
+	return null;
+```
+
+(All of the snippets in this lesson type-check against AI SDK 7.)
+
+<Diagram
+	caption="The approval round trip. The tool only executes after an explicit human decision, and the decision is recorded."
+	code={`sequenceDiagram
+    participant A as Agent (UI)
+    participant S as Server
+    participant M as Model
+    participant P as Payments API
+    A->>S: "Customer's glassware arrived broken, refund the $340"
+    S->>M: messages + tools
+    M-->>S: tool call issueRefund {amount: 340}
+    S->>S: toolApproval: amount > 100, so user-approval
+    S-->>A: part approval-requested (+ reason)
+    Note over A: Approval card: amount, shipment, reason
+    A->>S: approval response: approved (logged with user and time)
+    S->>P: createRefund (idempotency key)
+    P-->>S: refundId
+    S->>M: tool result
+    M-->>S: "Refund of $340 issued (RF-8812)."
+    S-->>A: output-available + text`}
+/>
+
+## Making approvals actually work
+
+An approval card is a tiny decision interface. Design it for a **fast, correct decision**:
+
+- **Human-readable summary, not JSON.** "Refund **$340** to **Jane Doe** for **ACM-2025-000183** (glassware broken)."
+- **The evidence next to the decision:** the policy excerpt that allows it, the damage photos, the customer's history.
+- **Highlight what's unusual:** "⚠️ 3rd refund for this customer this month", "Amount exceeds the shipment value."
+- **Edit, don't just approve or deny.** Let the human change the amount or the wording, then approve. Edit-before-send is often better than yes/no.
+- **Make denial cheap and informative:** a reason field that feeds back to the model ("Policy requires photos first") and into your eval data.
+- **Undo where possible:** emails with a 30-second "unsend" window; refunds with a same-day reversal path.
+
+<FailureCard
+	title="Approval fatigue"
+	symptom="Approval rate is 99.8%, and the median time per approval is 0.9 seconds."
+	cause="Too many low-risk prompts trained people to click without reading."
+	detect="Track approval rate and time-to-decision per tool. Sub-second decisions on money are a red flag."
+	fix="Auto-approve low-risk actions (with audit logs and caps), reserve prompts for meaningful decisions, show only what matters, and periodically insert known-bad test cases in training environments (never production) to measure attention."
+/>
+
+<FailureCard
+	title="The double refund after 'Approve'"
+	symptom="One click on Approve issued two refunds."
+	cause="A network retry re-sent the approval, and the refund call had no idempotency key, so the payments API processed it twice."
+	detect="Reconciliation: refunds per approval ID should always be ≤ 1."
+	fix="Idempotency keys derived from the tool call ID; the payments API rejects duplicates; disable the button after the first click."
+/>
+
+<FailureCard
+	title="The model said 'Done!' before the human approved"
+	symptom="The customer got an email saying 'your refund was issued', but the agent later denied it."
+	cause="The model wrote a confident confirmation in text while the tool call was still awaiting approval, and an automation sent that text."
+	detect="An eval/check: any claim of a completed action must correspond to a successful tool result in the same turn."
+	fix="Instruct the model never to claim completion without a tool result, enforce it with a post-check, and never auto-send text produced in the same turn as a pending approval."
+/>
+
+<IncidentDrill
+	id="approval-drill"
+	title="The 47-customer email"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'An agent asks Relay: "Email everyone affected by the Antwerp delay." The model proposes sendEmail to 47 customers. What should the system do?',
+			choices: [
+				{ label: 'Ask for approval 47 times, once per email', next: 'fatigue', cost: 20, note: 'By email 6 the agent is clicking Approve without reading.' },
+				{ label: 'One bulk approval card: recipient list preview, the rendered email, and a sample of 3 personalised versions', next: 's2', cost: 0 },
+				{ label: 'Send automatically, since it is just an apology', next: 'end_bad', cost: 120, note: 'Two of the 47 were the wrong customers, matched on a similar shipment ID.' },
+			],
+		},
+		fatigue: { text: 'The agent approved all 47 in 40 seconds. Two recipients were wrong. Rethink the design?', choices: [{ label: 'Switch to one bulk card with a recipient preview', next: 's2', cost: 0 }] },
+		s2: {
+			text: 'The preview shows 47 recipients. The agent notices 2 shipments that weren\'t in Antwerp. What should the card allow?',
+			choices: [
+				{ label: 'Untick individual recipients, then approve the rest, with the excluded ones fed back to improve the matching', next: 's3', cost: 0 },
+				{ label: 'Only Approve all / Deny all', next: 'end_ok', cost: 15, note: 'The agent denies everything and does it by hand. The tool lost its value.' },
+			],
+		},
+		s3: {
+			text: 'The 45 emails are approved. Anything else before sending?',
+			choices: [
+				{ label: 'Send with a 5-minute undo window and idempotency per recipient, and log who approved what', next: 'end_good', cost: 0 },
+				{ label: 'Send immediately, nothing else needed', next: 'end_ok', cost: 5, note: 'It works, but any mistake now is permanent and unaudited.' },
+			],
+		},
+		end_good: { text: 'One meaningful decision, an editable preview, reversibility, and an audit trail. That\'s a control that works.', end: 'good' },
+		end_ok: { text: 'You avoided the worst, but the control is either too coarse to be useful or not reversible.', end: 'ok' },
+		end_bad: { text: 'Irreversible bulk actions need a human with a preview. Two customers got someone else\'s delay notice.', end: 'bad' },
+	}}
+/>
+
+<ThinkFirst question="Acme wants to automate refunds under $50 with no human involved, to save agent time. What guardrails would you require before agreeing?">
+
+Agreeing is reasonable if the blast radius is bounded and you can see what's happening:
+
+1. **Hard limits outside the model:** schema max ($50), a per-customer daily and monthly cap, a global daily budget, and refunds only for shipments that belong to the requesting customer (checked in code).
+2. **Policy checks in code** where possible: delivery date within the refund window, no prior refund on the same shipment.
+3. **Idempotency** on every refund, plus reconciliation reports.
+4. **Audit and sampling:** every auto-refund is logged with the conversation; a human reviews a random 5% weekly, plus all refunds flagged by anomaly rules (velocity, repeat customers).
+5. **Kill switch:** a config flag to instantly route all refunds back to approval.
+6. **Eval evidence first:** measured accuracy of the refund decision on historical cases before launch, and the rollout to a small share of traffic first.
+
+That's the autonomy dial from lesson 1: move right only with limits, visibility, and a way back.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** write the action table (reversibility × blast radius × policy) for every tool you plan to give Relay.
+- **Stretch:** implement the `issueRefund` tool with `toolApproval` (approval above $100) in your Pattern B app, with a readable approval card that shows the policy excerpt and the customer's refund history.
+- **Boss level:** add **edit-before-approve**: the agent can change the amount in the card, and the edited amount is what executes. Add an audit log (who, what, original vs approved amount, when), and a test proving a double-clicked Approve issues exactly one refund.
+
+</Practice>
+
+<Quiz
+	id="m2-hitl"
+	questions={[
+		{
+			q: 'Approval rate is 99.8% with a median decision time under one second. What does this suggest?',
+			options: ['The AI is excellent', 'Approval fatigue: the control is no longer working', 'The UI is fast', 'Nothing'],
+			answer: 1,
+			why: 'Decisions about money in under a second mean nobody is reading. Reduce prompts to meaningful ones and make each card easy to evaluate.',
+		},
+		{
+			q: 'Which action should usually be auto-approved?',
+			options: ['Refund of $2,000', 'Emailing 40 customers', 'Read-only shipment lookup', 'Deleting a customer record'],
+			answer: 2,
+			why: 'Read-only, no blast radius. Spend human attention on irreversible or costly actions.',
+		},
+		{
+			q: 'Why derive the refund\'s idempotency key from the tool call ID?',
+			options: [
+				'It makes the call faster',
+				'Retries and double-submits of the same approved call then can\'t create duplicate refunds',
+				'Payments APIs require it',
+				'It hides the amount',
+			],
+			answer: 1,
+			why: 'The same logical action keeps the same key, so the payments system can recognise and ignore duplicates.',
+		},
+		{
+			q: 'What is the safest way to handle "delete customer data" for an AI support agent?',
+			options: ['Require approval', 'Auto-approve with logs', 'Don\'t give the agent that tool at all', 'Ask the model to be careful'],
+			answer: 2,
+			why: 'Least privilege: an action the agent can\'t take can\'t go wrong. Route rare, high-risk operations to humans through normal processes.',
+		},
+	]}
+/>
+
+<LessonComplete id="ai-ux/human-in-the-loop" />

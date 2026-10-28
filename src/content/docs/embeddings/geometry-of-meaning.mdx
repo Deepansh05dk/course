@@ -1,0 +1,176 @@
+---
+title: The geometry of meaning
+description: What embeddings are, how semantic search differs from keyword search, how to choose an embedding model, and the blind spots every RAG engineer must know.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import EmbeddingPlayground from '../../../components/EmbeddingPlayground.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'Search is broken' — the keyword edition" severity="SEV3">
+Acme's help center used keyword search. A customer typed "my money back" and got zero results, because every policy says "refund". Another typed "box smashed" and found nothing about "damaged goods". The content was there; the **words** didn't match. That gap between what people mean and the words they use is what embeddings fix. As you'll see, they come with blind spots of their own.
+</Incident>
+
+## Text as coordinates
+
+An **embedding model** turns a piece of text into a list of numbers, a **vector** with typically 384 to 3,072 dimensions. The model is trained so that texts with **similar meaning end up close together** in that space, even when they share no words.
+
+<Diagram
+	caption="Each text becomes a point. Closeness means similar meaning. Real spaces have hundreds of dimensions, which this 2-D sketch flattens."
+	code={`flowchart LR
+    A["'I want my money back'"] --> E["Embedding model"]
+    B["'Refunds are paid within 10 days'"] --> E
+    C["'Box arrived smashed'"] --> E
+    E --> V1["[0.12, -0.83, 0.07, ...]"]
+    E --> V2["[0.10, -0.79, 0.11, ...]"]
+    E --> V3["[-0.66, 0.21, 0.45, ...]"]
+    V1 -. "close: same meaning" .- V2
+    V1 -. "far: different topic" .- V3`}
+/>
+
+**Semantic search** then becomes geometry: embed the query, find the stored vectors closest to it, and return their texts. That's the "R" in RAG.
+
+## Try it
+
+This playground embeds Acme's 24 help-center snippets in your browser. Try the preset queries, then your own. Watch where the two columns agree and where they don't.
+
+<EmbeddingPlayground />
+
+Things to notice (try each one):
+
+1. **"my money back"**: the semantic column finds refund policies without sharing the word "refund". Keyword search finds almost nothing.
+2. **"opening times"**: semantic search finds the support-hours snippet; keyword search finds nothing at all.
+3. **"ERR_AUTH_8091"**: the embedding can't handle it (this demo's vocabulary has never seen the code), while **keyword search nails it**. Modern subword models *can* embed such codes, but they tend to blur them with similar-looking strings. Exact identifiers are keyword territory.
+4. **"tax on imported goods"**: semantic search puts the right answer second, behind a wrong one. Embeddings are good at "roughly the right neighbourhood", not perfect ranking. That's why production systems add **hybrid search and reranking** (Module 4).
+5. **Compare two sentences:** "refunds are allowed…" vs "refunds are not allowed…" have very high similarity. **Negation barely moves the vector.** Real embedding models do better than this demo, but still not reliably.
+
+:::note[About this demo model]
+To run in your browser without an API, the playground averages public-domain GloVe word vectors (with rare words weighted up and the common direction removed). Production embedding models are transformer-based and far stronger, but the geometry, the operations, and the failure modes are exactly the same.
+:::
+
+## Embedding in code
+
+```python
+# Every major provider and open-source library has the same shape:
+#   list of texts in -> list of vectors out
+from sentence_transformers import SentenceTransformer  # open-source, runs locally
+
+model = SentenceTransformer("all-MiniLM-L6-v2")        # 384 dimensions
+vectors = model.encode(
+    ["Refunds are paid within 10 business days.", "I want my money back"],
+    normalize_embeddings=True,                           # unit length, so dot product = cosine
+)
+print(vectors.shape)                                     # (2, 384)
+print(float(vectors[0] @ vectors[1]))                    # cosine similarity
+```
+
+Hosted APIs (OpenAI, Voyage, Cohere, Google, Mistral, …) work the same way: send a batch of texts, get vectors back. Some models also distinguish **query** embeddings from **document** embeddings (an input-type flag or a prefix). Use them as documented, because mixing them up quietly hurts retrieval.
+
+## Choosing an embedding model
+
+| Factor | Why it matters |
+|---|---|
+| **Retrieval quality on your data** | Public leaderboards (like MTEB) are a starting filter. Build a small retrieval eval (Module 4) and test 2–3 models |
+| **Languages** | A great English model can be poor in Hindi or German. Test every language your users write in |
+| **Dimensions** | More dimensions means more storage and memory per vector and slower search. Some models support shortening vectors with small quality loss |
+| **Max input length** | Text beyond the limit is silently truncated, so long chunks lose their ending |
+| **Cost and latency** | You embed every document once (and again on every re-index), plus every query |
+| **Hosting and data** | API vs self-hosted: privacy, data residency, and air-gapped customers (very common in FDE work) |
+| **Domain** | Legal, medical and code have specialized models that can beat general ones |
+
+## The index contract
+
+The most important operational fact about embeddings:
+
+> **Vectors from different models (or different versions of a model) are not comparable.**
+
+A query embedded with model B searched against documents embedded with model A returns garbage, **silently**: the system still returns results with similarity scores, they're just meaningless. So:
+
+- Store the **model name and version** next to every vector.
+- Changing the model means **re-embedding everything** (plan the cost and time).
+- Re-index with a **blue/green** approach: build the new index alongside the old one, evaluate, then switch traffic atomically.
+
+<FailureCard
+	title="The silent model swap"
+	symptom="After a 'minor dependency update', search quality collapses. No errors, and similarity scores look normal."
+	cause="The embedding model default changed in a library upgrade. New queries were embedded with the new model and searched against documents embedded with the old one."
+	detect="Store `embedding_model` per vector and per query, and alert on mismatch. Run a retrieval eval (recall@k) in CI and as a daily canary."
+	fix="Pin the embedding model explicitly, never rely on library defaults. Version the index, and do blue/green re-indexing for model changes."
+/>
+
+<FailureCard
+	title="The truncated chunks"
+	symptom="Answers miss facts that are definitely in the documents, always facts near the end of long sections."
+	cause="Chunks were longer than the embedding model's max input. The tail was silently truncated, so it was never represented in the vector."
+	detect="Count tokens per chunk with the embedding model's tokenizer, and alert on chunks over the limit."
+	fix="Chunk to fit the model (Module 4), and validate chunk lengths in the ingestion pipeline."
+/>
+
+<ThinkFirst question="Acme's agents ask questions in English, but 30% of the policy documents are in Dutch and German. How would you design and test the embedding setup?">
+
+1. **Choose a multilingual embedding model** whose training covers English, Dutch and German, so that an English query lands near a Dutch passage with the same meaning (cross-lingual retrieval).
+2. **Build a cross-lingual retrieval eval:** 50+ English questions whose correct answer lives in Dutch or German documents, plus same-language controls. Measure recall@5 for 2–3 candidate models.
+3. **Compare against alternatives:** translate documents to English at ingestion time (more cost and a translation-error risk, but simpler retrieval), or translate queries into each language and merge results.
+4. **Keep keyword search per language** for exact terms (product names, codes), with language-aware tokenization.
+5. **Answer in the agent's language**, with the citation pointing to the original-language source (and a translated excerpt).
+
+The core lesson: **test the languages you actually serve**, because models that are excellent in English can quietly fail elsewhere.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** in the playground, find three queries where keyword search beats semantic search, and three where semantic wins. Write down the pattern.
+- **Stretch:** embed 50 of your own sentences (any domain) with an open-source model locally. For five queries, print the top 3 neighbours and score them by hand: how many are actually relevant?
+- **Boss level:** build a **mini embedding bake-off**: 30 questions, each labelled with the correct passage among 200. Compare two embedding models (and BM25) on recall@1 and recall@5, and write a short recommendation with cost per million chunks. You'll reuse this harness in Module 4.
+
+</Practice>
+
+<Quiz
+	id="m3-geometry"
+	questions={[
+		{
+			q: 'What does it mean when two texts have embeddings that are close together?',
+			options: ['They share many words', 'The model considers their meanings similar', 'They have the same length', 'They are in the same file'],
+			answer: 1,
+			why: 'Embeddings capture meaning, so "my money back" and "refund policy" end up close despite sharing no words.',
+		},
+		{
+			q: 'A user searches for the exact error code `ERR_AUTH_8091`. Which retrieval method is most reliable?',
+			options: ['Semantic (embedding) search', 'Keyword search (e.g. BM25)', 'Random sampling', 'A bigger LLM'],
+			answer: 1,
+			why: 'Exact, rare identifiers are where keyword search shines and embeddings blur. Production systems combine both (hybrid search).',
+		},
+		{
+			q: 'You switch to a better embedding model for new documents only. What happens?',
+			options: [
+				'Search improves gradually',
+				'Old and new vectors aren\'t comparable, so retrieval silently degrades until everything is re-embedded with one model',
+				'Nothing changes',
+				'The vector DB converts them automatically',
+			],
+			answer: 1,
+			why: 'Different models produce different spaces. Re-embed everything, store the model version per vector, and switch with blue/green re-indexing.',
+		},
+		{
+			q: '"Refunds are allowed" and "Refunds are not allowed" have a cosine similarity of 0.97. What does this teach?',
+			options: [
+				'The model is broken',
+				'Embeddings capture topic well but negation poorly, so retrieval finds the right topic and the LLM (with the full text) must read the details',
+				'Negation is always handled by embeddings',
+				'Cosine similarity is wrong',
+			],
+			answer: 1,
+			why: 'Retrieval finds candidate passages; the generator reads the actual text. Never make decisions from similarity scores alone.',
+		},
+	]}
+/>
+
+<LessonComplete id="embeddings/geometry-of-meaning" />

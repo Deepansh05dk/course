@@ -1,0 +1,137 @@
+---
+title: Distance metrics demystified
+description: Cosine similarity, dot product and Euclidean distance. What each measures, why normalization makes them equivalent, and how to pick the right one.
+sidebar:
+  order: 2
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import VectorPlayground from '../../../components/VectorPlayground.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+"Find the closest vectors" needs a definition of *close*. There are three you'll meet in every vector database configuration screen, and choosing wrongly gives you plausible-looking but subtly wrong results.
+
+## Play first
+
+Drag the arrow tips. Make both arrows point in the same direction with very different lengths, then tick **Normalize**.
+
+<VectorPlayground />
+
+## The three metrics
+
+For two vectors **a** and **b**:
+
+| Metric | Formula (intuition) | Range | "Closer" means | Sensitive to length? |
+|---|---|---|---|---|
+| **Dot product** | Σ aᵢ·bᵢ | −∞ to +∞ | **Larger** | Yes: long vectors score higher |
+| **Cosine similarity** | dot(a, b) ÷ (‖a‖·‖b‖) | −1 to 1 | **Larger** | No: only the angle matters |
+| **Euclidean (L2) distance** | √Σ(aᵢ − bᵢ)² | 0 to +∞ | **Smaller** | Yes |
+
+Vector databases often express everything as a **distance** (smaller is closer), so cosine *similarity* becomes cosine *distance* = 1 − similarity. Watch the sign conventions: pgvector's `<#>` operator returns the **negative** inner product so that "smaller is closer" holds for every operator.
+
+## The normalization trick
+
+If every vector is normalized to length 1:
+
+- **Cosine similarity = dot product** (the denominators are 1).
+- **L2 distance** depends only on the angle: ‖a − b‖² = 2 − 2·cos(a, b). So ranking by L2 gives the same order as ranking by cosine.
+
+That's why a common production pattern is: **normalize once at write time, then use the fastest operation (dot product) at query time.** All three metrics then agree on ranking.
+
+```python
+import numpy as np
+
+a = np.array([3.0, 4.0])
+b = np.array([6.0, 8.0])          # same direction, twice as long
+
+cos = a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+print(cos)                        # 1.0  -> identical direction
+print(a @ b)                      # 50.0 -> grows with length
+print(np.linalg.norm(a - b))      # 5.0  -> "far apart" by L2
+
+def unit(v): return v / np.linalg.norm(v)
+ua, ub = unit(a), unit(b)
+print(ua @ ub, np.linalg.norm(ua - ub))   # 1.0, 0.0 -> after normalization, all agree
+```
+
+## Which one should you use?
+
+**Use the metric the embedding model was trained for.** The model's documentation says so. Most text-embedding models are trained with cosine similarity, and many already return normalized vectors.
+
+- **Cosine (or dot product on normalized vectors):** the default for text embeddings. Length usually carries no useful meaning.
+- **Dot product on unnormalized vectors:** some models (and recommender systems) deliberately encode "importance" or "popularity" in vector length. Normalizing would throw that away.
+- **L2:** common for image and some other embeddings; equivalent to cosine for normalized vectors.
+
+<FailureCard
+	title="Long documents always win"
+	symptom="Search results are dominated by a few very long policy documents, whatever the query."
+	cause="Vectors weren't normalized and the index used raw dot product. This model's vectors for long texts had larger magnitudes, inflating their scores."
+	detect="Check the distribution of vector norms in your index. If norms vary widely and correlate with document length, you have a length bias."
+	fix="Use the metric the model was trained for: normalize vectors and use cosine or dot product on unit vectors. Add a test that asserts stored vectors have norm ≈ 1."
+/>
+
+<FailureCard
+	title="The metric mismatch"
+	symptom="Recall in production is far below the numbers from your offline experiment, with the same model and data."
+	cause="The offline notebook used cosine similarity, but the vector DB index was created with L2 on **unnormalized** vectors. Different metric, different ranking."
+	detect="Run the same queries through the notebook and the production index, and compare the top-k overlap."
+	fix="Make the metric part of the index configuration in code (not clicked in a UI), normalize consistently, and run the retrieval eval against the real index."
+/>
+
+<ThinkFirst question="A recommender team stores product embeddings where vector length encodes popularity (popular products have longer vectors). Product wants 'similar items' on product pages. Which metric would you use, and would your answer change for a 'trending items' feature?">
+
+**"Similar items": cosine similarity.** Similarity of *kind* is about direction. Using dot product would push popular products into every list, even when they're only loosely related (the "long documents always win" problem, deliberately).
+
+**"Trending" or "recommended for you": dot product can be the right choice**, precisely because it rewards both relevance (direction) and popularity (length). That's a feature, not a bug.
+
+The general lesson: **the metric encodes a product decision.** Know what length means in your vectors before choosing.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** compute cosine, dot and L2 by hand for a = (1, 2) and b = (2, 4), then check with numpy.
+- **Stretch:** embed 100 texts with any model, plot the histogram of vector norms, and check whether they're normalized. Look up which metric the model card recommends.
+- **Boss level:** take your bake-off harness from the previous lesson and run it with three configurations (cosine, raw dot, L2 on unnormalized vectors). Report recall@5 for each and explain the differences.
+
+</Practice>
+
+<Quiz
+	id="m3-metrics"
+	questions={[
+		{
+			q: 'Two vectors point in exactly the same direction but one is 10× longer. What is their cosine similarity?',
+			options: ['0.1', '1.0', '10', 'It depends on the dimension'],
+			answer: 1,
+			why: 'Cosine only measures the angle, so identical directions give 1.0 regardless of length.',
+		},
+		{
+			q: 'All vectors are normalized to unit length. Which statement is true?',
+			options: [
+				'Cosine and dot product give different rankings',
+				'Cosine similarity equals dot product, and L2 ranking matches cosine ranking',
+				'L2 distance becomes meaningless',
+				'You must use L2',
+			],
+			answer: 1,
+			why: 'With unit vectors, dot = cosine and ‖a−b‖² = 2 − 2·cos, so all three agree on ordering. Use the fastest one.',
+		},
+		{
+			q: 'How do you choose the metric for a text embedding model?',
+			options: ['Always L2', 'Whatever the vector DB defaults to', 'The metric the model was trained for, as stated in its documentation', 'Random'],
+			answer: 2,
+			why: 'The model learned its geometry under a specific metric. Using another one degrades ranking quietly.',
+		},
+		{
+			q: 'Search results are dominated by long documents. What is the most likely cause?',
+			options: ['Too few documents', 'Raw dot product on unnormalized vectors whose norms grow with document length', 'Cosine similarity', 'The query was too short'],
+			answer: 1,
+			why: 'Unnormalized dot product rewards long vectors. Check norm distributions and match the model\'s intended metric.',
+		},
+	]}
+/>
+
+<LessonComplete id="embeddings/distance-metrics" />

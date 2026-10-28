@@ -1,0 +1,206 @@
+---
+title: Feedback that becomes eval data
+description: Explicit and implicit feedback signals, storing feedback against traces, the biases to watch for, and turning feedback into a growing eval set. Plus the Module 2 lab.
+sidebar:
+  order: 6
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="12,000 thumbs, zero insight" severity="SEV3">
+After six months, Relay's feedback table had 12,000 thumbs-up/down clicks. When quality dipped, the team tried to use them, and couldn't. The clicks weren't linked to the prompt version, the model, or the retrieved documents. 94% were thumbs-up from a handful of enthusiastic agents. The most useful signal (agents rewriting 60% of a draft before sending) wasn't recorded at all.
+</Incident>
+
+Your UI is the best eval-data generator you'll ever have. Every interaction tells you something about quality, **if** you capture it in a form you can use.
+
+## Explicit vs implicit signals
+
+| Signal | Type | Strength | Notes |
+|---|---|---|---|
+| 👍 / 👎 | Explicit | Weak alone | Few people click; skewed toward extremes |
+| 👎 + reason ("wrong policy", "too long", "wrong tone") | Explicit | **Strong** | Gives you a failure taxonomy for free |
+| User provides the correct answer | Explicit | **Gold** | Becomes an eval case almost directly |
+| **Edit distance between the draft and what was sent** | Implicit | **Very strong** | The most honest signal for drafting features |
+| Regenerate clicked | Implicit | Medium | Dissatisfaction, but not *why* |
+| Stop clicked early | Implicit | Medium | Wrong direction, or too long |
+| Citation opened | Implicit | Context | Verification behaviour (or doubt) |
+| Ticket reopened / escalated after an AI answer | Implicit (outcome) | **Strong** | The business outcome you actually care about |
+
+:::tip[The edit diff is gold]
+For any "draft" feature, store both the AI draft and the final version the human sent. Large edits pinpoint failures, and the human's final version is often a ready-made reference answer for your eval set.
+:::
+
+## Store feedback against the trace
+
+Feedback is only useful if you can reproduce **exactly** what the model saw and did:
+
+```python
+# app/models.py (SQLAlchemy-style sketch)
+class Interaction(Base):
+    __tablename__ = "interactions"
+    id = Column(String, primary_key=True)            # same id as the trace (Module 9)
+    feature = Column(String)                         # "reply_draft", "policy_qa"
+    prompt_version = Column(String)                  # "reply_draft@v7"
+    model = Column(String)
+    input_redacted = Column(Text)                    # PII-redacted user input
+    retrieved_ids = Column(JSON)                     # which chunks were in context
+    output = Column(Text)                            # what the AI produced
+    final_text = Column(Text, nullable=True)         # what the human actually sent
+    edit_ratio = Column(Float, nullable=True)        # 0 = sent as-is, 1 = fully rewritten
+    rating = Column(Integer, nullable=True)          # -1 / 0 / +1
+    reason = Column(String, nullable=True)           # from a fixed taxonomy
+    comment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+```
+
+```python
+# computing the edit ratio
+from difflib import SequenceMatcher
+
+def edit_ratio(draft: str, sent: str) -> float:
+    return round(1 - SequenceMatcher(None, draft, sent).ratio(), 3)
+```
+
+## From feedback to evals: the flywheel
+
+<Diagram
+	caption="The flywheel. Production feedback finds failures; failures become eval cases; eval cases protect every future change."
+	code={`flowchart LR
+    A["Production traffic"] --> B["Capture signals<br/>ratings, reasons, edits, outcomes"]
+    B --> C["Triage weekly<br/>sample the worst: big edits, thumbs down, escalations"]
+    C --> D["Label and categorize<br/>failure taxonomy"]
+    D --> E["Add to golden set<br/>with expected properties"]
+    E --> F["CI eval gate<br/>Module 1 and Module 5"]
+    F --> G["Fix: prompt, retrieval,<br/>model, UX"]
+    G --> A`}
+/>
+
+A practical weekly ritual (30–60 minutes):
+
+1. Pull the 50 interactions with the **largest edit ratios**, all 👎 with reasons, and all escalations.
+2. Read them. Tag each with a failure category ("missing refund condition", "wrong tone", "outdated policy").
+3. Turn the 5–10 most important into golden-set cases with **expected properties**.
+4. Pick the top category and fix it, with the eval proving the fix.
+
+That's error analysis, the core skill of Module 5, fed by your UI.
+
+## Bias and pitfalls
+
+<FailureCard
+	title="The happy minority"
+	symptom="Feedback says 94% satisfaction while ticket reopen rates are rising."
+	cause="A few enthusiastic users produce most of the clicks; unhappy users don't bother to rate, they just stop using the feature or rewrite drafts."
+	detect="Feedback volume per user; compare explicit ratings with implicit signals (edits, reopens) and with outcomes."
+	fix="Weight by user, rely more on implicit and outcome signals, and review random samples, not just rated ones."
+/>
+
+<FailureCard
+	title="Feedback without context"
+	symptom="Thousands of 👎, but nobody can tell which prompt, model or documents produced them."
+	cause="Feedback was stored as `(message_id, rating)` only, and traces weren't kept or linked."
+	detect="Try to reproduce a random 👎 interaction. If you can't rebuild the exact request, your data is unusable."
+	fix="Link feedback to a trace that records prompt version, model, retrieved IDs, input and output (with PII redaction and a retention policy)."
+/>
+
+<FailureCard
+	title="Training on your own mistakes"
+	symptom="After adding 'approved drafts' to the few-shot example bank automatically, quality slowly gets worse."
+	cause="Drafts that were approved without reading (approval fatigue), including subtly wrong ones, became examples, reinforcing errors."
+	detect="Audit example-bank entries; compare eval scores before and after example-bank updates."
+	fix="Only promote **edited-and-sent** or **explicitly reviewed** outputs, keep a human gate on the example bank, and re-run evals whenever it changes."
+/>
+
+## 🧪 Module 2 lab: the Relay agent UI
+
+Build it in your `relay-ui` app (React + AI SDK), backed by your FastAPI service (Pattern A) or a TypeScript route (Pattern B). **Acceptance criteria:**
+
+1. **Inline draft** on a ticket page: one click streams a reply draft into the editor, with Stop, Regenerate and Insert.
+2. **Chat panel** with the current ticket attached automatically as context, and example prompts in the empty state.
+3. **All seven states designed:** idle, submitted, tool use, streaming, done, truncated, and error/refusal.
+4. **Generative UI:** a `ShipmentCard` rendered from a `getShipment` tool, with skeleton and error states and a safe default for unknown parts.
+5. **Approval card** for refunds over $100 with a readable summary, evidence, edit-before-approve, and an idempotent execution.
+6. **Citations** rendered as chips with an excerpt panel (use fake sources until Module 4).
+7. **Feedback capture:** 👍/👎 with a reason taxonomy, plus the draft-vs-sent edit ratio, stored with prompt version, model and trace ID.
+8. **Verified Stop:** a test or log showing that Stop ends generation server-side.
+9. `docs/module-2.md`: screenshots of each state, and **three UX failures you found while testing with someone else**.
+
+<ThinkFirst question="Your 👎 rate for the reply-draft feature is 4%, but the average edit ratio is 0.45 (agents rewrite almost half of each draft). Which number do you believe, and what do you do next?">
+
+**Believe the edit ratio.** It's implicit, measured on every interaction, and directly reflects whether the draft was usable. The 4% 👎 rate is explicit, sparse, and biased (most people don't click).
+
+Next steps:
+
+1. **Segment** the edit ratio by category, customer language and ticket length to find where drafts fail.
+2. **Read the diffs** of the 50 most-edited drafts. What did agents change? Tone? Missing policy details? Length? Wrong facts?
+3. **Build a taxonomy** of the edits and turn the top categories into eval cases, using the agents' final versions as references.
+4. **Fix the top category** (prompt, retrieval or examples) and track the edit ratio as a product metric on a dashboard, alongside the eval pass rate.
+
+</ThinkFirst>
+
+<Practice title="Build it yourself: Module 2 wrap-up">
+
+- **Warm-up:** add 👍/👎 with a 5-option reason picker to your chat, and store it with the message ID, prompt version and model.
+- **Stretch:** store draft and sent text for the inline draft feature, compute edit ratios, and build a tiny page that lists the 20 most-edited drafts with a side-by-side diff.
+- **Boss level:** build a **feedback triage tool**: an internal page where you can tag interactions with failure categories, and a button "Add to golden set" that writes a case (input + expected properties) to `evals/golden.jsonl`. You've built the flywheel, and it's exactly the kind of tool FDEs build in their first week at a customer.
+
+</Practice>
+
+<Quiz
+	id="m2-feedback"
+	title="Module 2 final quiz"
+	questions={[
+		{
+			q: 'Which is the strongest quality signal for an AI draft-reply feature?',
+			options: ['Thumbs-up rate', 'How much the human edited the draft before sending', 'Number of messages sent', 'Average response length'],
+			answer: 1,
+			why: 'Edit distance is measured on every interaction, it isn\'t biased toward vocal users, and the final text is often a ready-made reference answer.',
+		},
+		{
+			q: 'What must be stored alongside a feedback rating to make it useful?',
+			options: [
+				'Only the rating',
+				'The trace: prompt version, model, input, retrieved documents and output, so the case can be reproduced',
+				'The user\'s browser version',
+				'Nothing, ratings are self-explanatory',
+			],
+			answer: 1,
+			why: 'Without the context, you can\'t debug or turn feedback into eval cases. Link every rating to a reproducible trace.',
+		},
+		{
+			q: 'Why is automatically adding every approved draft to the few-shot example bank risky?',
+			options: [
+				'It uses too much storage',
+				'Approval fatigue means some approved drafts are wrong, so errors get reinforced as examples',
+				'Examples must be written by engineers',
+				'It breaks prompt caching',
+			],
+			answer: 1,
+			why: 'Only promote outputs a human actually reviewed or edited, keep a gate on the example bank, and re-run evals when it changes.',
+		},
+		{
+			q: 'Which design best limits the damage of a wrong answer about customs rules?',
+			options: [
+				'A confident tone',
+				'Verified inline citations, a "verify before sending" cue based on measured error rates, and a cheap escalation path',
+				'A model self-confidence percentage',
+				'Hiding the sources to keep the UI clean',
+			],
+			answer: 1,
+			why: 'Calibrated friction plus verifiable evidence lets users catch errors cheaply in exactly the categories where they occur.',
+		},
+		{
+			q: 'Where should the API key for the model provider live in a Next.js + AI SDK app?',
+			options: ['In a public env var used by the browser', 'Only in server-side code (route handlers), never in client bundles', 'In localStorage', 'In the React component'],
+			answer: 1,
+			why: 'Anything shipped to the browser is public. Model calls go through your server, which also enforces auth and quotas.',
+		},
+	]}
+/>
+
+<LessonComplete id="ai-ux/feedback-loops" />

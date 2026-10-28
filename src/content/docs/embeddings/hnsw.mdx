@@ -1,0 +1,220 @@
+---
+title: "HNSW: approximate search that scales"
+description: How Hierarchical Navigable Small World graphs find neighbours in logarithmic-ish time, the recall/latency/memory knobs, and how to benchmark them yourself.
+sidebar:
+  order: 4
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+Exact search compares the query with everything. **Approximate nearest neighbour (ANN)** search gives up a tiny bit of accuracy for a huge gain in speed: instead of checking 10 million vectors, it checks a few thousand and *almost always* finds the true neighbours.
+
+The most widely used ANN algorithm in production is **HNSW (Hierarchical Navigable Small World)**. It's in pgvector, Qdrant, Weaviate, Milvus, Elasticsearch/OpenSearch, Redis, and others.
+
+## The intuition: a road network for vectors
+
+Think about driving to a house in another city. You don't check every street. You take a **motorway** to the right region, **main roads** to the right neighbourhood, then **local streets** to the door.
+
+HNSW builds exactly that: a graph where each vector is connected to some of its neighbours, organised in **layers**:
+
+<Diagram
+	caption="HNSW layers. The top layers are sparse 'motorways' with long jumps; the bottom layer contains every vector with short local links."
+	code={`flowchart TB
+    subgraph L2["Layer 2: few nodes, long links"]
+        A2((A)) --- F2((F))
+    end
+    subgraph L1["Layer 1: more nodes, medium links"]
+        A1((A)) --- C1((C)) --- F1((F)) --- H1((H))
+    end
+    subgraph L0["Layer 0: every vector, short links"]
+        A0((A)) --- B0((B)) --- C0((C)) --- D0((D)) --- E0((E)) --- F0((F)) --- G0((G)) --- H0((H))
+        B0 --- D0
+        E0 --- G0
+    end
+    A2 -.-> A1
+    F2 -.-> F1
+    A1 -.-> A0
+    C1 -.-> C0
+    F1 -.-> F0
+    H1 -.-> H0`}
+/>
+
+- Every vector exists on **layer 0**. Each vector is also randomly promoted to higher layers with decreasing probability, which gives a few "hub" nodes at the top (like a skip list).
+- **Search** starts at the top layer and greedily moves to whichever neighbour is closest to the query, then drops down a layer and repeats, refining at each level. At layer 0 it explores a candidate list of size **`ef_search`** and returns the best k.
+
+Step through a search:
+
+<AgentStepper
+	title="An HNSW search for the query 'box arrived smashed'"
+	steps={[
+		{ kind: 'harness', title: 'Start at the entry point (top layer)', body: 'Node A (a vector about invoices). Distance to the query: far.' },
+		{ kind: 'model', title: 'Layer 2: greedy hop', body: 'A\'s only top-layer neighbour is F (about shipping and packaging). F is closer, so move to F. No closer neighbour exists, so descend.' },
+		{ kind: 'model', title: 'Layer 1: greedy hops', body: 'From F, check C and H. H (about "carrier handling") is closer. From H, no closer neighbour, so descend.' },
+		{ kind: 'tool_call', title: 'Layer 0: beam search with ef_search candidates', body: 'Keep a priority list of the best `ef_search` nodes seen so far. Expand neighbours of the best unexpanded node: G, E, D…' },
+		{ kind: 'tool_result', title: 'Converge', body: 'The list stops improving. Return the top k: E ("report damaged goods within 48 hours"), G ("glass must be packed with protective wrapping"), D…' },
+		{ kind: 'harness', title: 'Cost', body: 'A few hundred to a few thousand distance computations instead of millions. That\'s the whole trick.' },
+	]}
+/>
+
+## The knobs
+
+| Parameter | What it controls | Higher value means |
+|---|---|---|
+| **`M`** | Links per node in the graph | Better recall, **more memory**, slower build |
+| **`ef_construction`** | Candidate list size while building | Better graph quality, **slower build** |
+| **`ef_search`** | Candidate list size while querying | **Better recall, slower queries.** Tunable per query, no rebuild |
+
+`ef_search` is your main production dial: you can raise it for a high-stakes feature and lower it for autocomplete, on the same index.
+
+## Measuring it: recall@k
+
+**Recall@k** = of the true k nearest neighbours (from exact search), how many did the approximate search return? It's the metric you trade against latency.
+
+```python
+# evals/vector_bench.py: brute force vs HNSW on clustered unit vectors
+import time
+
+import hnswlib
+import numpy as np
+
+N, DIM, K, QUERIES = 100_000, 384, 10, 200
+rng = np.random.default_rng(42)
+
+
+def unit(x: np.ndarray) -> np.ndarray:
+    return x / np.linalg.norm(x, axis=1, keepdims=True)
+
+
+# Real embeddings are clustered (topics), not uniform noise, so simulate that.
+centers = rng.standard_normal((2_000, DIM), dtype=np.float32)
+data = unit(centers[rng.integers(0, len(centers), N)] + 0.6 * rng.standard_normal((N, DIM), dtype=np.float32))
+queries = unit(centers[rng.integers(0, len(centers), QUERIES)] + 0.6 * rng.standard_normal((QUERIES, DIM), dtype=np.float32))
+
+# --- exact (brute force): one matrix multiply, then top-k ---
+start = time.perf_counter()
+scores = queries @ data.T
+exact = np.argpartition(-scores, K, axis=1)[:, :K]
+brute_ms = (time.perf_counter() - start) / QUERIES * 1000
+
+# --- approximate: HNSW ---
+index = hnswlib.Index(space="cosine", dim=DIM)
+start = time.perf_counter()
+index.init_index(max_elements=N, M=16, ef_construction=200)
+index.add_items(data, np.arange(N))
+build_s = time.perf_counter() - start
+
+print(f"brute force: {brute_ms:.2f} ms/query (recall 1.000 by definition)")
+print(f"HNSW build: {build_s:.1f} s")
+for ef in (10, 40, 100, 400):
+    index.set_ef(ef)
+    start = time.perf_counter()
+    labels, _ = index.knn_query(queries, k=K)
+    hnsw_ms = (time.perf_counter() - start) / QUERIES * 1000
+    recall = np.mean([len(set(labels[i]) & set(exact[i])) / K for i in range(QUERIES)])
+    print(f"HNSW ef_search={ef:>3}: {hnsw_ms:.3f} ms/query, recall@{K} = {recall:.3f}")
+```
+
+One run of exactly this script (a cloud container, CPU only):
+
+| Method | ms / query | recall@10 |
+|---|---|---|
+| Brute force (batched matrix multiply) | 1.61 | 1.000 |
+| HNSW `ef_search=10` | 0.024 | 0.926 |
+| HNSW `ef_search=40` | 0.056 | 1.000 |
+| HNSW `ef_search=100` | 0.137 | 1.000 |
+| HNSW build time (100K vectors) | 26 s | — |
+
+Notice the trade-offs: queries are about **30× faster** than brute force at full recall, but the index took **26 seconds to build** for just 100K vectors. Build time and memory are the price. And this synthetic data is easy; on real embeddings, expect to need a higher `ef_search` for the same recall. **Run it on your data.**
+
+## Other ANN families (know the names)
+
+| Family | Idea | Where you'll see it |
+|---|---|---|
+| **IVF** (inverted file) | Cluster vectors; search only the nearest clusters (`nprobe`) | FAISS, pgvector `ivfflat`, Milvus |
+| **PQ** (product quantization) | Compress vectors into short codes; approximate distances | FAISS, large-scale systems, often combined with IVF |
+| **Disk-based graphs** (e.g. DiskANN-style) | Graph search with vectors on SSD | Very large corpora that don't fit in RAM |
+
+HNSW is the usual default: excellent recall and latency, easy to tune. The main costs are **memory** and **build time**.
+
+<FailureCard
+	title="Recall drift"
+	symptom="Answer quality slowly declines over months. No deploys changed retrieval."
+	cause="The corpus grew 10×, but `ef_search` stayed at its initial value. At the larger scale, the same setting found fewer true neighbours, so recall dropped from about 0.98 to about 0.85."
+	detect="A scheduled **recall canary**: periodically compare ANN results with exact search on a sample of queries, and alert when recall@k drops below target."
+	fix="Re-tune `ef_search` (and `M` at rebuild time) as the corpus grows; track recall as a production metric, not a one-off experiment."
+/>
+
+<FailureCard
+	title="The index build that took down search"
+	symptom="During a nightly re-index, search latency spikes for all users, and the database runs low on memory."
+	cause="The HNSW build ran on the same primary database serving live traffic, competing for CPU and RAM."
+	detect="Latency correlated with index-build windows; memory alerts during builds."
+	fix="Build new indexes on a replica or a separate collection (blue/green), give builds dedicated memory, and switch traffic only after the new index is validated."
+/>
+
+<ThinkFirst question="Relay's policy search uses HNSW with ef_search=40 and gets recall@10 of 0.97 on your benchmark. Product wants answers about refunds to be 'as accurate as possible', and autocomplete suggestions in the search box to appear within 50 ms. How do you configure retrieval for both, on one index?">
+
+**Use per-query `ef_search` on the same index:**
+
+- **Autocomplete:** a low `ef_search` (e.g. 10–20) and a small k. Speed matters most and a slightly imperfect suggestion list is harmless. Combine with a prefix/keyword index for exact terms.
+- **Refund answers (high stakes):** a higher `ef_search` (e.g. 100–200), a larger candidate set (k = 50), then a **reranker** (Module 4) to pick the best 5. The extra milliseconds are invisible next to LLM latency (seconds).
+
+Then **measure both**: recall and p95 latency per configuration on your real data, and keep a recall canary in production. The broader principle is to **budget accuracy and latency per feature**, not globally.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the benchmark script above. Then change the noise from 0.6 to 1.5. What happens to recall at each `ef_search`, and why?
+- **Stretch:** add `M` as a variable (8, 16, 32). Plot recall@10 against ms/query for each `M` and `ef_search` combination, and note memory and build time.
+- **Boss level:** run the benchmark on **real embeddings**: embed 50K–200K real texts (Wikipedia sentences, product reviews, or your own docs) with an open-source model. Produce the recall-vs-latency curve and pick an operating point with written justification. This chart is an excellent portfolio artifact.
+
+</Practice>
+
+<Quiz
+	id="m3-hnsw"
+	questions={[
+		{
+			q: 'What does raising `ef_search` do?',
+			options: [
+				'Rebuilds the index with more links',
+				'Explores more candidates per query, increasing recall at the cost of latency, with no rebuild needed',
+				'Reduces memory usage',
+				'Changes the distance metric',
+			],
+			answer: 1,
+			why: 'It\'s the per-query accuracy/speed dial. `M` and `ef_construction` are build-time settings.',
+		},
+		{
+			q: 'How is recall@10 for an ANN index measured?',
+			options: [
+				'User ratings',
+				'The fraction of the true 10 nearest neighbours (from exact search) that the ANN search returns',
+				'Query latency',
+				'The number of vectors in the index',
+			],
+			answer: 1,
+			why: 'Exact search defines ground truth; recall measures how much of it the approximation finds.',
+		},
+		{
+			q: 'What are the main costs of HNSW compared with brute force?',
+			options: ['Lower recall only', 'Memory for the graph and build time, plus slightly approximate results', 'It cannot handle cosine', 'It requires a GPU'],
+			answer: 1,
+			why: 'HNSW buys fast queries with memory, build time and a small, tunable loss of recall.',
+		},
+		{
+			q: 'The corpus grew 10× and answer quality slowly dropped, with no deploys. What should you check first?',
+			options: ['The LLM version', 'ANN recall at the current scale (recall canary) and whether `ef_search` needs re-tuning', 'The UI', 'Network latency'],
+			answer: 1,
+			why: 'Recall at a fixed `ef_search` can fall as the corpus grows. Track recall continuously, not just at launch.',
+		},
+	]}
+/>
+
+<LessonComplete id="embeddings/hnsw" />

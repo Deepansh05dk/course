@@ -1,0 +1,148 @@
+---
+title: "Beyond chat: pick the interface before the model"
+description: Inline, ambient, batch and agentic interaction patterns, how to choose between them, and the latency states every AI interface must design for.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The chatbot nobody opened" severity="SEV3">
+Acme's IT team shipped "Ask Relay", a chat window in the corner of the support tool. The model was good. Usage after a month: **4% of agents**, mostly to test it. In interviews, agents said: "I'm in the middle of a ticket. I don't have time to explain the ticket to a chatbot that can't see the ticket." The intelligence was fine. **The interface was wrong.**
+</Incident>
+
+Your frontend experience is a real advantage in AI engineering, because most AI product failures are **interaction failures**: the wrong surface, the wrong moment, or the wrong amount of autonomy. Chat is the default because it's the easiest thing to build. It's rarely the best thing to ship.
+
+## Four interaction patterns
+
+| Pattern | What it looks like | Relay example | Best when |
+|---|---|---|---|
+| **Inline** | AI output appears right where the user is already working | A draft reply pre-filled in the ticket's reply box | The task and its context are already on screen |
+| **Ambient** | AI works in the background and surfaces hints | "This customer had 3 delayed shipments this month" banner on the ticket | Information helps, but nobody would think to ask for it |
+| **Batch** | AI processes many items offline; humans review results | Overnight triage of 2,000 tickets into queues with priorities | High volume, no one waiting, cost matters (batch APIs are cheaper) |
+| **Conversational / agentic** | The user delegates an open-ended goal | "Find all customers affected by the Antwerp strike and draft apology emails" | Open-ended, multi-step work that's hard to specify up front |
+
+<Diagram
+	caption="A quick way to choose. Many products combine several patterns, for example ambient hints plus an inline draft plus chat for follow-ups."
+	code={`flowchart TD
+    A["What is the user doing<br/>when they need AI help?"] --> B{"Is someone waiting<br/>for the result?"}
+    B -- No --> C["Batch<br/>queue it, process cheaply, review later"]
+    B -- Yes --> D{"Is the context already<br/>on screen?"}
+    D -- Yes --> E{"Does the user know<br/>they need help?"}
+    E -- Yes --> F["Inline<br/>draft, rewrite, autocomplete"]
+    E -- No --> G["Ambient<br/>hints, warnings, suggestions"]
+    D -- No --> H{"Is the goal open-ended<br/>and multi-step?"}
+    H -- Yes --> I["Agentic<br/>delegate with checkpoints and approvals"]
+    H -- No --> J["Conversational Q&A<br/>with the right context attached"]`}
+/>
+
+:::tip[Pass context, don't ask for it]
+The single biggest fix for "Ask Relay" was attaching the open ticket automatically to every request. Users should never have to copy and paste context that your app already has. That's both a UX principle and a context-engineering principle.
+:::
+
+## Every AI interface has more states than you think
+
+A normal button has two states: idle and loading. An AI feature has at least seven, and each one needs a design:
+
+| State | What the user needs to see |
+|---|---|
+| **Idle** | What this can do (examples, not a blank box) |
+| **Submitted, waiting** | Immediate acknowledgement (under 100ms) and a sign that work started |
+| **Thinking / tool use** | Progress you can understand ("Looking up shipment ACM-183…") |
+| **Streaming** | Text appearing, with the ability to **stop** |
+| **Done** | The result, its sources, and actions (copy, insert, regenerate, rate) |
+| **Partial / truncated** | An honest notice ("The answer was cut off. Continue?") |
+| **Error / refusal / unavailable** | What happened in plain language, and a next step (retry, fallback, human) |
+
+Designing only the "done" state is how you get spinners that hang forever and blank cards on errors.
+
+## Autonomy is a dial, not a switch
+
+<Diagram
+	caption="Move right only as fast as your evals and your users' trust allow."
+	code={`flowchart LR
+    A["Suggest<br/>AI drafts,<br/>human does it"] --> B["Assist<br/>AI does it,<br/>human approves each step"]
+    B --> C["Supervise<br/>AI acts, human reviews<br/>a sample or exceptions"]
+    C --> D["Automate<br/>AI acts alone<br/>within guardrails"]`}
+/>
+
+Relay starts at **Suggest** for replies (agents edit and send) and **Assist** for refunds (agents approve). Batch triage can move to **Supervise** once evals show 95%+ accuracy. Moving right is a product decision backed by data, never a default.
+
+<FailureCard
+	title="The blank box problem"
+	symptom="Users open the AI feature, stare at an empty input, type 'hi', and leave."
+	cause="No affordances: the UI didn't show what the feature can do, so users couldn't form a mental model."
+	detect="Analytics: first-message length, share of sessions with only one short message, and drop-off after the first answer."
+	fix="Show 3–4 concrete example prompts based on the current context ('Summarize this ticket', 'Draft a reply about the delay'), and prefer inline buttons over an empty chat box."
+/>
+
+<FailureCard
+	title="Autonomy too early"
+	symptom="After launching auto-send for 'simple' replies, a wave of complaints arrives about wrong delivery dates."
+	cause="The team jumped from Suggest to Automate without measuring accuracy on the specific case, or sampling outputs after launch."
+	detect="Edit rate before launch (how often agents changed the draft) is a strong predictor. A high edit rate means the system isn't ready to automate."
+	fix="Move one step at a time: Assist, then Supervise with sampling, then Automate only for categories whose measured error rate is acceptable."
+/>
+
+<ThinkFirst question="Acme warehouse managers want help with 'which shipments will miss their delivery date this week?'. Which interaction pattern (or combination) would you pick, and why? What would the first version look like?">
+
+**A combination: batch plus ambient, with conversational follow-up.**
+
+- **Batch:** every morning, score all open shipments for delay risk (route, weather, port congestion, history). Nobody is waiting, volume is high, and the work is cheap overnight.
+- **Ambient:** a "⚠️ 14 shipments at risk" panel on the manager's dashboard, each with a one-line reason ("Antwerp port strike, 2-day backlog"). Managers wouldn't think to ask every morning, so the system should tell them.
+- **Conversational follow-up:** "Why is ACM-183 at risk?" or "Draft customer notices for these 14" when they want to act.
+
+**First version:** the batch job plus a simple list with reasons, and a thumbs up/down per prediction so you start collecting labels. No chat needed on day one.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** pick three AI features in products you use. Classify each as inline, ambient, batch or agentic. Which one would you redesign, and how?
+- **Stretch:** design (Figma, paper, or HTML) all seven states for Relay's "draft reply" feature. Show what the agent sees in each state.
+- **Boss level:** build an **inline** "Draft reply" button for a fake ticket page (plain React is fine): clicking it streams a draft into the reply textarea, with Stop, Regenerate and "Insert" actions, and a visible state for errors and truncation. Use your Module 1 streaming endpoint.
+
+</Practice>
+
+<Quiz
+	id="m2-patterns"
+	questions={[
+		{
+			q: 'Why did "Ask Relay" fail despite a good model?',
+			options: [
+				'The model was too slow',
+				'Agents had to leave their work and re-explain context the app already had, so the interface didn\'t fit the workflow',
+				'Chat interfaces are always bad',
+				'The prompt was poorly written',
+			],
+			answer: 1,
+			why: 'The surface didn\'t match the workflow. An inline draft in the ticket, with the ticket attached as context automatically, fits the moment agents need help.',
+		},
+		{
+			q: 'Which pattern fits "triage 2,000 tickets overnight"?',
+			options: ['Inline', 'Ambient', 'Batch', 'Chat'],
+			answer: 2,
+			why: 'Nobody is waiting, volume is high, and cost matters. Batch processing (and provider batch APIs) fits, with human review of the results.',
+		},
+		{
+			q: 'What is the best leading indicator that a "suggest" feature is ready to move toward automation?',
+			options: ['Thumbs-up rate', 'How often humans edit or reject the suggestion, measured per category', 'Token cost', 'The number of users'],
+			answer: 1,
+			why: 'The edit rate measures how often the human disagreed. Low edit rates in a category, confirmed by evals, justify more autonomy for that category.',
+		},
+		{
+			q: 'Which state is most often forgotten in AI interfaces?',
+			options: ['Idle', 'Done', 'Partial, truncated, error and refusal states', 'Streaming'],
+			answer: 2,
+			why: 'Happy-path designs skip them, so users get blank cards, endless spinners, or silently truncated answers. Design every state.',
+		},
+	]}
+/>
+
+<LessonComplete id="ai-ux/interface-patterns" />

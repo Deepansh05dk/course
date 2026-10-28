@@ -1,0 +1,167 @@
+---
+title: Why vector search is hard at scale
+description: Why normal database indexes can't help, what brute-force kNN costs at 10 million vectors, the curse of dimensionality, and memory math for real deployments.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The search that got slower every week" severity="SEV3">
+Relay's first RAG prototype stored embeddings in a Postgres `float[]` column and computed similarity in SQL over every row. With 20,000 chunks it answered in 40 ms. Acme then connected their full document archive: 3 million chunks. Every query took 6 seconds and pinned a CPU core, and two concurrent users made it 12 seconds. Nothing was "broken". It was doing exactly what it was told: compare the query with **every** vector.
+</Incident>
+
+## Why a B-tree can't help
+
+Normal database indexes (B-trees) work because data can be **sorted** along one dimension: "find prices between 10 and 20" jumps straight to the right range. Nearest-neighbour search in 384 or 1,536 dimensions has no such ordering:
+
+- Sorting by any single dimension says almost nothing about overall closeness.
+- Classic spatial indexes (k-d trees, R-trees) partition space into boxes. They work well in 2–3 dimensions (maps!), but in hundreds of dimensions nearly every box has to be checked, which degrades to scanning everything.
+
+## Brute force: exact, simple, and linear
+
+**Exact k-nearest-neighbours (kNN)** is easy: compute the similarity between the query and every vector, and keep the top k. With normalized vectors it's one matrix multiplication:
+
+```python
+import numpy as np
+
+def knn(query: np.ndarray, vectors: np.ndarray, k: int = 5) -> np.ndarray:
+    scores = vectors @ query                     # cosine similarity for unit vectors
+    top = np.argpartition(-scores, k)[:k]        # unordered top-k, O(N)
+    return top[np.argsort(-scores[top])]         # sort only the k winners
+```
+
+The cost grows linearly with N × dimensions. Do the maths for a realistic enterprise archive:
+
+| Quantity | 1M chunks × 384 dims | 10M chunks × 1,536 dims |
+|---|---|---|
+| Memory (float32 = 4 bytes) | 1.5 GB | **61 GB** |
+| Multiply-adds per query | 384 million | **15.4 billion** |
+| Feels like | Fine on one machine | Too slow and too big for interactive use |
+
+:::tip[Brute force is underrated]
+Below roughly a few hundred thousand vectors, exact search with a good numeric library is often **fast enough, perfectly accurate, and has zero index to maintain**. Many internal tools and FDE pilots never need more. Measure before adding an approximate index.
+:::
+
+## The curse of dimensionality
+
+High-dimensional space behaves strangely. As dimensions grow, randomly scattered points become **almost equally far from each other**: the gap between the nearest and the farthest neighbour shrinks relative to the distances themselves. "Nearest" stops meaning much.
+
+Why does vector search work at all, then? Because **real embeddings aren't random**. They sit on lower-dimensional structures (topics, clusters), so meaningful neighbours really are much closer than everything else. Approximate indexes exploit that structure.
+
+You can see this directly. Here's one run of the benchmark from this module's lab, with the same index settings on two kinds of data (a cloud container, numbers will differ on your machine):
+
+| Data (384 dims) | HNSW recall@10 at `ef_search=40` |
+|---|---|
+| 200K vectors of uniform random noise | **0.03** (barely better than guessing) |
+| 100K clustered vectors, like real embeddings | **1.00** |
+
+Same algorithm, same parameters. The data's structure made all the difference. That's also a warning: **always benchmark on your real embeddings**, not synthetic ones.
+
+## Memory math you'll need in customer conversations
+
+Vectors usually dominate the RAM of a vector search system. Options to shrink them:
+
+| Representation | Bytes per dimension | 10M × 1,536 | Typical quality impact |
+|---|---|---|---|
+| float32 | 4 | 61 GB | Baseline |
+| float16 / bfloat16 ("halfvec") | 2 | 31 GB | Usually negligible |
+| int8 scalar quantization | 1 | 15 GB | Small; often recovered by re-scoring top results with full vectors |
+| Binary (1 bit) | 1/8 | 1.9 GB | Large on its own; used as a fast first pass, then re-scored |
+| Fewer dimensions (if the model supports shortening) | — | e.g. 512 dims → 20 GB | Model-dependent; measure |
+
+<Diagram
+	caption="A common pattern at scale: a cheap, compressed first pass over everything, then precise re-scoring of a small candidate set."
+	code={`flowchart LR
+    Q["Query vector"] --> A["Pass 1: compressed index<br/>(binary or int8, or HNSW)<br/>top 200 candidates, fast"]
+    A --> B["Pass 2: re-score with full<br/>float vectors, top 20"]
+    B --> C["Pass 3 (Module 4): cross-encoder<br/>rerank, top 5 to the LLM"]`}
+/>
+
+<FailureCard
+	title="The 6-second search"
+	symptom="Query latency grows linearly with the number of documents; CPU is pinned during searches."
+	cause="Exact similarity computed over every row with no vector index (or an index the query planner didn't use)."
+	detect="Latency versus corpus size in your metrics; `EXPLAIN ANALYZE` showing a sequential scan."
+	fix="Add an approximate index (HNSW, next lesson) once the corpus outgrows brute force, and check that queries actually use it."
+/>
+
+<FailureCard
+	title="The out-of-memory index"
+	symptom="After a big ingestion, the vector database node restarts repeatedly with out-of-memory errors."
+	cause="Nobody did the memory math: vectors plus index overhead exceeded RAM. Approximate indexes perform best when held in memory."
+	detect="Capacity planning: (vectors × dims × bytes) + index overhead, compared with node RAM, tracked as the corpus grows."
+	fix="Quantize (halfvec or int8), reduce dimensions if the model supports it, shard, or move to a managed service sized for the corpus. Plan this **before** the customer's archive arrives."
+/>
+
+<ThinkFirst question="A customer has 40 million support-ticket chunks and wants semantic search with p95 under 200 ms, on infrastructure they control. Their embedding model produces 1,024-dim float32 vectors. Do the memory maths and propose a design.">
+
+**Memory:** 40M × 1,024 × 4 bytes ≈ **164 GB** of raw float32 vectors, before any index overhead. That's too much for one ordinary node.
+
+**Options to combine:**
+
+1. **Quantize:** halfvec → about 82 GB; int8 → about 41 GB. Re-score the top candidates with full precision (stored on disk or in a separate column).
+2. **Reduce dimensions** if the model supports shortened embeddings (e.g. 512 dims halves everything again). Validate recall on their data.
+3. **Partition by tenant or time:** if most searches are scoped (one customer, last 2 years), you search a much smaller slice. Partitioning is often the biggest win.
+4. **Approximate index (HNSW)** on the compressed vectors, sized to fit in RAM, possibly sharded across nodes.
+5. **Measure:** build a retrieval eval and a load test before committing. "p95 < 200 ms" must hold at their concurrency, not just for one query.
+
+A good FDE answer also asks: **do they really need all 40 million?** Old, duplicate or closed tickets may be archivable, the cheapest optimization of all.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** compute the memory needed for your own (or a hypothetical) corpus at float32, halfvec and int8.
+- **Stretch:** run the brute-force `knn` function above on 10K, 100K and 1M random unit vectors (384 dims). Plot query latency against N. Then try a batch of 100 queries at once and compare per-query time. Why is it faster?
+- **Boss level:** implement int8 scalar quantization yourself (per-dimension min/max scaling), search with int8 vectors, re-score the top 100 with float32, and measure recall@10 against exact search, plus the memory saved.
+
+</Practice>
+
+<Quiz
+	id="m3-scale"
+	questions={[
+		{
+			q: 'Why can\'t a regular B-tree index speed up nearest-neighbour search on embeddings?',
+			options: [
+				'B-trees don\'t support floats',
+				'Closeness in hundreds of dimensions has no single sort order a B-tree could exploit',
+				'Postgres forbids it',
+				'B-trees are too slow in general',
+			],
+			answer: 1,
+			why: 'B-trees exploit ordering along one key. High-dimensional similarity has no such ordering, so dedicated structures (like HNSW) are needed.',
+		},
+		{
+			q: 'Roughly how much memory do 10 million 1,536-dim float32 vectors need?',
+			options: ['6 GB', '61 GB', '600 GB', '1.5 GB'],
+			answer: 1,
+			why: '10M × 1,536 × 4 bytes ≈ 61 GB, before index overhead. This maths decides your infrastructure.',
+		},
+		{
+			q: 'Why does approximate search work well on real embeddings but poorly on uniform random vectors?',
+			options: [
+				'Random vectors are too small',
+				'Real embeddings are clustered (structured), so true neighbours are clearly closer, while in random high-dimensional data everything is nearly equidistant',
+				'Indexes only support text',
+				'It works equally on both',
+			],
+			answer: 1,
+			why: 'That\'s the curse of dimensionality in action. Structure is what makes "nearest" meaningful, so benchmark on your real data.',
+		},
+		{
+			q: 'When is brute-force exact search a good production choice?',
+			options: ['Never', 'For small to medium corpora (often up to a few hundred thousand vectors) where it is fast enough and needs no index', 'Only for images', 'Only above 100M vectors'],
+			answer: 1,
+			why: 'Exact search is simple, perfectly accurate, and has no index to tune. Add approximation when measurements say you must.',
+		},
+	]}
+/>
+
+<LessonComplete id="embeddings/brute-force-and-scale" />

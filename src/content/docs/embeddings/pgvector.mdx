@@ -1,0 +1,267 @@
+---
+title: pgvector in production
+description: Vector search inside Postgres. Schema, HNSW indexes, the filtering pitfall, iterative scans, multitenancy, re-indexing safely, and when to choose a dedicated vector database. Plus the Module 3 lab.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Only 2 results, for a question with 40 answers" severity="SEV3">
+Relay searched policies with `WHERE region = 'BENELUX'` added to the vector query. After the HNSW index was created, many questions suddenly returned only 1–3 chunks, sometimes zero, even though dozens of matching Benelux policies existed. The answers got thin and refusals spiked. Nothing errored. The index was doing exactly what approximate indexes do with filters.
+</Incident>
+
+For most teams, the best first vector database is **the Postgres they already run**. **pgvector** adds a `vector` type, distance operators, and HNSW/IVFFlat indexes. You get transactions, joins, backups, access control and your existing tooling for free.
+
+## Schema
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE chunks (
+    id               bigserial PRIMARY KEY,
+    tenant_id        int         NOT NULL,             -- which customer (Acme, ...)
+    document_id      bigint      NOT NULL REFERENCES documents(id),
+    region           text        NOT NULL,             -- a filterable attribute
+    content          text        NOT NULL,
+    embedding        vector(384) NOT NULL,             -- dimension must match the model
+    embedding_model  text        NOT NULL,             -- the index contract (lesson 1)
+    created_at       timestamptz NOT NULL DEFAULT now()
+);
+
+-- Approximate index for cosine distance. Defaults: m = 16, ef_construction = 64.
+CREATE INDEX chunks_embedding_hnsw ON chunks
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+```
+
+Operators (smaller is always "closer"):
+
+| Operator | Distance | Index ops class |
+|---|---|---|
+| `<=>` | Cosine distance (1 − cosine similarity) | `vector_cosine_ops` |
+| `<->` | L2 (Euclidean) | `vector_l2_ops` |
+| `<#>` | **Negative** inner product | `vector_ip_ops` |
+
+## Querying from Python
+
+```python
+# app/retrieval.py
+import numpy as np
+import psycopg
+from pgvector.psycopg import register_vector
+
+conn = psycopg.connect("postgresql://relay@localhost/relay", autocommit=True)
+register_vector(conn)  # lets psycopg send and receive numpy arrays as vectors
+
+
+def search(query_vec: np.ndarray, tenant_id: int, k: int = 5) -> list[tuple]:
+    return conn.execute(
+        """
+        SELECT id, content, 1 - (embedding <=> %(q)s) AS similarity
+        FROM chunks
+        WHERE tenant_id = %(tenant)s
+        ORDER BY embedding <=> %(q)s
+        LIMIT %(k)s
+        """,
+        {"q": query_vec, "tenant": tenant_id, "k": k},
+    ).fetchall()
+```
+
+The `ORDER BY embedding <=> … LIMIT k` shape is what lets Postgres use the HNSW index. Check with `EXPLAIN ANALYZE` that it really does.
+
+## The filtering pitfall
+
+This is the incident above. With approximate indexes, **filtering happens after the index scan**. The HNSW scan returns its best `ef_search` candidates (40 by default), and *then* the `WHERE` clause removes the ones that don't match. If only 10% of rows match the filter, you get about 4 results on average, however many matching rows exist.
+
+<Diagram
+	caption="Post-filtering: the index finds the nearest 40 overall, then the filter throws most of them away."
+	code={`flowchart LR
+    Q["Query + WHERE region='BENELUX'"] --> I["HNSW scan<br/>best 40 candidates overall<br/>(ef_search = 40)"]
+    I --> F["Filter: region = BENELUX<br/>(about 10% match)"]
+    F --> R["about 4 rows returned<br/>even if 400 match in the table"]`}
+/>
+
+Fixes, from pgvector's own guidance:
+
+```sql
+-- 1. Iterative index scans (pgvector 0.8.0+): keep scanning until enough rows pass the filter.
+SET hnsw.iterative_scan = relaxed_order;   -- or strict_order
+SET hnsw.max_scan_tuples = 20000;          -- upper bound on work (the default)
+
+-- 2. A bigger candidate list for this query only.
+BEGIN;
+SET LOCAL hnsw.ef_search = 200;
+SELECT ... ORDER BY embedding <=> $1 LIMIT 5;
+COMMIT;
+
+-- 3. Few distinct filter values: a partial index per value.
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops) WHERE (region = 'BENELUX');
+
+-- 4. Selective filters (matching a small % of rows): a normal B-tree on the filter column,
+--    so Postgres can do exact search over the few matching rows instead.
+CREATE INDEX ON chunks (region);
+```
+
+## Multitenancy and permissions
+
+For FDE work this matters most. Two rules:
+
+1. **Isolation for recall and speed:** with one shared approximate index, one big tenant's vectors affect recall and speed for everyone. pgvector's guidance is **list partitioning by tenant** (or separate tables):
+
+```sql
+CREATE TABLE chunks (/* ...columns... */) PARTITION BY LIST (tenant_id);
+CREATE TABLE chunks_acme PARTITION OF chunks FOR VALUES IN (1);
+-- each partition gets its own HNSW index
+```
+
+2. **Isolation for security:** the tenant and permission filter must be **enforced by the data layer**, never added by the LLM, and never optional. Use Postgres **row-level security** or a mandatory query-builder parameter, and test it. A missing `WHERE tenant_id = …` is a data breach, not a relevance bug. (Permission-aware retrieval is covered fully in Module 4.)
+
+## Operating it
+
+| Concern | What to do |
+|---|---|
+| **Build time** | Builds are much faster when the graph fits in `maintenance_work_mem`. Build after bulk-loading, not row by row during a big import |
+| **Memory** | Best performance when the index fits in RAM. Check size with `pg_relation_size`; use `halfvec` to halve it |
+| **Dimensions** | `vector` indexes support up to 2,000 dims, `halfvec` up to 4,000. Bigger models need half precision, binary quantization, or shortened vectors |
+| **Updates and deletes** | Dead tuples reduce result counts and quality. Vacuum regularly; consider periodic `REINDEX ... CONCURRENTLY` for heavy churn |
+| **Model changes** | Blue/green: add a new column (or table) for the new model's vectors, backfill, index, evaluate, switch reads, then drop the old one |
+| **Recall** | Keep a recall canary (lesson 4) running against production |
+
+## pgvector or a dedicated vector database?
+
+| Choose **pgvector** when… | Consider **a dedicated vector DB** (Qdrant, Weaviate, Milvus, Pinecone, …) when… |
+|---|---|
+| Up to roughly tens of millions of vectors | Hundreds of millions to billions of vectors |
+| You already run Postgres and want one system | Vector search is the core product and needs its own scaling |
+| You need joins, transactions, and row-level security with your business data | You need advanced built-in features (native hybrid search, multi-vector, quantization tuning, filtering-aware graph search) |
+| The customer's security team already approves Postgres (very common in FDE work) | The team is happy to run (or buy) another piece of infrastructure |
+
+The honest default: **start with pgvector, and measure.** Switch when a measured limit (latency, recall under filters, scale, operational cost) appears, not because of a blog post.
+
+<IncidentDrill
+	id="pgvector-drill"
+	title="The Monday morning model swap"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Monday 09:30. Policy answers have been nonsense since the weekend deploy. Similarity scores still look normal (0.6–0.8). The deploy included "upgrade embedding library". First move?',
+			choices: [
+				{ label: 'Compare the embedding_model stored on chunks with the model now used for queries', next: 's2', cost: 5, note: 'Chunks: model v1. Queries: model v2. The library changed its default.' },
+				{ label: 'Increase hnsw.ef_search to 400', next: 's1b', cost: 25, note: 'Searching harder through incompatible vectors returns more nonsense, more slowly.' },
+				{ label: 'Rebuild the HNSW index', next: 's1b', cost: 40, note: 'The index rebuilds over the same v1 vectors. Nothing changes.' },
+			],
+		},
+		s1b: { text: 'No improvement. What else changed?', choices: [{ label: 'Check which embedding model embeds the queries vs the stored chunks', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'Confirmed: queries use v2, the stored chunks are v1. Fastest safe mitigation?',
+			choices: [
+				{ label: 'Pin the query embedder back to v1 and redeploy', next: 's3', cost: 10, note: 'Search recovers within minutes.' },
+				{ label: 'Re-embed all 3 million chunks with v2 right now on the production database', next: 'end_ok', cost: 120, note: 'It works after hours, and the backfill slows the database for everyone meanwhile.' },
+			],
+		},
+		s3: {
+			text: 'Search has recovered. How do you prevent this, and actually adopt v2 safely?',
+			choices: [
+				{ label: 'Pin models explicitly, assert query model = index model at startup, add a recall eval in CI, and do blue/green re-indexing to move to v2', next: 'end_good', cost: 0 },
+				{ label: 'Never upgrade the library again', next: 'end_ok', cost: 0, note: 'Safe today; stuck with an outdated model and security patches tomorrow.' },
+			],
+		},
+		end_good: { text: 'Diagnosed from the index contract, mitigated in minutes, and turned into guardrails: pinned models, a startup assertion, CI recall evals, and blue/green migration.', end: 'good' },
+		end_ok: { text: 'It\'s fixed, but either slowly and riskily, or by freezing upgrades. Neither scales.', end: 'ok' },
+	}}
+/>
+
+## 🧪 Module 3 lab: Relay's vector store
+
+Build it in your `relay` repo, with Postgres + pgvector in Docker (the `pgvector/pgvector` image). **Acceptance criteria:**
+
+1. **Schema** with `tenant_id`, `embedding_model`, and a fixed dimension; an HNSW cosine index.
+2. **Ingestion script** that embeds at least 5,000 chunks (any public text works until Module 4 brings the real policy PDFs), in batches, with retries, storing the model name per row.
+3. **`search(query, tenant_id, k)`** with a mandatory tenant filter, enforced by row-level security or a required parameter, plus a **test** that a query for tenant A can never return tenant B's chunks.
+4. **Benchmark notebook:** exact search (no index) vs HNSW at 3 `ef_search` values, reporting recall@10 and p95 latency on your real embeddings.
+5. **Filtering experiment:** a filter matching about 10% of rows, with and without `hnsw.iterative_scan`. Report result counts.
+6. **Startup assertion:** the app refuses to start if the configured embedding model differs from the model stored in the index.
+7. `docs/module-3.md`: your recall/latency chart, the chosen settings with justification, the memory estimate at 10× your data, and three things that surprised you.
+
+<ThinkFirst question="An enterprise customer (FDE engagement) has 25 business units. Documents must only be visible to employees of the owning unit, plus a few 'company-wide' documents visible to all. Search must stay fast and accurate. Design the pgvector data model and query path.">
+
+A strong design separates **security** from **performance**, and makes security impossible to skip:
+
+1. **Data model:** each chunk carries `unit_id` (or NULL for company-wide) and inherits document-level ACLs at ingestion. Permissions are copied from the source system and **re-synced** when they change there.
+2. **Enforcement:** Postgres **row-level security** keyed on the session's unit (set per request from the authenticated user, never from the LLM or the prompt). Every search runs under that policy, so a forgotten `WHERE` can't leak data.
+3. **Performance:** list-partition by `unit_id` (25 partitions, each with its own HNSW index), plus a small partition for company-wide documents. A query searches the user's partition plus the company-wide one, then merges. Each search is over a small, dense, unfiltered index, which gives good recall with no post-filtering trap.
+4. **Tests:** automated tests that impersonate users from different units and assert no cross-unit results, run in CI.
+5. **Audit:** log which chunk IDs were retrieved for which user, so you can answer "who saw what".
+
+The underlying principle: **performance tricks are optional; permission enforcement is not.**
+
+</ThinkFirst>
+
+<Practice title="Build it yourself: Module 3 wrap-up">
+
+- **Warm-up:** run pgvector in Docker, create the schema, insert 1,000 vectors, and confirm with `EXPLAIN ANALYZE` that a `LIMIT` query uses the HNSW index.
+- **Stretch:** reproduce the filtering pitfall: a filter matching 5% of rows, with default settings, then with `SET hnsw.iterative_scan = relaxed_order`. Chart the result counts.
+- **Boss level:** implement **blue/green re-embedding**: add `embedding_v2`, backfill it in throttled batches, build its index concurrently, run your retrieval eval on both, and switch reads with a feature flag. Document the runbook. Real customers will ask you for exactly this.
+
+</Practice>
+
+<Quiz
+	id="m3-pgvector"
+	title="Module 3 final quiz"
+	questions={[
+		{
+			q: 'A vector query with `WHERE region = \'BENELUX\'` returns far fewer rows after adding an HNSW index. Why?',
+			options: [
+				'The index is corrupted',
+				'Filtering is applied after the approximate scan, which only returns about ef_search candidates, and most get filtered out',
+				'Postgres limits results to 5',
+				'Cosine distance ignores filters',
+			],
+			answer: 1,
+			why: 'Post-filtering with approximate indexes. Use iterative index scans (pgvector 0.8+), a larger ef_search, partial indexes, partitioning, or exact search for selective filters.',
+		},
+		{
+			q: 'What does the `<#>` operator return in pgvector?',
+			options: ['Cosine similarity', 'The negative inner product (so smaller means closer)', 'L2 distance', 'Hamming distance'],
+			answer: 1,
+			why: 'pgvector keeps "smaller is closer" for every operator, so the inner product is negated. Mixing up signs is a classic bug.',
+		},
+		{
+			q: 'Where must tenant and permission filtering be enforced?',
+			options: [
+				'In the LLM prompt',
+				'In the data layer (e.g. row-level security or a mandatory parameter), tested in CI',
+				'In the UI',
+				'It is optional for internal tools',
+			],
+			answer: 1,
+			why: 'A missing filter is a data breach. Enforce it where it can\'t be skipped, and test it.',
+		},
+		{
+			q: 'Your embedding model needs 3,072 dimensions. Which pgvector option can index it?',
+			options: ['`vector` with HNSW', '`halfvec` (up to 4,000 dims for indexing) or binary quantization', 'IVFFlat only', 'It is impossible'],
+			answer: 1,
+			why: '`vector` indexes support up to 2,000 dimensions. Half-precision indexing goes up to 4,000, and binary quantization much further.',
+		},
+		{
+			q: 'When is a dedicated vector database usually worth it over pgvector?',
+			options: [
+				'Always',
+				'When measured limits appear: very large scale, filtered-recall needs, or vector search as the core product',
+				'For any RAG project',
+				'Never',
+			],
+			answer: 1,
+			why: 'Start with what you run and measure. Move when data shows a limit, not on hype.',
+		},
+	]}
+/>
+
+<LessonComplete id="embeddings/pgvector" />

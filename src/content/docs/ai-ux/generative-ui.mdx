@@ -1,0 +1,191 @@
+---
+title: "Generative UI: when the model chooses components"
+description: Turning tool calls into React components. Typed tool parts, part states, designing tool outputs for display, and keeping rendering safe.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'Your shipment is delayed' — but which one?" severity="SEV3">
+Relay's text answers about shipments were correct but hard to use: agents had to read a paragraph to find the ETA, then copy the shipment ID by hand into another system. A two-week experiment replaced the paragraph with a **shipment card** (status chip, location, ETA, a "copy ID" button). Average handling time for tracking tickets dropped by 40 seconds.
+</Incident>
+
+**Generative UI** means the model's output is not only text: it can trigger **components**. The mechanism isn't magic. The model calls a tool, the tool returns structured data, and your frontend renders that data with a component *you* designed.
+
+<Diagram
+	caption="The model decides WHEN to show a component (by calling a tool). Your code decides WHAT it looks like and what data it contains."
+	code={`sequenceDiagram
+    participant U as Agent (UI)
+    participant S as Server
+    participant M as Model
+    participant DB as Shipment DB
+    U->>S: "Where is ACM-2025-000183?"
+    S->>M: messages + tools (getShipment)
+    M-->>S: tool call getShipment {shipmentId}
+    S-->>U: part tool-getShipment state=input-available
+    Note over U: render skeleton card "Looking up..."
+    S->>DB: lookup
+    DB-->>S: {status, location, eta}
+    S-->>U: part state=output-available + data
+    Note over U: render ShipmentCard from data
+    S->>M: tool result
+    M-->>S: "It's running a day late because of port congestion."
+    S-->>U: text part`}
+/>
+
+## Define tools once, type them everywhere
+
+```ts
+// src/ai/tools.ts
+import { tool, type InferUITools, type UIDataTypes, type UIMessage } from 'ai';
+import { z } from 'zod';
+
+export const tools = {
+	getShipment: tool({
+		description: 'Look up the live status of a shipment by its ID (format ACM-YYYY-NNNNNN).',
+		inputSchema: z.object({ shipmentId: z.string().regex(/^ACM-\d{4}-\d{6}$/) }),
+		execute: async ({ shipmentId }) => lookupShipment(shipmentId), // your backend call
+	}),
+};
+
+// The UI message type now knows each tool's input and output types.
+export type RelayUIMessage = UIMessage<never, UIDataTypes, InferUITools<typeof tools>>;
+```
+
+On the server, pass `tools` to `streamText` (and a step limit such as `stopWhen: isStepCount(5)` so the model can call the tool and then write its answer). On the client, each tool call arrives as a typed part named `tool-<name>`, with a **state**:
+
+| `part.state` | Meaning | What to render |
+|---|---|---|
+| `input-streaming` | The model is still writing the tool arguments | Skeleton / "preparing…" |
+| `input-available` | Arguments complete, tool running | Skeleton with the known input ("Looking up ACM-183…") |
+| `output-available` | Tool finished | The real component, built from `part.output` |
+| `output-error` | Tool failed | A useful error ("Shipment system unavailable, try again") |
+| `approval-requested` / `approval-responded` / `output-denied` | Human approval flow | An approval card (lesson 5) |
+
+```tsx
+// inside message.parts.map(...)
+case 'tool-getShipment':
+	switch (part.state) {
+		case 'output-available':
+			return <ShipmentCard key={part.toolCallId} {...part.output} />;
+		case 'output-error':
+			return <ErrorChip key={part.toolCallId} text="Couldn't load the shipment. Try again." />;
+		default:
+			return <ShipmentCardSkeleton key={part.toolCallId} id={part.input?.shipmentId} />;
+	}
+```
+
+Step through how one answer is assembled from parts:
+
+<AgentStepper
+	title="Trace: one assistant message, many parts"
+	steps={[
+		{ kind: 'user', title: 'User', body: 'Where is ACM-2025-000183, and can the customer pick it up instead?' },
+		{ kind: 'model', title: 'Part 1: text', body: '"Let me check that shipment."' },
+		{ kind: 'tool_call', title: 'Part 2: tool-getShipment (input-available)', body: 'The UI renders a skeleton card: "Looking up ACM-2025-000183…"' },
+		{ kind: 'tool_result', title: 'Part 2 updates: output-available', body: '`{status: "delayed", location: "Antwerp", eta: "Thu 9:00–12:00"}`, so the skeleton becomes a ShipmentCard with an amber "Delayed" chip.' },
+		{ kind: 'tool_call', title: 'Part 3: tool-findPickupPoints (input-available)', body: 'A second skeleton: a map placeholder.' },
+		{ kind: 'tool_result', title: 'Part 3 updates: output-available', body: '3 depots near the customer, rendered as a PickupList component with opening hours.' },
+		{ kind: 'model', title: 'Part 4: text', body: '"It\'s a day late due to port congestion. The customer can collect it from the Ghent depot from Wednesday 14:00."' },
+		{ kind: 'harness', title: 'What the agent sees', body: 'Two rich, scannable components plus two short sentences, instead of a dense paragraph with IDs to copy by hand.' },
+	]}
+/>
+
+## Designing tool outputs for display
+
+Your tool's return value now has **two audiences**: the model (which reads it to write the answer) and the component (which renders it). Design for both:
+
+- **Return structured, stable fields** (`status: "delayed"`), not pre-formatted prose. The component formats; the model reasons.
+- **Return only what's needed.** A 4,000-field database row bloats the model's context (cost, latency) *and* the payload sent to the browser.
+- **Never return secrets or internal-only fields.** Tool outputs travel to the client in the stream, so anything in the output is visible in the browser's network tab.
+- **Version your components:** old conversations replay old tool outputs. A component must handle older output shapes (or fall back to JSON or text) without crashing.
+
+<FailureCard
+	title="Internal notes in the network tab"
+	symptom="A customer-facing chat shows a shipment card. A curious customer opens dev tools and finds internal fraud-risk scores and staff notes in the stream."
+	cause="The tool returned the full database record. The component only *displayed* a few fields, but the whole output was streamed to the browser."
+	detect="Review tool output schemas as part of security review; snapshot-test tool outputs for forbidden fields."
+	fix="Tools return an explicit, minimal DTO (data transfer object) built for this use, never raw rows. Separate internal tools from customer-facing tools."
+/>
+
+<FailureCard
+	title="Markdown that ran a script"
+	symptom="A pen-tester gets the assistant to output a link like `javascript:...` or raw HTML, and the chat renders it."
+	cause="Model output was rendered as unsanitized HTML or markdown. Model output is **untrusted input**: it can be steered by prompt injection from documents and tickets."
+	detect="Security tests that feed hostile markdown and HTML through the renderer."
+	fix="Render with a markdown library configured to strip raw HTML, allow only `http(s)` links, and treat images carefully (Module 8 covers image-based data exfiltration). Never use `dangerouslySetInnerHTML` on model output."
+/>
+
+<FailureCard
+	title="One unknown part crashes the chat"
+	symptom="After adding a new tool on the server, older deployed frontends show a blank screen for some conversations."
+	cause="The client's `switch` over part types threw on an unknown part type (or tried to read fields that didn't exist)."
+	detect="Error monitoring on the frontend (Sentry, etc.) grouped by part type."
+	fix="Always have a safe `default` branch (render nothing or a generic 'tool used' chip), keep frontend and backend tool sets versioned together, and deploy backend changes that add tools only after the UI can handle them."
+/>
+
+<ThinkFirst question="Product wants the model to generate arbitrary React/HTML for every answer ('fully generative UI') instead of picking from your component library. What are the risks, and what would you propose instead?">
+
+**Risks of arbitrary model-generated UI:**
+
+- **Security:** generated HTML/JS is an XSS vector, especially when injection-controlled content (tickets, documents) influences the model.
+- **Consistency and accessibility:** every answer looks different, breaks your design system, and fails accessibility checks unpredictably.
+- **Reliability and cost:** generating markup is many output tokens (slow, expensive) and often invalid.
+- **Testability:** you can't snapshot-test or eval UIs that never look the same twice.
+
+**Proposal: a constrained component vocabulary.** Offer the model a catalogue of safe, designed components (cards, tables, charts, timelines, forms) via tools or a schema. The model picks the component and fills in **data**; your code renders it. If they need more flexibility, add a generic `Table` and `Chart` with schema-validated props, and render them inside a sandboxed iframe for anything truly custom. You get 90% of the flexibility with none of the XSS.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** add a `getShipment` tool (with a fake lookup) to your Pattern B app and render a `ShipmentCard` with a skeleton state. Make the fake lookup slow (2s) so you can see the states change.
+- **Stretch:** add a second tool, `findPickupPoints`, and make the model use both in one answer. Add a `default` branch that renders a small "used tool X" chip for unknown tools.
+- **Boss level:** in your **FastAPI** (Pattern A) backend, implement tool calls with the Anthropic SDK, and emit `tool-input-available` and `tool-output-available` events in the AI SDK protocol, so the same React `ShipmentCard` works with a Python backend. Write the protocol contract test for the tool events.
+
+</Practice>
+
+<Quiz
+	id="m2-genui"
+	questions={[
+		{
+			q: 'In generative UI with the AI SDK, who decides what a component looks like?',
+			options: ['The model, by generating HTML', 'Your code: the model only chooses to call a tool, and you render its output with your component', 'The browser', 'The provider'],
+			answer: 1,
+			why: 'The model decides **when** (by calling a tool); you decide **what** (the component and the data shape). That keeps the design system, security and testing in your hands.',
+		},
+		{
+			q: 'A tool returns a full customer record, but the component shows only the name and status. What is the risk?',
+			options: ['None, hidden fields are not visible', 'The whole output is streamed to the client, so every field is visible in dev tools', 'It is slower to render', 'React will crash'],
+			answer: 1,
+			why: 'Anything in a tool output reaches the browser. Return minimal, purpose-built outputs.',
+		},
+		{
+			q: 'What should a tool part render while `state` is `input-available`?',
+			options: ['Nothing', 'An error', 'A skeleton or progress state using the known input', 'The final component with empty data'],
+			answer: 2,
+			why: 'The arguments are known but the tool is still running. Show progress ("Looking up ACM-183…") so the UI never feels frozen.',
+		},
+		{
+			q: 'Why treat model output as untrusted when rendering markdown?',
+			options: [
+				'Models write invalid markdown',
+				'Prompt injection from tickets or documents can make the model output malicious links or HTML',
+				'Markdown is slow',
+				'It is required by the AI SDK',
+			],
+			answer: 1,
+			why: 'Anything that influenced the prompt can influence the output. Sanitize, allow-list link schemes, and never inject raw HTML.',
+		},
+	]}
+/>
+
+<LessonComplete id="ai-ux/generative-ui" />

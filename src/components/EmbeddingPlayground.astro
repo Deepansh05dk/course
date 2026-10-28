@@ -1,0 +1,224 @@
+---
+// Data comes from public/data/embedding-demo.json (built by scripts/build-embedding-demo.mjs).
+const dataUrl = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/data/embedding-demo.json`;
+const topics = {
+	refunds: '#ef4444',
+	tracking: '#0ea5e9',
+	damage: '#f59e0b',
+	customs: '#a855f7',
+	address: '#10b981',
+	account: '#64748b',
+	policy: '#ec4899',
+};
+---
+
+<section class="emb not-content" data-emb={dataUrl} data-topics={JSON.stringify(topics)}>
+	<p class="emb__badge">🧭 Embedding playground: semantic vs keyword search</p>
+	<p class="emb__status">Loading 4,000 word vectors (about 600 KB)…</p>
+	<div class="emb__ui" hidden>
+		<label class="emb__q">
+			Search Acme's 24 help-center snippets
+			<input type="text" placeholder="Type a question, e.g. 'my money back'" />
+		</label>
+		<div class="emb__presets"></div>
+		<p class="emb__oov" aria-live="polite"></p>
+		<div class="emb__cols">
+			<div>
+				<p class="emb__colhead">🧠 Semantic (cosine similarity of embeddings)</p>
+				<ol class="emb__list" data-list="sem"></ol>
+			</div>
+			<div>
+				<p class="emb__colhead">🔤 Keyword (BM25)</p>
+				<ol class="emb__list" data-list="kw"></ol>
+			</div>
+		</div>
+		<details class="emb__mapwrap" open>
+			<summary>Map of the embedding space (2-D projection of 100 dimensions)</summary>
+			<svg class="emb__map" viewBox="-1.15 -1.15 2.3 2.3" role="img" aria-label="2-D projection of document embeddings"></svg>
+			<p class="emb__legend"></p>
+			<p class="emb__note">Outlined dots are the top 3 results. Squashing 100 dimensions into 2 distorts distances, so the star can look far from its true neighbours; the rankings above use all 100 dimensions.</p>
+		</details>
+		<details class="emb__cmp">
+			<summary>Compare two sentences</summary>
+			<div class="emb__cmpgrid">
+				<input type="text" data-cmp="a" value="refunds are allowed for used goods" />
+				<input type="text" data-cmp="b" value="refunds are not allowed for used goods" />
+			</div>
+			<p class="emb__cmpout"></p>
+		</details>
+	</div>
+	<p class="emb__note">
+		Uses public-domain GloVe word vectors averaged per sentence (with rare words weighted up and the common direction
+		removed). Modern embedding models are far better, but the geometry and the failure modes you see here are the same.
+	</p>
+</section>
+
+<script>
+	type Data = {
+		dim: number;
+		stopwords: string[];
+		corpus: { id: string; topic: string; text: string }[];
+		presets: string[];
+		center: number[];
+		pca: { components: number[][] };
+		vocab: string[];
+		scales: number[];
+		vectors: string;
+	};
+
+	const tokenize = (s: string) => s.toLowerCase().match(/[a-z0-9_]+/g) ?? [];
+	const normalize = (v: number[]) => {
+		const n = Math.hypot(...v) || 1;
+		return v.map((x) => x / n);
+	};
+	const dot = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i], 0);
+	const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+
+	function setup(box: HTMLElement, d: Data) {
+		const topics: Record<string, string> = JSON.parse(box.dataset.topics!);
+		const bytes = Int8Array.from(atob(d.vectors), (c) => (c.charCodeAt(0) << 24) >> 24);
+		const rank = new Map(d.vocab.map((w, i) => [w, i]));
+		const stop = new Set(d.stopwords);
+
+		// Must match rawEmbed() + centering in scripts/build-embedding-demo.mjs.
+		const embed = (text: string) => {
+			const words = tokenize(text).filter((w) => !stop.has(w));
+			const known = words.filter((w) => rank.has(w));
+			if (!known.length) return { vec: null, oov: words };
+			const out = new Array(d.dim).fill(0);
+			for (const w of known) {
+				const r = rank.get(w)!;
+				const weight = Math.log(2 + r / 20);
+				for (let i = 0; i < d.dim; i++) out[i] += weight * bytes[r * d.dim + i] * d.scales[r];
+			}
+			const raw = normalize(out);
+			return { vec: normalize(raw.map((x, i) => x - d.center[i])), oov: words.filter((w) => !rank.has(w)) };
+		};
+
+		const docs = d.corpus.map((doc) => ({ ...doc, vec: embed(doc.text).vec!, toks: tokenize(doc.text).filter((w) => !stop.has(w)) }));
+		const avgLen = docs.reduce((s, x) => s + x.toks.length, 0) / docs.length;
+		const bm25 = (query: string, doc: (typeof docs)[number]) =>
+			tokenize(query)
+				.filter((w) => !stop.has(w))
+				.reduce((score, w) => {
+					const f = doc.toks.filter((t) => t === w).length;
+					if (!f) return score;
+					const df = docs.filter((x) => x.toks.includes(w)).length;
+					const idf = Math.log(1 + (docs.length - df + 0.5) / (df + 0.5));
+					return score + (idf * f * 2.2) / (f + 1.2 * (0.25 + (0.75 * doc.toks.length) / avgLen));
+				}, 0);
+
+		const project = (v: number[]) => d.pca.components.map((c) => dot(v, c));
+		const pts = docs.map((doc) => project(doc.vec));
+		const maxAbs = Math.max(...pts.flat().map(Math.abs)) || 1;
+		const scale = (p: number[]) => p.map((x) => x / maxAbs);
+
+		// Static map: one dot per document, coloured by topic.
+		const svg = box.querySelector<SVGSVGElement>('.emb__map')!;
+		svg.innerHTML =
+			docs
+				.map((doc, i) => {
+					const [x, y] = scale(pts[i]);
+					return `<circle cx="${x}" cy="${-y}" r="0.045" fill="${topics[doc.topic]}" data-doc="${doc.id}"><title>${esc(doc.text)}</title></circle>`;
+				})
+				.join('') + '<g class="emb__query"></g>';
+		box.querySelector('.emb__legend')!.innerHTML = Object.entries(topics)
+			.map(([t, c]) => `<span><i style="background:${c}"></i>${t}</span>`)
+			.join('');
+
+		const input = box.querySelector<HTMLInputElement>('.emb__q input')!;
+		const oovEl = box.querySelector<HTMLElement>('.emb__oov')!;
+		const renderList = (key: string, rows: { doc: (typeof docs)[number]; score: number }[], max: number) => {
+			box.querySelector(`[data-list="${key}"]`)!.innerHTML = rows
+				.map(
+					({ doc, score }) =>
+						`<li><span class="emb__bar" style="width:${Math.max(0, (score / (max || 1)) * 100)}%;background:${topics[doc.topic]}"></span>` +
+						`<span class="emb__score">${score.toFixed(2)}</span> ${esc(doc.text)}</li>`,
+				)
+				.join('');
+		};
+
+		const run = () => {
+			const q = input.value.trim();
+			svg.querySelector('.emb__query')!.innerHTML = '';
+			box.querySelectorAll('.emb__map circle').forEach((c) => c.classList.remove('is-hit'));
+			if (!q) {
+				oovEl.textContent = '';
+				renderList('sem', [], 1);
+				renderList('kw', [], 1);
+				return;
+			}
+			const { vec, oov } = embed(q);
+			const kw = docs
+				.map((doc) => ({ doc, score: bm25(q, doc) }))
+				.sort((a, b) => b.score - a.score)
+				.slice(0, 5)
+				.filter((r) => r.score > 0);
+			renderList('kw', kw, kw[0]?.score ?? 1);
+			if (!kw.length) box.querySelector('[data-list="kw"]')!.innerHTML = '<li class="emb__empty">No document shares a word with the query.</li>';
+
+			if (!vec) {
+				oovEl.innerHTML = `⚠️ None of your words are in the model's vocabulary (<code>${esc(oov.join(', '))}</code>), so it cannot embed this query at all. Exact codes and IDs are a classic blind spot for embeddings.`;
+				box.querySelector('[data-list="sem"]')!.innerHTML = '<li class="emb__empty">No embedding: nothing to compare.</li>';
+				return;
+			}
+			oovEl.innerHTML = oov.length ? `Ignored (not in vocabulary): <code>${esc(oov.join(', '))}</code>` : '';
+			const sem = docs
+				.map((doc) => ({ doc, score: dot(vec, doc.vec) }))
+				.sort((a, b) => b.score - a.score)
+				.slice(0, 5);
+			renderList('sem', sem, sem[0].score);
+			for (const r of sem.slice(0, 3)) svg.querySelector(`[data-doc="${r.doc.id}"]`)?.classList.add('is-hit');
+			const [x, y] = scale(project(vec)).map((v) => Math.max(-1.1, Math.min(1.1, v)));
+			svg.querySelector('.emb__query')!.innerHTML = `<path d="M${x} ${-y - 0.09}L${x + 0.03} ${-y - 0.03}L${x + 0.09} ${-y}L${x + 0.03} ${-y + 0.03}L${x} ${-y + 0.09}L${x - 0.03} ${-y + 0.03}L${x - 0.09} ${-y}L${x - 0.03} ${-y - 0.03}Z" class="emb__star"><title>Your query</title></path>`;
+		};
+
+		const presets = box.querySelector<HTMLElement>('.emb__presets')!;
+		for (const p of d.presets) {
+			const b = document.createElement('button');
+			b.type = 'button';
+			b.textContent = p;
+			b.addEventListener('click', () => {
+				input.value = p;
+				run();
+			});
+			presets.append(b);
+		}
+		input.addEventListener('input', run);
+
+		const [a, b] = [...box.querySelectorAll<HTMLInputElement>('[data-cmp]')];
+		const cmpOut = box.querySelector<HTMLElement>('.emb__cmpout')!;
+		const compare = () => {
+			const ea = embed(a.value).vec;
+			const eb = embed(b.value).vec;
+			cmpOut.textContent =
+				ea && eb ? `Cosine similarity: ${dot(ea, eb).toFixed(3)} (1.0 = same direction)` : 'One of the sentences has no known words.';
+		};
+		a.addEventListener('input', compare);
+		b.addEventListener('input', compare);
+		compare();
+
+		box.querySelector<HTMLElement>('.emb__status')!.hidden = true;
+		box.querySelector<HTMLElement>('.emb__ui')!.hidden = false;
+		input.value = d.presets[0];
+		run();
+	}
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-emb]')) {
+		const load = () =>
+			fetch(box.dataset.emb!)
+				.then((r) => r.json())
+				.then((d: Data) => setup(box, d))
+				.catch(() => {
+					box.querySelector('.emb__status')!.textContent = 'Could not load the embedding data. Try reloading the page.';
+				});
+		// Only download the vectors when the playground scrolls into view.
+		const io = new IntersectionObserver((entries) => {
+			if (entries.some((e) => e.isIntersecting)) {
+				io.disconnect();
+				load();
+			}
+		});
+		io.observe(box);
+	}
+</script>

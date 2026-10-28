@@ -78,25 +78,21 @@ You build one product the whole way through, like a real FDE engagement. *Acme L
 8. [Prompts as code + your first eval](/foundations/prompts-as-code/): versioned templates, golden sets, CI gates
 
 #### Module 2 · AI-Native UX with the Vercel AI SDK *(weeks 4–5)*
-- Beyond chat: inline, ambient, batch and agentic interfaces
-- Streaming by hand first (fetch + `ReadableStream`), then with the **AI SDK** UI hooks: what the abstraction hides
-- **Pattern A:** React + AI SDK UI talking to a FastAPI backend · **Pattern B:** a full-TypeScript app (route handlers + AI SDK Core). When to choose each
-- Generative UI: tool calls rendered as React components (shipment cards, refund approvals)
-- Designing for wrong answers: citations, confidence cues, easy correction
-- Human-in-the-loop UI: approve, edit before sending, undo
-- Feedback capture that becomes eval data
-
-💥 Stop doesn't stop the bill (no end-to-end cancellation) · API keys in client bundles · proxy buffering · serverless timeouts on long agent runs · breaking changes between SDK major versions · users trusting fluent wrong answers
+1. [Beyond chat: pick the interface before the model](/ai-ux/interface-patterns/): inline, ambient, batch and agentic patterns; the seven states; the autonomy dial
+2. [Streaming UIs with the Vercel AI SDK](/ai-ux/ai-sdk/): `useChat`; **Pattern A** (React + FastAPI speaking the AI SDK protocol) vs **Pattern B** (full TypeScript)
+3. [Generative UI](/ai-ux/generative-ui/): tool calls rendered as typed React components, safely
+4. [Designing for wrong answers](/ai-ux/designing-for-wrong-answers/): verified citations, honest uncertainty, cheap correction
+5. [Human-in-the-loop approvals](/ai-ux/human-in-the-loop/): `toolApproval`, approval cards, idempotency, approval fatigue
+6. [Feedback that becomes eval data](/ai-ux/feedback-loops/): edit ratios, traces, the feedback flywheel, and the Module 2 lab
 
 ### Phase 2: Retrieval
 
 #### Module 3 · Embeddings & Vector Search from Scratch *(week 6)*
-- The geometry of meaning: embeddings as coordinates
-- Distance metrics: cosine, L2, and the dot-product trick on normalized vectors
-- Why B-trees can't index high-dimensional space; brute-force kNN vs approximate search
-- HNSW intuition: layered proximity graphs; the recall vs latency vs memory knobs
-- pgvector in practice; when to use a dedicated vector DB
-- 🧪 Build brute-force search, then compare it with HNSW on 1M vectors. **Measure** recall and latency yourself.
+1. [The geometry of meaning](/embeddings/geometry-of-meaning/): embeddings, semantic vs keyword search (live playground), choosing a model, the index contract
+2. [Distance metrics demystified](/embeddings/distance-metrics/): cosine, dot product, L2, and the normalization trick (draggable vectors)
+3. [Why vector search is hard at scale](/embeddings/brute-force-and-scale/): B-trees vs high dimensions, brute-force cost, the curse of dimensionality, memory maths and quantization
+4. [HNSW: approximate search that scales](/embeddings/hnsw/): layers, `M` / `ef_construction` / `ef_search`, recall@k, a benchmark you run yourself
+5. [pgvector in production](/embeddings/pgvector/): schema, the filtering pitfall, iterative scans, multitenancy, blue/green re-indexing, and the Module 3 lab
 
 #### Module 4 · Production RAG *(weeks 7–9)*
 - Do you even need RAG? Long context + caching vs RAG vs search vs fine-tuning
@@ -228,5 +224,7 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 |---|---|
 | Module 0 · Start Here | ✅ Ready |
 | Module 1 · LLM Foundations | ✅ Ready |
+| Module 2 · AI-Native UX | ✅ Ready |
+| Module 3 · Embeddings & Vector Search | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
-| Modules 2–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
+| Modules 4–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
