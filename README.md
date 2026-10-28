@@ -1,10 +1,14 @@
 # AI in Production
 
-An interactive course (built with Astro + Starlight) for software engineers moving into
+An interactive course (Astro + Starlight) for software engineers moving into
 **Applied AI Engineer**, **GenAI Engineer**, and **Forward Deployed Engineer** roles.
 
-Status: **curriculum draft, under review**. See `src/content/docs/curriculum.md`.
-Lessons have not been written yet; `drafts/` holds early lesson drafts that are not published.
+- Curriculum: `src/content/docs/curriculum.md`
+- Lessons: `src/content/docs/<module>/*.mdx`
+- Interactive components (quizzes, incident drills, design drills, failure cards,
+  cost calculator, context budget, agent stepper, Mermaid diagrams): `src/components/`
+
+Progress and quiz scores are stored in the reader's browser (`localStorage`).
 
 ## Run locally
 
@@ -12,3 +16,5 @@ Lessons have not been written yet; `drafts/` holds early lesson drafts that are 
 npm install
 npm run dev
 ```
+
+Requires Node 22.12+.

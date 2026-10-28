@@ -1,0 +1,211 @@
+---
+title: Structured outputs
+description: From "please return JSON" to schema-guaranteed outputs. How constrained decoding works, Pydantic integration, and the semantic validation that still matters.
+sidebar:
+  order: 6
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="HTTP 500s from a markdown fence" severity="SEV2">
+Relay's triage endpoint asked the model to "Return JSON with category and priority." It worked in testing. In production, 2% of responses were wrapped in a markdown code fence, 0.5% had a trailing comma, and a few said "Sure! Here's the JSON:" first. Each one was a `JSONDecodeError` and an HTTP 500, and the ticket silently never got triaged.
+</Incident>
+
+Most production LLM work isn't chat. It's turning messy text into **data your code can use**: categories, extracted fields, decisions, tool arguments. That means the output has to be machine-readable, every time.
+
+## The ladder of reliability
+
+| Approach | What it guarantees | Verdict |
+|---|---|---|
+| "Please return JSON" in the prompt | Nothing | ❌ Demo only |
+| Prompt + regex/`json.loads` cleanup | Fewer crashes | ❌ Whack-a-mole |
+| **JSON mode** | Syntactically valid JSON | ⚠️ Valid JSON, but the *wrong keys* or types are still possible |
+| **Schema-constrained output** (structured outputs / strict tools) | Output matches your JSON Schema | ✅ Production default |
+| Schema + **semantic validation** | Valid *and* sensible values | ✅✅ What you actually want |
+
+## How constrained decoding works
+
+Remember that the model picks each next token from a probability distribution. **Constrained decoding** applies a filter at every step: the schema is compiled into a grammar (a state machine), and any token that would break the grammar gets its probability set to zero before sampling.
+
+<Diagram
+	caption="At each step the grammar allows only tokens that keep the output valid. Invalid JSON becomes impossible, not just unlikely."
+	code={`flowchart LR
+    S["Schema<br/>{category: enum, priority: 1-4}"] --> G["Compile to grammar /<br/>state machine"]
+    G --> M{"Each decoding step"}
+    L["Model's next-token<br/>probabilities"] --> M
+    M --> X["Mask tokens that would break the grammar<br/>(probability = 0, logit = -inf)"]
+    X --> T["Sample from the allowed tokens only"]
+    T --> M`}
+/>
+
+Providers offer this natively ("structured outputs", strict tool schemas), and open-source serving stacks (vLLM, plus libraries like Outlines) do the same for self-hosted models.
+
+**What it can't do:** guarantee the *values* are right. `{"category": "refund", "priority": 1}` is perfectly valid and perfectly wrong if the ticket is about tracking.
+
+## In Python with Pydantic
+
+```python
+# app/triage.py
+from enum import Enum
+
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.Anthropic(timeout=30.0)
+
+
+class Category(str, Enum):
+    tracking = "tracking"
+    refund = "refund"
+    damage = "damage"
+    address_change = "address_change"
+    other = "other"  # always give the model an honest escape hatch
+
+
+class Triage(BaseModel):
+    category: Category
+    priority: int = Field(ge=1, le=4, description="1 = urgent (money/safety at risk), 4 = low")
+    shipment_ids: list[str] = Field(description="Shipment IDs exactly as written in the ticket, e.g. ACM-2025-000183")
+    customer_sentiment: str = Field(description="One of: calm, frustrated, angry")
+    summary: str = Field(description="One sentence, max 25 words")
+
+
+def triage(ticket: str) -> Triage:
+    response = client.messages.parse(
+        model="claude-opus-5-5",
+        max_tokens=2000,
+        system="You triage support tickets for Acme Logistics. Use only information in the ticket.",
+        messages=[{"role": "user", "content": f"<ticket>\n{ticket}\n</ticket>"}],
+        output_format=Triage,
+    )
+    return response.parsed_output  # a validated Triage instance
+```
+
+Schema design tips that measurably improve quality:
+
+- **Descriptions are instructions.** The model reads field descriptions, so be specific ("exactly as written in the ticket").
+- **Enums over free text** wherever your code branches on the value.
+- **Always include an escape hatch** (`other`, `unknown`, nullable fields). Without one, the model is *forced* to pick a wrong option.
+- **Keep it flat and small.** Deeply nested, 40-field schemas degrade accuracy. Split into steps if needed.
+
+## Semantic validation: the layer schemas can't give you
+
+Valid shape doesn't mean valid meaning. Add checks that use **your** knowledge:
+
+```python
+import re
+
+SHIPMENT_ID = re.compile(r"ACM-\d{4}-\d{6}")
+
+
+def validate_triage(ticket: str, result: Triage) -> list[str]:
+    problems = []
+    for sid in result.shipment_ids:
+        if not SHIPMENT_ID.fullmatch(sid):
+            problems.append(f"malformed shipment id: {sid}")
+        elif sid not in ticket:
+            problems.append(f"shipment id not in ticket (hallucinated?): {sid}")
+    if result.category == "refund" and result.priority == 4:
+        problems.append("refund requests are never lowest priority")
+    return problems
+```
+
+When validation fails, you have options, in order of preference:
+
+1. **Repair loop:** send the output back with the specific problems ("`ACM-2025-18` is not in the ticket. Only use IDs that appear verbatim.") and ask again. **Cap it at 1–2 attempts.**
+2. **Deterministic fix:** drop the invalid field, recompute something in code.
+3. **Escalate:** route to a human queue with the problems attached.
+
+Track the **validation failure rate** as a metric. If it rises, something changed: the inputs, the model, or the prompt.
+
+<FailureCard
+	title="The confident enum"
+	symptom="Every 'where's my invoice?' ticket gets categorized as `tracking`, and the billing team never sees them."
+	cause="The schema had no category for billing and **no `other` option**, so the model had to pick the closest wrong answer, every time, with full confidence."
+	detect="Error analysis: review a sample per category. A category absorbing unrelated tickets is a schema smell."
+	fix="Add an `other` escape hatch, track the `other` rate, and add new categories when `other` reveals a real cluster."
+/>
+
+<FailureCard
+	title="Hallucinated IDs that pass validation"
+	symptom="Some refunds are issued against the wrong shipment. The extracted IDs were well-formed."
+	cause="The model 'completed' a partial ID from the ticket (`ACM-183` became `ACM-2025-000183`), which happened to belong to another customer. Format checks passed."
+	detect="A semantic check: the extracted ID must appear verbatim in the source **and** belong to the ticket's customer (database lookup)."
+	fix="Verify extracted identifiers against the source text and your systems of record **before** any action. Never let an extracted value trigger a side effect unchecked."
+/>
+
+<ThinkFirst question="Acme wants Relay to extract 35 fields from scanned customs declarations (PDFs), feeding a system that files with customs authorities. One wrong value can mean a fine. Design the extraction pipeline: what are the steps, and where do humans come in?">
+
+A strong design layers guarantees and puts humans where the risk is:
+
+1. **Ingestion:** OCR/PDF parsing (or send the PDF directly to a vision-capable model), with page references kept for each field.
+2. **Split the schema:** 3–4 smaller extraction calls (parties, goods lines, values, codes) instead of one 35-field monster. Each uses schema-constrained output.
+3. **Evidence per field:** ask for a `source_quote` (and page) next to each value, then **verify in code** that the quote exists in the document.
+4. **Deterministic validation:** HS code format and existence in the official code list, country codes, sums of line values equal to the declared total (code computes it, not the model), and date sanity.
+5. **Confidence routing:** any failed check, or a missing quote, sends that document to **human review** with the problems highlighted. Clean ones go to a lighter spot-check sample.
+6. **Evals:** a labeled set of real declarations with field-level accuracy, tracked per field. Customs codes will be the weakest.
+
+The core idea: **the model proposes, code verifies, humans approve where the stakes are high.**
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** implement `triage()` and run it on your 30 golden tickets. Count validation failures by type.
+- **Stretch:** add the repair loop (max 1 retry with the specific errors). Measure how many failures it fixes, and how much extra cost it adds.
+- **Boss level:** build an **invoice extractor** for 10 real-looking PDF invoices (generate them, or find public samples): line items, totals, dates, vendor. The model extracts; code computes totals and cross-checks; disagreements go to a "review" list. Report field-level accuracy in a table.
+
+</Practice>
+
+<Quiz
+	id="m1-structured"
+	questions={[
+		{
+			q: 'JSON mode is on. Which failure is still possible?',
+			options: ['Invalid JSON syntax', 'Valid JSON with missing or wrong keys and types', 'Markdown fences around the JSON', 'Trailing commas'],
+			answer: 1,
+			why: 'JSON mode guarantees syntax only. **Schema-constrained** output guarantees structure. And neither guarantees correct values.',
+		},
+		{
+			q: 'How does constrained decoding make invalid output impossible?',
+			options: [
+				'It retries until the output parses',
+				'It removes tokens that would violate the grammar from consideration at each decoding step',
+				'It post-processes the text with regex',
+				'It uses a bigger model',
+			],
+			answer: 1,
+			why: 'The schema is compiled to a grammar; disallowed tokens are masked (probability zero) before sampling. Validity is enforced *during* generation.',
+		},
+		{
+			q: 'Why include an `other` option in a category enum?',
+			options: [
+				'It is required by JSON Schema',
+				'Without an escape hatch, the model is forced to pick a wrong category with full confidence',
+				'It makes outputs shorter',
+				'It improves latency',
+			],
+			answer: 1,
+			why: 'Forced choices hide uncertainty. `other` turns silent misclassification into a measurable signal, and its rate tells you when your taxonomy needs updating.',
+		},
+		{
+			q: 'An extracted shipment ID is well-formed. Is it safe to issue a refund against it?',
+			options: [
+				'Yes, the format is valid',
+				'Only after verifying it appears in the source and belongs to this customer in your system of record',
+				'Yes, if the schema was strict',
+				'Only if the model says it is confident',
+			],
+			answer: 1,
+			why: 'Well-formed doesn\'t mean true. Before any side effect, verify extracted values against the **source text and your systems of record**.',
+		},
+	]}
+/>
+
+<LessonComplete id="foundations/structured-outputs" />

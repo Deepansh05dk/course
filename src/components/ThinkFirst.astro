@@ -1,0 +1,41 @@
+---
+import { inline } from './fmt';
+
+interface Props {
+	question: string;
+	title?: string;
+}
+
+const { question, title = 'Design drill: you are the architect' } = Astro.props;
+---
+
+<section class="think not-content" data-think>
+	<p class="think__badge">🏗️ {title}</p>
+	<p class="think__q" set:html={inline(question)} />
+	<textarea
+		class="think__input"
+		rows="4"
+		placeholder="Commit to an answer first. Write your design, trade-offs, and what could fail..."
+	></textarea>
+	<button type="button" class="think__reveal" disabled>Write something to unlock the expert answer</button>
+	<div class="think__answer sl-markdown-content" hidden>
+		<slot />
+	</div>
+</section>
+
+<script>
+	for (const box of document.querySelectorAll<HTMLElement>('[data-think]')) {
+		const input = box.querySelector<HTMLTextAreaElement>('.think__input')!;
+		const btn = box.querySelector<HTMLButtonElement>('.think__reveal')!;
+		const answer = box.querySelector<HTMLElement>('.think__answer')!;
+		input.addEventListener('input', () => {
+			const ready = input.value.trim().length >= 15;
+			btn.disabled = !ready;
+			btn.textContent = ready ? 'Reveal the expert answer' : 'Write something to unlock the expert answer';
+		});
+		btn.addEventListener('click', () => {
+			answer.hidden = false;
+			btn.hidden = true;
+		});
+	}
+</script>

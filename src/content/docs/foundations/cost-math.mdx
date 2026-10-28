@@ -1,0 +1,180 @@
+---
+title: Cost math before code
+description: Estimate what an AI feature will cost before you build it, and find the hidden multipliers that blow up real bills.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import CostCalculator from '../../../components/CostCalculator.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The $38,000 month" severity="SEV2">
+A startup launched an "AI research assistant" with a $3,000/month estimate. The first invoice was $38,000. Causes, in order of impact: (1) the agent averaged 14 tool-call turns per task, re-sending the growing history every turn; (2) a bug retried failed requests forever; (3) one customer scripted 50,000 requests over a weekend. None of these were in the spreadsheet.
+</Incident>
+
+FDEs get asked "what will this cost?" in the **first meeting**. Applied AI Engineers get asked "why did this cost that?" after launch. Both questions come down to the same arithmetic.
+
+## The formula
+
+```text
+cost per request = input_tokens  × input_price
+                 + cached_tokens × cache_read_price      (much cheaper than input)
+                 + output_tokens × output_price          (thinking tokens count here)
+
+monthly cost     = cost per request × requests per month × multipliers
+```
+
+Two facts that surprise people:
+
+1. **Output tokens cost about 5× as much as input tokens** on most models, so a verbose model is an expensive model.
+2. **Price differences between tiers are huge**: often 20–40× between a frontier model and a small one. Model choice is your biggest cost lever, *as long as quality holds* (next lesson).
+
+## Try it
+
+Default values: 5,000 requests a day, a 3K-token prompt, a 400-token answer. Switch tiers, then raise the cached share to see what prompt caching does.
+
+<CostCalculator />
+
+## The hidden multipliers
+
+Spreadsheet estimates fail because they model **one clean request**. Production has multipliers:
+
+| Multiplier | Typical size | Why |
+|---|---|---|
+| **Agent turns** | 3–20× | Each tool-call turn re-sends the whole conversation, so input grows every turn |
+| **Retries** | 1.05–2× | Timeouts, 429s and validation repair loops repeat full requests |
+| **Long tail inputs** | 2–5× on p95 | Your example was 1 page; real users paste 40 |
+| **Thinking tokens** | 1–10× output | Reasoning is billed as output |
+| **Evals and tests** | +5–30% | CI runs your eval set on every PR |
+| **Abuse and bugs** | Unbounded | Scripts, loops, prompt-injection-driven tool spam |
+
+:::caution[An agent's cost grows faster than its turn count]
+If each turn adds about 2K tokens and the agent takes 10 turns, the inputs are 2K + 4K + … + 20K = **110K input tokens**, not 20K. History compaction, caching, and turn limits exist because of this.
+:::
+
+## Budget controls you should have from day 1
+
+- **Log `usage` on every call**, and aggregate cost per feature, per customer, and per day.
+- **Per-request caps:** `max_tokens`, a maximum number of agent turns, and a maximum retry count.
+- **Per-user and per-tenant quotas** (requests and dollars per day).
+- **Provider spend alerts and hard limits.**
+- **An anomaly alert:** "today's cost is more than 2× the 7-day average."
+
+<IncidentDrill
+	id="bill-tripled"
+	title="The bill tripled overnight"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Monday 09:10. The spend alert fires: yesterday cost $4,900 against a usual $1,500. Traffic (requests/day) is flat. Where do you look first?',
+			choices: [
+				{ label: 'Average tokens per request and requests per user, broken down by feature, over the last 7 days', next: 's2', cost: 0, note: 'Flat traffic plus higher cost means something per request changed, or a few users changed.' },
+				{ label: 'Switch everything to the cheapest model right away', next: 'end_bad', cost: 60, note: 'Quality drops for every customer, and you still don\'t know the cause.' },
+				{ label: 'Email the provider asking for a billing error refund', next: 's1b', cost: 20, note: 'It\'s almost never a billing error.' },
+			],
+		},
+		s1b: {
+			text: 'The provider confirms usage is real. Still at $200/hour. Next?',
+			choices: [{ label: 'Break down tokens per request by feature', next: 's2', cost: 0 }],
+		},
+		s2: {
+			text: 'Input tokens per request for "ticket triage" went from 3K to 9K on Sunday. Nothing else changed. What do you check?',
+			choices: [
+				{ label: 'Deploys and prompt changes on Sunday', next: 's3', cost: 0, note: 'A Sunday deploy added 12 few-shot examples to the system prompt, adding about 6K tokens to every request.' },
+				{ label: 'Whether customers started writing longer tickets', next: 's2b', cost: 15, note: 'Ticket length is unchanged.' },
+			],
+		},
+		s2b: { text: 'Ticket length is flat. What else changed?', choices: [{ label: 'Check deploys and prompt changes', next: 's3', cost: 0 }] },
+		s3: {
+			text: 'Found it: a prompt change added 6K tokens of static examples. Accuracy improved by 2 points. What\'s the best fix?',
+			choices: [
+				{ label: 'Revert the change entirely', next: 'end_ok', cost: 0, note: 'Cost returns to normal, but you lose the 2-point accuracy gain.' },
+				{ label: 'Keep the examples, but enable prompt caching on the stable prefix and select only the 2 most relevant examples per ticket', next: 'end_good', cost: 0, note: 'You keep most of the gain at a fraction of the cost.' },
+			],
+		},
+		end_good: { text: 'Root cause found from data, accuracy kept, cost fixed with caching and dynamic examples. Add a CI check that flags prompt changes that increase tokens by more than 20%.', end: 'good' },
+		end_ok: { text: 'The cost is fixed, but a quality gain was thrown away. Cost and quality should be traded deliberately, not by reflex.', end: 'ok' },
+		end_bad: { text: 'You acted before diagnosing, and paid for it in quality.', end: 'bad' },
+	}}
+/>
+
+<FailureCard
+	title="The infinite retry"
+	symptom="Cost per hour climbs steadily during a provider incident, even though few requests succeed."
+	cause="The retry wrapper retries on **every** error with no cap and no backoff. During the incident, each user request turned into dozens of full-price attempts (and some 'failed' attempts were actually timeouts on requests the provider completed and billed)."
+	detect="Track attempts per request and the retry rate as metrics; alert when the retry rate exceeds a few percent."
+	fix="Retry only retryable errors (429, 5xx, connection errors), with exponential backoff and jitter, a max of 2–3 attempts, and a **retry budget** (e.g. retries ≤ 10% of traffic). Lesson 4 builds this."
+/>
+
+<ThinkFirst question="Estimate Relay's monthly cost for ticket triage: 9,000 tickets a week, a 2,500-token system prompt + about 600 tokens per ticket, and a 300-token output. Pick a model tier from the calculator. Then name the two biggest risks to your estimate.">
+
+**Rough maths** (about 39K tickets/month, 3.1K input and 300 output tokens each):
+
+- Frontier tier ($4/$20 per M): input 3.1K × $4/M ≈ $0.0124, output 300 × $20/M = $0.006, so about **$0.018 per ticket and about $720/month**.
+- Caching the 2.5K-token system prompt removes most of the input cost: about **$0.009/ticket, $350/month**.
+- Small tier ($0.10/$0.50): about $0.0005/ticket, roughly **$20/month**, *if it passes your eval*.
+
+**The biggest risks:**
+
+1. **Thinking tokens and effort.** Reasoning can add hundreds or thousands of output tokens. Measure real `usage.output_tokens`.
+2. **The long tail.** Some tickets are long email threads (p95 might be 5× the average), and retries and repair loops add more.
+
+The point of the exercise: even at the frontier tier, this feature is cheap relative to 60 support agents' salaries. **Cost rarely kills a good triage feature; quality does.** Agent loops are where cost becomes dangerous.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** extend your `app/llm.py` (from Module 0) to compute and log cost per call using a price table in config.
+- **Stretch:** write `scripts/cost_report.py` that reads `logs/calls.jsonl` and prints cost by day, by feature, and the p50/p95/max tokens per request.
+- **Boss level:** build a **budget guard**: a per-user daily dollar limit stored in Redis or SQLite, checked before each call, returning HTTP 429 with a friendly message when exceeded. Write a test that simulates a script hammering the endpoint.
+
+</Practice>
+
+<Quiz
+	id="m1-cost"
+	questions={[
+		{
+			q: 'An agent takes 10 turns, and each turn adds about 2K tokens to the history. Roughly how many input tokens does the whole task use?',
+			options: ['20K', 'About 110K', '2K', '200K'],
+			answer: 1,
+			why: 'Each turn re-sends everything so far: 2K + 4K + ... + 20K ≈ 110K. Agent costs grow roughly with the **square** of the turn count unless you compact or cache.',
+		},
+		{
+			q: 'Which is usually the single biggest cost lever, as long as quality holds?',
+			options: ['Shorter variable names in prompts', 'Choice of model tier', 'Using HTTP keep-alive', 'Lowercase text'],
+			answer: 1,
+			why: 'Tier price differences are often 20–40×. But you only get to take that lever after an eval shows the cheaper model is good enough.',
+		},
+		{
+			q: 'Traffic is flat but cost tripled. What is the most likely class of cause?',
+			options: [
+				'More users',
+				'Tokens per request changed (prompt change, history growth, retries) or a few users/scripts changed behaviour',
+				'Provider price increase overnight',
+				'Network latency',
+			],
+			answer: 1,
+			why: 'Cost = requests × tokens × price. If requests are flat, look at **tokens per request** and **per-user distribution**, and correlate with deploys.',
+		},
+		{
+			q: 'Why do output tokens matter so much for cost?',
+			options: [
+				'They are usually priced several times higher than input tokens, and thinking tokens count as output',
+				'They are cached automatically',
+				'They are free on most models',
+				'They don\'t matter, only input does',
+			],
+			answer: 0,
+			why: 'Output is commonly about 5× the price of input, and reasoning tokens are billed as output. Verbosity is a cost multiplier.',
+		},
+	]}
+/>
+
+<LessonComplete id="foundations/cost-math" />

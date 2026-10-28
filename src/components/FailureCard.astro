@@ -1,0 +1,37 @@
+---
+import { inline } from './fmt';
+
+interface Props {
+	title: string;
+	symptom: string;
+	cause: string;
+	detect: string;
+	fix: string;
+}
+
+const { title, symptom, cause, detect, fix } = Astro.props;
+---
+
+<article class="fail not-content" data-fail>
+	<p class="fail__title">💥 {title}</p>
+	<p><strong>Symptom:</strong> <span set:html={inline(symptom)} /></p>
+	<button type="button" class="fail__reveal">Diagnose it first, then reveal</button>
+	<dl class="fail__body" hidden>
+		<dt>Root cause</dt>
+		<dd set:html={inline(cause)} />
+		<dt>How you'd detect it</dt>
+		<dd set:html={inline(detect)} />
+		<dt>Mitigation</dt>
+		<dd set:html={inline(fix)} />
+	</dl>
+</article>
+
+<script>
+	for (const card of document.querySelectorAll<HTMLElement>('[data-fail]')) {
+		const btn = card.querySelector<HTMLButtonElement>('.fail__reveal')!;
+		btn.addEventListener('click', () => {
+			card.querySelector<HTMLElement>('.fail__body')!.hidden = false;
+			btn.hidden = true;
+		});
+	}
+</script>

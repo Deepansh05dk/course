@@ -1,0 +1,98 @@
+---
+interface Choice {
+	label: string;
+	next: string;
+	note?: string;
+	/** Minutes of user impact this choice adds. */
+	cost?: number;
+}
+interface Node {
+	text: string;
+	choices?: Choice[];
+	end?: 'good' | 'ok' | 'bad';
+}
+interface Props {
+	id: string;
+	title: string;
+	start: string;
+	nodes: Record<string, Node>;
+}
+
+const { id, title, start, nodes } = Astro.props;
+---
+
+<section class="drill not-content" data-drill={id} data-start={start} data-nodes={JSON.stringify(nodes)}>
+	<header class="drill__head">
+		<span class="drill__badge">🔥 Incident drill</span>
+		<strong>{title}</strong>
+		<span class="drill__impact" aria-live="polite">User impact: 0 min</span>
+	</header>
+	<ol class="drill__log"></ol>
+	<div class="drill__stage">
+		<p class="drill__text"></p>
+		<div class="drill__choices"></div>
+	</div>
+	<button type="button" class="drill__restart" hidden>Run the drill again</button>
+</section>
+
+<script>
+	type Choice = { label: string; next: string; note?: string; cost?: number };
+	type Node = { text: string; choices?: Choice[]; end?: 'good' | 'ok' | 'bad' };
+
+	const endings = {
+		good: '🟢 Incident resolved well.',
+		ok: '🟡 Resolved, with avoidable damage.',
+		bad: '🔴 This went badly. Replay and try another path.',
+	};
+
+	for (const drill of document.querySelectorAll<HTMLElement>('[data-drill]')) {
+		const nodes: Record<string, Node> = JSON.parse(drill.dataset.nodes!);
+		const log = drill.querySelector<HTMLOListElement>('.drill__log')!;
+		const text = drill.querySelector<HTMLElement>('.drill__text')!;
+		const choices = drill.querySelector<HTMLElement>('.drill__choices')!;
+		const impact = drill.querySelector<HTMLElement>('.drill__impact')!;
+		const restart = drill.querySelector<HTMLButtonElement>('.drill__restart')!;
+		let minutes = 0;
+
+		const show = (key: string) => {
+			const node = nodes[key];
+			text.textContent = node.text;
+			choices.replaceChildren();
+			if (node.end) {
+				const p = document.createElement('p');
+				p.className = `drill__end drill__end--${node.end}`;
+				p.textContent = `${endings[node.end]} Total user impact: ${minutes} min.`;
+				choices.append(p);
+				restart.hidden = false;
+				return;
+			}
+			for (const choice of node.choices ?? []) {
+				const btn = document.createElement('button');
+				btn.type = 'button';
+				btn.className = 'drill__choice';
+				btn.textContent = choice.label;
+				btn.addEventListener('click', () => {
+					minutes += choice.cost ?? 0;
+					impact.textContent = `User impact: ${minutes} min`;
+					const li = document.createElement('li');
+					li.innerHTML = '<strong></strong><span></span>';
+					li.querySelector('strong')!.textContent = `You: ${choice.label}`;
+					li.querySelector('span')!.textContent = choice.note ? ` → ${choice.note}` : '';
+					log.append(li);
+					show(choice.next);
+				});
+				choices.append(btn);
+			}
+		};
+
+		restart.addEventListener('click', () => {
+			minutes = 0;
+			impact.textContent = 'User impact: 0 min';
+			log.replaceChildren();
+			restart.hidden = true;
+			show(drill.dataset.start!);
+		});
+
+		show(drill.dataset.start!);
+	}
+</script>

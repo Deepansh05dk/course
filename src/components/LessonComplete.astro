@@ -1,0 +1,49 @@
+---
+interface Props {
+	id: string;
+}
+
+const { id } = Astro.props;
+---
+
+<div class="done not-content" data-done={id}>
+	<button type="button" class="done__btn">Mark lesson complete</button>
+	<span class="done__count"></span>
+</div>
+
+<script>
+	const KEY = 'course:completed';
+	const read = (): string[] => {
+		try {
+			return JSON.parse(localStorage.getItem(KEY) ?? '[]');
+		} catch {
+			return [];
+		}
+	};
+	const write = (ids: string[]) => {
+		try {
+			localStorage.setItem(KEY, JSON.stringify(ids));
+		} catch {
+			/* storage unavailable: progress isn't remembered */
+		}
+	};
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-done]')) {
+		const id = box.dataset.done!;
+		const btn = box.querySelector<HTMLButtonElement>('.done__btn')!;
+		const count = box.querySelector<HTMLElement>('.done__count')!;
+		const render = () => {
+			const ids = read();
+			const done = ids.includes(id);
+			btn.textContent = done ? '✅ Completed (click to undo)' : 'Mark lesson complete';
+			box.dataset.state = done ? 'done' : '';
+			count.textContent = `${ids.length} lesson${ids.length === 1 ? '' : 's'} completed so far`;
+		};
+		btn.addEventListener('click', () => {
+			const ids = read();
+			write(ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]);
+			render();
+		});
+		render();
+	}
+</script>

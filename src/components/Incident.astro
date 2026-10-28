@@ -1,0 +1,17 @@
+---
+interface Props {
+	title: string;
+	severity?: 'SEV1' | 'SEV2' | 'SEV3';
+}
+
+const { title, severity = 'SEV2' } = Astro.props;
+---
+
+<aside class="incident not-content">
+	<p class="incident__head">
+		<span class="incident__sev">{severity}</span> 🚨 <strong>{title}</strong>
+	</p>
+	<div class="incident__body">
+		<slot />
+	</div>
+</aside>

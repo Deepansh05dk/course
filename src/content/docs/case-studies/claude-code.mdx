@@ -1,0 +1,392 @@
+---
+title: "Case study: Claude Code architecture"
+description: A full system-design breakdown of an agentic coding tool. The agent loop, tools, context engineering without a vector index, compaction, subagents, permissions, hooks, MCP and skills, with diagrams for every layer.
+sidebar:
+  order: 1
+  badge:
+    text: Hard
+    variant: danger
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+Claude Code is Anthropic's agentic coding tool. You give it a goal ("fix the failing auth test", "add pagination to this API") and it explores the codebase, edits files, runs commands, checks its own work, and iterates until done. It runs in the terminal, IDEs, a desktop app, the web (in cloud containers), and as a library (the Claude Agent SDK).
+
+**Why study it?** It's one of the most widely used production agent harnesses, and nearly every pattern in this course shows up in it: tool design, context engineering, long-horizon memory, safety controls, extensibility, and cost management. Once you understand it, you can design almost any agent.
+
+:::note[About this breakdown]
+This is a system-design analysis based on public documentation and observable behaviour, simplified for learning. Internal implementation details may differ. The goal is to understand the **design decisions and trade-offs**, which are what you'll reuse.
+:::
+
+## 1. The design problem
+
+Before looking at the solution, define the problem the way you would in a system-design interview.
+
+**Functional requirements**
+- Understand codebases from 10 files to 10 million lines, in any language, with no setup.
+- Take real actions: read, write and edit files, run shell commands, tests, git.
+- Work on multi-step tasks that may take hours and far exceed one context window.
+- Let teams extend it with their own tools, conventions and workflows.
+
+**Non-functional requirements**
+- **Safety:** never destroy work or leak secrets; the human stays in control.
+- **Trust:** the user can see what it's doing and why.
+- **Latency:** feel responsive (streaming, fast tool calls).
+- **Cost:** a long session shouldn't be prohibitively expensive.
+- **Portability:** the same agent works in a terminal, an IDE, CI, or the cloud.
+
+<ThinkFirst question="Before reading on: sketch the main components you would build for this system. In particular, how would the agent find relevant code in a 5-million-line repository it has never seen?">
+
+Most people's first instinct is **"index the repo into a vector database and do RAG over code"**. It's a reasonable answer, and it's *not* what Claude Code primarily does. Keep your sketch, and compare it with sections 2 and 4. The interesting part of this case study is *why* a different approach was chosen.
+
+</ThinkFirst>
+
+## 2. The big picture
+
+<Diagram
+	caption="High-level architecture. One harness (the loop plus context, tools, permissions and extensions) is shared by every surface."
+	code={`flowchart TB
+    subgraph Surfaces
+        T["Terminal TUI"]
+        I["IDE extensions"]
+        D["Desktop app"]
+        W["Web / cloud sessions"]
+        S["Agent SDK + headless mode<br/>(CI, scripts, your products)"]
+    end
+    subgraph Harness["Agent harness"]
+        L["Agent loop<br/>stream, call tools, repeat"]
+        C["Context manager<br/>system prompt, memory files,<br/>compaction"]
+        P["Permission engine<br/>modes, allow/deny rules"]
+        H["Hooks runner<br/>deterministic scripts at lifecycle events"]
+        X["Tool executor"]
+        SS[("Session store<br/>transcripts, checkpoints")]
+    end
+    subgraph Tools["Tools"]
+        B["Built-in: Read, Edit, Write, Glob, Grep,<br/>Bash, WebFetch, WebSearch, Todo"]
+        SA["Subagents<br/>isolated context"]
+        MCP["MCP servers<br/>GitHub, DBs, internal APIs"]
+        SK["Skills<br/>packaged instructions and scripts"]
+    end
+    ENV["Environment<br/>filesystem, shell, git, optional sandbox"]
+    API["Model API<br/>streaming, tool use, prompt caching"]
+    T --> L
+    I --> L
+    D --> L
+    W --> L
+    S --> L
+    L <--> API
+    L --> C
+    L --> P
+    P --> H
+    H --> X
+    X --> B
+    X --> SA
+    X --> MCP
+    X --> SK
+    B --> ENV
+    L --> SS`}
+/>
+
+The central idea: **the model decides, the harness controls**. The model chooses which tool to call next; the harness decides what the model sees (context), whether a tool call may run (permissions and hooks), and what happens with the result.
+
+## 3. The agent loop
+
+At its core is the same loop you'll build in Module 6, just very well engineered:
+
+<Diagram
+	caption="The core loop: gather context, act, verify, repeat. The model stops calling tools when it judges the task complete, or the harness stops it."
+	code={`sequenceDiagram
+    autonumber
+    participant U as User
+    participant H as Harness
+    participant M as Model
+    participant T as Tools / Environment
+    U->>H: "Fix the failing test in auth"
+    H->>M: system + memory + tools + history + request
+    M-->>H: thinking, then tool_use Bash "run tests"
+    H->>H: permission check + PreToolUse hooks
+    H->>T: run pytest
+    T-->>H: 1 failed: test_token_expiry
+    H->>M: tool_result (output trimmed if huge)
+    M-->>H: tool_use Grep "def validate_token"
+    H->>T: grep
+    T-->>H: auth/tokens.py:42
+    H->>M: tool_result
+    M-->>H: tool_use Read auth/tokens.py
+    M-->>H: tool_use Edit (exact string replace)
+    H->>U: ask permission (or auto-approve per mode)
+    U-->>H: approve
+    H->>T: apply edit, PostToolUse hooks (e.g. formatter)
+    M-->>H: tool_use Bash "run tests" (verify)
+    T-->>H: all passed
+    M-->>H: final text: summary of the change
+    H-->>U: streamed answer`}
+/>
+
+Step through a real-looking trace and notice how much of the "intelligence" is **verification**:
+
+<AgentStepper
+	title="Trace: 'the date filter on /orders returns nothing'"
+	steps={[
+		{ kind: 'user', title: 'User request', body: 'The date filter on /orders returns nothing since yesterday. Fix it.' },
+		{ kind: 'harness', title: 'Harness assembles context', body: 'System prompt + tool definitions (stable, cached) + CLAUDE.md ("run tests with `make test`; never edit migrations") + git status snapshot + the request.' },
+		{ kind: 'model', title: 'Model plans', body: 'Thinks: "Something changed yesterday. Check recent commits and the orders endpoint."' },
+		{ kind: 'tool_call', title: 'Bash: git log --since=yesterday --stat', body: 'Read-only command. Allowed by the user\'s allow rules, so no prompt.' },
+		{ kind: 'tool_result', title: 'Result', body: 'One commit touched `api/orders/filters.py`: "refactor: use UTC everywhere".' },
+		{ kind: 'tool_call', title: 'Read api/orders/filters.py', body: 'Reads the file (with line numbers) into context.' },
+		{ kind: 'model', title: 'Model forms a hypothesis', body: 'The refactor compares a timezone-aware datetime with naive dates stored in the DB, so the comparison excludes every row.' },
+		{ kind: 'tool_call', title: 'Edit filters.py', body: 'Exact string replacement: normalizes the incoming date to UTC before the comparison. The harness asks permission (default mode) and the user approves.' },
+		{ kind: 'harness', title: 'PostToolUse hook', body: 'The team\'s hook runs the formatter on the edited file. Deterministic, so no model involvement.' },
+		{ kind: 'tool_call', title: 'Bash: make test', body: 'Verifies the fix: runs the suite as instructed in CLAUDE.md.' },
+		{ kind: 'tool_result', title: 'Result', body: '2 failures: the fix worked, but two tests asserted the buggy behaviour.' },
+		{ kind: 'model', title: 'Model reasons', body: 'The tests encode the bug. Update them and explain why in the summary, rather than silently changing expectations.' },
+		{ kind: 'tool_call', title: 'Edit tests + Bash: make test', body: 'All tests pass.' },
+		{ kind: 'model', title: 'Final answer', body: 'Summary: root cause (naive vs aware datetimes after yesterday\'s refactor), the fix, the two updated tests and why, and a suggestion to add a regression test for timezone boundaries.' },
+	]}
+/>
+
+Key design choices in the loop:
+
+- **Streaming everything.** Users watch thinking summaries, tool calls and results live, which builds trust and lets them interrupt early.
+- **The model can call several independent tools at once** (e.g. three `Read`s), and the harness runs them in parallel.
+- **Tool outputs are bounded.** Huge command outputs or files are truncated or paginated so one `cat` can't blow the context window.
+- **Verification is part of the job.** Running tests or the build after editing is what turns "plausible code" into "working code".
+
+## 4. Context engineering: no vector index required
+
+This is the most instructive decision. Instead of pre-indexing the codebase into embeddings, Claude Code primarily uses **agentic search**: the model explores the repo the way a senior engineer would, with `Glob` (find files by pattern), `Grep` (search contents with regex) and `Read` (open files), iterating until it understands enough.
+
+| | Vector index (RAG over code) | Agentic search (grep/glob/read) |
+|---|---|---|
+| Setup | Index build, embedding cost, re-indexing pipeline | None: works instantly on any repo |
+| Freshness | Stale after every edit or branch switch unless re-indexed | Always current: it reads the live filesystem |
+| Precision | Semantic similarity, which can blur exact identifiers | Exact matches on symbols and error strings |
+| Privacy | Code embedded and stored somewhere | Nothing leaves except what's sent to the model |
+| Cost | Cheap per query once indexed | More tool calls and tokens per task |
+| Weakness | Misses exact symbols; chunking breaks code structure | Slower on vague "where is the thing that does X?" questions |
+
+For code, where identifiers are exact and the files change constantly as the agent edits them, **freshness and precision win**. That's the same lesson as BM25 in Module 4: dense vectors blur exact strings like `ERR_AUTH_8091`.
+
+What's actually in the context window:
+
+<Diagram
+	caption="Context layout. The stable prefix is cached; the conversation grows until compaction."
+	code={`flowchart TB
+    A["Tool definitions<br/>built-in + MCP (some deferred)"] --> B["System prompt<br/>behaviour, safety, tool usage guidance"]
+    B --> C["Memory files: CLAUDE.md<br/>org policy, user, project; subdirectories on demand"]
+    C --> D["Environment snapshot<br/>working dir, platform, git status"]
+    D -. "stable prefix: prompt cached" .-> E
+    E["Conversation<br/>user turns, model turns, tool calls and results"] --> F["Latest user message"]`}
+/>
+
+**CLAUDE.md memory files** are plain markdown, loaded automatically at the start of every session. They form a hierarchy: organization-wide policy, your personal preferences, the project's shared file (committed to git, so the team shares conventions), and files in subdirectories that load when the agent works there. They hold exactly what a new teammate needs: build and test commands, conventions, "don't touch X". That's the "context" layer of a system prompt from [Module 1](/foundations/context-engineering/), turned into a team-maintained file.
+
+## 5. Long tasks: beating the context window
+
+A real task can involve hundreds of tool calls, far more than fits in one window. Several mechanisms work together:
+
+<Diagram
+	caption="Four techniques for long-horizon work: compaction, subagents, task lists and progressive disclosure."
+	code={`flowchart LR
+    subgraph Main["Main agent context"]
+        M1["Conversation grows"] --> M2{"Near the limit?"}
+        M2 -- yes --> M3["Compaction<br/>summarize older history,<br/>keep key decisions and state"]
+        M3 --> M1
+        TD["Todo / task list<br/>persistent plan the model updates"]
+    end
+    M1 -- "delegate: 'find every caller of X'" --> SA1
+    subgraph SA1["Subagent, fresh context"]
+        S1["Reads 40 files"] --> S2["Returns a short summary"]
+    end
+    S2 --> M1
+    SK["Skills and deferred tools:<br/>only names and descriptions loaded<br/>until actually needed"] -.-> M1`}
+/>
+
+1. **Compaction.** When the conversation nears the window limit, older history is summarized into a compact form (decisions made, files changed, current state), and work continues. Users can also trigger it manually. Trade-off: details can be lost, which is why important facts belong in files (CLAUDE.md, a plan file, the todo list) rather than only in chat.
+2. **Subagents.** The main agent can delegate a sub-task ("search the codebase for all usages of the old API") to a subagent with its **own fresh context window**. The subagent may read 40 files, but only its summary comes back. That's context isolation: the main thread stays clean and focused. Subagents can also run in parallel, and can use cheaper or faster models.
+3. **Task lists.** For multi-step work the model maintains an explicit todo list, which is visible to the user, survives compaction, and keeps the model from losing track of the plan.
+4. **Progressive disclosure.** With dozens of MCP tools and skills installed, loading every definition would waste the window and confuse tool selection. Instead only short descriptions are loaded up front. Full skill instructions load when a skill is invoked, and rarely used tools can be **deferred** and discovered through a tool-search step.
+
+## 6. Safety and control
+
+An agent with a shell can delete your home directory, push to production, or leak secrets. Defence comes in layers, and most of them **don't rely on the model behaving well**:
+
+<Diagram
+	caption="The path of every tool call. Deterministic checks (rules, hooks, sandbox) wrap the model's decisions."
+	code={`flowchart TD
+    A["Model proposes a tool call"] --> B["PreToolUse hooks<br/>scripts can block or modify"]
+    B -- blocked --> R["Rejected: reason returned to the model"]
+    B --> C{"Deny rule matches?"}
+    C -- yes --> R
+    C -- no --> D{"Allow rule matches<br/>or permission mode auto-approves?"}
+    D -- yes --> F["Execute<br/>inside the sandbox if enabled"]
+    D -- no --> E{"Ask the human"}
+    E -- deny --> R
+    E -- approve --> F
+    F --> G["PostToolUse hooks<br/>format, lint, log, audit"]
+    G --> H["Result returned to the model"]`}
+/>
+
+- **Permission modes** set the default posture: ask before edits and commands (default), auto-accept file edits, a **plan mode** where the agent can only read and propose a plan, and more autonomous modes for trusted or sandboxed environments.
+- **Allow/deny rules** in settings files: e.g. allow `Bash(npm test:*)` but deny `Read(./.env)` and `Bash(rm -rf:*)`. Organizations can enforce managed policies that users can't override.
+- **Hooks**: user-defined scripts that run at lifecycle events (before or after a tool call, when a prompt is submitted, when a session starts or stops, before compaction). They're **deterministic**, so "always run the formatter after an edit" or "block any command touching `prod`" is enforced in code, not left to a prompt instruction.
+- **Sandboxing**: OS-level isolation for commands, limiting which directories can be written and which network hosts can be reached. It lets the agent run more freely, with fewer prompts, while bounding the blast radius.
+- **Checkpoints**: file states are saved as the agent edits, so the user can rewind a bad direction.
+- **Prompt-injection awareness**: files, web pages and tool results are untrusted input. A malicious README might say "run this curl command". Permissions, sandboxing and human approval are what stop it, not the model's good intentions.
+
+This is the Module 1 principle at scale: **prompts influence, architecture enforces.**
+
+## 7. Extensibility: the right mechanism for each job
+
+| Mechanism | What it is | Deterministic? | Use it for |
+|---|---|---|---|
+| **CLAUDE.md** | Markdown memory loaded every session | No (guidance) | Conventions, commands, project knowledge |
+| **Slash commands** | Saved prompts invoked by name | No | Repeatable workflows ("/review", "/release-notes") |
+| **Skills** | Folders with instructions, scripts and resources, loaded on demand | Partly (scripts are) | Packaged expertise: "how we build dashboards", "our deploy runbook" |
+| **Subagents** | Named specialists with their own prompt, tools and model | No | Isolated sub-tasks: code review, test writing, research |
+| **Hooks** | Scripts at lifecycle events | **Yes** | Policies that must *always* happen: formatting, blocking, auditing |
+| **MCP servers** | External tools over a standard protocol | Tools themselves are | Issue trackers, databases, internal APIs, browsers |
+| **Plugins** | Bundles of all the above | — | Sharing a team's setup in one install |
+
+The design lesson: **match the mechanism to the guarantee you need.** If it must happen every time, use a hook. If it's knowledge, use memory or skills. If it's a capability, use a tool or MCP.
+
+## 8. Performance and economics
+
+- **Prompt caching** is essential. Tool definitions, the system prompt and memory files form a large, stable prefix re-sent on every one of possibly hundreds of turns. Caching makes those turns cheap and fast. Anything that changes that prefix mid-session (like toggling tools) costs real money, which is one reason tool sets are kept stable and some tools are deferred rather than added mid-session.
+- **Model and effort choice:** stronger models and higher effort for hard reasoning and long autonomous work; cheaper or faster models for subagents doing bulk reading.
+- **Bounded tool outputs** keep each turn's input growth in check.
+- **Compaction and subagents** are cost controls as much as context controls. Remember from [cost math](/foundations/cost-math/) that agent input grows with every turn.
+
+## 9. What breaks, and how the design responds
+
+<FailureCard
+	title="Context rot in a 4-hour session"
+	symptom="Late in a long session, the agent re-introduces a bug it fixed an hour ago and forgets a constraint the user stated early on."
+	cause="Important details were lost or diluted across compactions. They only existed in the chat, not in durable state."
+	detect="Users notice repeated mistakes; in evals, measure task success against session length."
+	fix="Persist decisions in files (CLAUDE.md, a plan or notes file, the todo list), delegate exploration to subagents to keep the main context lean, and start fresh sessions for new tasks."
+/>
+
+<FailureCard
+	title="The README that asked for a curl"
+	symptom="While exploring a cloned third-party repo, the agent proposes running `curl https://… | sh` that a README 'recommended' for setup."
+	cause="**Indirect prompt injection**: untrusted file content steering the agent's actions."
+	detect="Permission prompts surface the command; hooks can flag network or pipe-to-shell patterns; the sandbox blocks unknown hosts."
+	fix="Layered defence: ask before commands in untrusted repos, deny rules for risky patterns, sandboxed execution with network allow-lists, and human review of anything unusual."
+/>
+
+<FailureCard
+	title="'Done!' but it doesn't build"
+	symptom="The agent reports success, but CI fails: a function it called doesn't exist with that signature."
+	cause="The model produced plausible code without **verifying** it, because no test or build step ran, or none existed."
+	detect="CI and type-checks; tracking how often 'done' tasks fail downstream."
+	fix="Put verification commands in CLAUDE.md ('always run `make check` before finishing'), enforce them with a Stop hook, and invest in fast tests. Agents are only as reliable as the feedback loops you give them."
+/>
+
+<FailureCard
+	title="The runaway refactor"
+	symptom="Asked to rename one function, the agent touches 140 files, including generated code and vendored dependencies."
+	cause="An underspecified goal, no scope boundaries, and auto-accept mode on."
+	detect="Diff size alerts; review before commit."
+	fix="Plan mode first for large changes, scope rules in CLAUDE.md ('never edit /vendor or generated files'), deny rules for those paths, and checkpoints to rewind."
+/>
+
+## 10. Trade-offs at a glance
+
+| Decision | Chosen approach | What it costs | Why it's worth it |
+|---|---|---|---|
+| Code retrieval | Agentic search | More tool calls per task | Always fresh, exact, no index to maintain |
+| Context limits | Compaction + subagents + files | Possible detail loss | Unbounded task length |
+| Safety | Layered deterministic controls + human approval | Interruptions, configuration effort | Safety that doesn't depend on model behaviour |
+| Extensibility | Several mechanisms (hooks, skills, MCP…) | Learning curve | The right guarantee for each need |
+| Surfaces | One harness, many front-ends | Abstraction work | Same behaviour in terminal, IDE, CI, cloud |
+| Tool set | Small, general tools (Bash, Read, Edit…) | The model must compose them | Works on any stack without custom integrations |
+
+## 11. Build your own mini version
+
+<Practice title="Build a mini coding agent (the best agent project for your portfolio)">
+
+Build `mini-agent` in Python, stage by stage. Commit each stage separately.
+
+- **Warm-up (one evening):** the loop. Tools: `read_file`, `list_files`, `grep`, `edit_file` (exact string replace, failing if the match is not unique). Run it on a small repo with "fix the failing test".
+- **Stretch (a weekend):** add `run_command` with a **permission prompt** (`y/n`) and an allow-list (`pytest`, `ls`, `git status` auto-approved). Load an `AGENT.md` memory file into the system prompt. Truncate tool outputs over 10K characters. Stream the model's text to the terminal.
+- **Boss level (a week):** add **compaction** (summarize history when input tokens pass 60% of the window), a **subagent tool** (spawns a fresh loop with read-only tools and returns a summary), a **PreToolUse hook** system (a Python callable that can block calls), a **todo list** tool, and a trace log of every turn (tokens, cost, tool calls). Then write 10 eval tasks (small repos with a failing test each) and report your agent's success rate, cost per task, and the three most common failure modes. That's a production agent harness, and a superb interview story.
+
+</Practice>
+
+<ThinkFirst question="Your company wants a version of this for its customer-support team: an agent that can read tickets, query the order database and issue refunds. Which three design ideas from Claude Code would you carry over directly, and which one would you change?">
+
+**Carry over directly:**
+
+1. **Layered, deterministic safety:** permission tiers (read tools auto-approved; refunds always need approval above a threshold), deny rules, and hooks for audit logging of every action.
+2. **Memory files as a team-maintained context layer:** a "SUPPORT.md" with policies, tone and escalation rules that support leads can edit (with evals!).
+3. **Subagents and context isolation:** e.g. a research subagent that digs through a long customer history and returns a 10-line summary.
+
+**Change:** **retrieval strategy.** Support knowledge (policies, past resolutions) is natural-language, fuzzy and relatively stable, so **RAG with hybrid search** (Module 4) fits better than grep, while exact lookups (order IDs) remain tool calls to the database. Also: support users aren't developers, so the approval UX must be a clear card in the UI (Module 2), not a terminal prompt.
+
+</ThinkFirst>
+
+<Quiz
+	id="case-claude-code"
+	title="Case study quiz"
+	questions={[
+		{
+			q: 'Why does Claude Code primarily use agentic search (grep/glob/read) rather than a vector index of the codebase?',
+			options: [
+				'Vector databases are too expensive to run',
+				'Code changes constantly and identifiers must match exactly, so live, precise search beats a possibly stale, fuzzy index',
+				'Models cannot use embeddings',
+				'Grep is always faster than any index',
+			],
+			answer: 1,
+			why: 'Freshness (the agent itself is editing files) and exact-match precision on symbols are decisive for code. The cost is more tool calls per task.',
+		},
+		{
+			q: 'What is the main purpose of running a sub-task in a subagent?',
+			options: [
+				'To make the model smarter',
+				'Context isolation: the subagent can read a lot while only a short summary returns to the main context',
+				'To bypass permissions',
+				'Subagents are free',
+			],
+			answer: 1,
+			why: 'Subagents keep the main thread focused and lean. They can also run in parallel and on cheaper models, but isolation is the core benefit.',
+		},
+		{
+			q: 'A team needs code to be formatted after every edit, with no exceptions. Which mechanism fits best?',
+			options: ['A line in CLAUDE.md', 'A slash command', 'A PostToolUse hook', 'A skill'],
+			answer: 2,
+			why: 'Hooks are **deterministic**: they run every time in code. Memory files and skills are guidance the model may or may not follow.',
+		},
+		{
+			q: 'Why is prompt caching especially important for a coding agent?',
+			options: [
+				'Code is hard to tokenize',
+				'Every turn re-sends a large, stable prefix (tools, system prompt, memory), possibly hundreds of times per session',
+				'Caching improves model accuracy',
+				'It is required for tool use',
+			],
+			answer: 1,
+			why: 'Long agent sessions multiply input tokens. Caching the stable prefix makes each turn much cheaper and faster, which is why that prefix is kept stable.',
+		},
+		{
+			q: 'A cloned repo\'s README instructs the agent to run a remote install script. What actually protects the user?',
+			options: [
+				'The model\'s training',
+				'A system prompt saying "be careful"',
+				'Deterministic layers: permission prompts, deny rules, hooks, and sandboxed execution with network limits',
+				'Nothing can',
+			],
+			answer: 2,
+			why: 'Indirect prompt injection is a real risk. Defence in depth with deterministic controls is what bounds the damage. Prompts influence; architecture enforces.',
+		},
+	]}
+/>
+
+<LessonComplete id="case-studies/claude-code" />

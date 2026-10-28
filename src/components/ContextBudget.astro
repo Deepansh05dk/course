@@ -1,0 +1,73 @@
+---
+interface Props {
+	window?: number;
+}
+
+const { window = 200000 } = Astro.props;
+const parts = [
+	{ key: 'system', label: 'System prompt', value: 2500, max: 30000, color: '#6366f1' },
+	{ key: 'tools', label: 'Tool definitions', value: 6000, max: 60000, color: '#0ea5e9' },
+	{ key: 'history', label: 'Conversation history', value: 40000, max: 400000, color: '#f59e0b' },
+	{ key: 'retrieved', label: 'Retrieved docs (RAG)', value: 30000, max: 400000, color: '#10b981' },
+	{ key: 'output', label: 'Reserved for output', value: 16000, max: 128000, color: '#ef4444' },
+];
+---
+
+<section class="budget not-content" data-budget data-window={window}>
+	<p class="budget__badge">📦 Context window budget</p>
+	<label class="budget__win">Model context window (tokens)
+		<select name="window">
+			<option value="200000" selected={window === 200000}>200K</option>
+			<option value="1000000" selected={window === 1000000}>1M</option>
+			<option value="32000">32K (small/open-weight model)</option>
+		</select>
+	</label>
+	<div class="budget__bar" aria-hidden="true">
+		{parts.map((p) => <span data-seg={p.key} style={`background:${p.color}`} />)}
+	</div>
+	<div class="budget__rows">
+		{
+			parts.map((p) => (
+				<label>
+					<i style={`background:${p.color}`} />
+					{p.label}
+					<input type="range" name={p.key} min="0" max={p.max} step="500" value={p.value} />
+					<output data-v={p.key} />
+				</label>
+			))
+		}
+	</div>
+	<p class="budget__status" aria-live="polite"></p>
+</section>
+
+<script>
+	const keys = ['system', 'tools', 'history', 'retrieved', 'output'];
+	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}K` : String(n));
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-budget]')) {
+		const status = box.querySelector<HTMLElement>('.budget__status')!;
+		const update = () => {
+			const win = Number(box.querySelector<HTMLSelectElement>('[name="window"]')!.value);
+			let used = 0;
+			for (const key of keys) {
+				const v = Number(box.querySelector<HTMLInputElement>(`[name="${key}"]`)!.value);
+				used += v;
+				box.querySelector<HTMLElement>(`[data-v="${key}"]`)!.textContent = k(v);
+			}
+			for (const key of keys) {
+				const v = Number(box.querySelector<HTMLInputElement>(`[name="${key}"]`)!.value);
+				box.querySelector<HTMLElement>(`[data-seg="${key}"]`)!.style.width = `${(v / Math.max(used, win)) * 100}%`;
+			}
+			const pct = Math.round((used / win) * 100);
+			box.dataset.state = pct > 100 ? 'over' : pct > 75 ? 'warn' : 'ok';
+			status.textContent =
+				pct > 100
+					? `🔴 ${k(used)} / ${k(win)} (${pct}%). The request fails, or you must truncate or compact. Decide what gets dropped before production decides for you.`
+					: pct > 75
+						? `🟡 ${k(used)} / ${k(win)} (${pct}%). It works, but it's expensive and slow, and quality on buried details can drop. Time to trim or compact.`
+						: `🟢 ${k(used)} / ${k(win)} (${pct}%). Healthy headroom.`;
+		};
+		box.addEventListener('input', update);
+		update();
+	}
+</script>

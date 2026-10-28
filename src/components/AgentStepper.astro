@@ -1,0 +1,57 @@
+---
+import { inline } from './fmt';
+
+interface Step {
+	kind: 'user' | 'model' | 'tool_call' | 'tool_result' | 'harness';
+	title: string;
+	body: string;
+}
+interface Props {
+	title?: string;
+	steps: Step[];
+}
+
+const { title = 'Step through the agent loop', steps } = Astro.props;
+const icon = { user: '🧑', model: '🤖', tool_call: '🛠️', tool_result: '📄', harness: '⚙️' };
+---
+
+<section class="stepper not-content" data-stepper data-count={steps.length}>
+	<header class="stepper__head">
+		<span>🔍 {title}</span>
+		<span class="stepper__pos">1 / {steps.length}</span>
+	</header>
+	<ol class="stepper__list">
+		{
+			steps.map((s, i) => (
+				<li class={`stepper__step stepper__step--${s.kind}`} hidden={i > 0}>
+					<p class="stepper__title">
+						{icon[s.kind]} <strong>{s.title}</strong>
+					</p>
+					<p class="stepper__body" set:html={inline(s.body)} />
+				</li>
+			))
+		}
+	</ol>
+	<div class="stepper__nav">
+		<button type="button" data-dir="-1">◀ Back</button>
+		<button type="button" data-dir="1">Next step ▶</button>
+	</div>
+</section>
+
+<script>
+	for (const box of document.querySelectorAll<HTMLElement>('[data-stepper]')) {
+		const steps = [...box.querySelectorAll<HTMLElement>('.stepper__step')];
+		const pos = box.querySelector<HTMLElement>('.stepper__pos')!;
+		let shown = 1;
+		const render = () => {
+			steps.forEach((s, i) => (s.hidden = i >= shown));
+			pos.textContent = `${shown} / ${steps.length}`;
+		};
+		for (const btn of box.querySelectorAll<HTMLButtonElement>('[data-dir]')) {
+			btn.addEventListener('click', () => {
+				shown = Math.min(steps.length, Math.max(1, shown + Number(btn.dataset.dir)));
+				render();
+			});
+		}
+	}
+</script>

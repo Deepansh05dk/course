@@ -1,0 +1,205 @@
+---
+title: "The reality check: prototypes vs production"
+description: Why the 10-line prototype collapses, how stochastic software differs from deterministic software, and when NOT to use an LLM.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Friday 16:40: the support bot promised a refund policy that doesn't exist" severity="SEV1">
+A customer posts a screenshot on social media: the support bot told them "all orders are refundable within 90 days, no questions asked." The real policy is 30 days with conditions. Legal wants to know **how many other customers got the same answer**. Nobody can tell them, because the bot doesn't log conversations.
+</Incident>
+
+## The 10-line prototype trap
+
+This is how almost every AI feature starts:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+def answer(question: str) -> str:
+    msg = client.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": f"Answer as Acme support: {question}"}],
+    )
+    return msg.content[-1].text
+```
+
+It works in the notebook, and the demo goes great. Now count the production problems hiding in those ten lines:
+
+| Line | What will happen in production |
+|---|---|
+| `Anthropic()` | Default timeouts are long (minutes). One slow response ties up a web worker, and under load your API stops responding |
+| `messages.create` | 429 rate limits and 5xx overloads happen daily at scale. What does the user see? |
+| `max_tokens=1000` | Long answers are **silently cut off** mid-sentence (`stop_reason == "max_tokens"`) |
+| The prompt | No policy documents, so the model **invents** a plausible policy. That's our incident |
+| f-string with `question` | User text is mixed with your instructions, so "ignore previous instructions…" works |
+| `content[-1].text` | Assumes the last block is text. Thinking blocks, tool calls and refusals break this |
+| No logging | When legal asks "who else got this answer?", you have nothing |
+| No eval | You can't tell if tomorrow's prompt tweak made things better or worse |
+| No cost tracking | The first bill is a surprise |
+
+None of these are exotic. **Every one of them will happen within weeks of launch.** The rest of this course is about fixing each line properly.
+
+## Deterministic vs stochastic software
+
+| Traditional code | LLM-powered code |
+|---|---|
+| `add(2, 2)` is always `4` | The same prompt can produce different outputs |
+| Bugs reproduce | "It worked when I tried it" is the norm |
+| Unit tests with exact asserts | Evals with **rates** ("94% of answers cite a source") |
+| Failures are loud (exceptions) | Failures are **silent and fluent** (confidently wrong) |
+| Cost is roughly fixed per request | Cost scales with tokens, so a long input or a retry loop gets expensive |
+| Latency in milliseconds | Latency in seconds, growing with output length |
+
+Why is it stochastic? A model produces a **probability distribution over the next token**, and the next token is *sampled* from it. Sampling settings like `temperature` and `top_p` shape that randomness. Two things matter for production:
+
+1. **Even "deterministic" settings are not truly deterministic.** Batching, hardware, and provider-side updates mean identical requests can still differ. Never build a system that relies on byte-identical outputs.
+2. **These knobs are disappearing on the newest models.** Reasoning models manage their own sampling, and Anthropic's newest API version rejects `temperature`/`top_p`/`top_k` entirely. You control behaviour through **instructions, examples, structured outputs, and validation**, not sampling parameters.
+
+:::tip[The mindset shift]
+Stop asking "is my output correct?" and start asking "**what fraction** of outputs are correct, **which kinds** fail, and **what happens** when one does?"
+:::
+
+## When NOT to use an LLM
+
+LLMs are the right tool for **ambiguous language**: understanding intent, summarizing, extracting meaning from messy text, and generating drafts. They're the wrong tool when a deterministic solution exists.
+
+<Diagram
+	caption="A quick decision filter. Most production systems mix all three: code for the deterministic parts, small models for simple judgments, big models for real ambiguity."
+	code={`flowchart TD
+    A["New task"] --> B{"Is there an exact, rule-based answer?<br/>math, date parsing, lookups, validation"}
+    B -- Yes --> C["Write normal code<br/>fast, free, always correct"]
+    B -- No --> D{"Is it a simple, narrow judgment<br/>at very high volume?"}
+    D -- Yes --> E["Classic ML or the smallest model<br/>that passes your eval"]
+    D -- No --> F{"Does it need open-ended language<br/>understanding or generation?"}
+    F -- Yes --> G["LLM, with evals, validation and fallbacks"]
+    F -- No --> H["Rethink the task: maybe search,<br/>a form, or a workflow"]`}
+/>
+
+Common anti-patterns:
+
+- **Arithmetic and money:** "What's 17% of $2,340.50?" Use code. Have the LLM *call* a calculator tool if it's inside a conversation.
+- **Date parsing:** "next Tuesday" → a date. `dateparser` or a few lines of code are free and exact. Let the LLM extract the phrase, and let code resolve it.
+- **Exact lookups:** "What's the status of order 8812?" That's a database query. The LLM's job is understanding the question, not remembering the answer.
+- **Validation:** emails, phone numbers, schemas. Use regex and Pydantic.
+- **Simple classification at huge volume:** sometimes a tiny model, or even a keyword rule, passes your eval at 1/100th of the cost. Measure before assuming you need a frontier model.
+
+<FailureCard
+	title="The invoice total that was off by $0.10"
+	symptom="An LLM-generated invoice summary shows totals that are occasionally a few cents off from the line items."
+	cause="The model was asked to **add numbers**. LLMs predict tokens; they don't execute arithmetic, so long sums drift."
+	detect="A deterministic check: recompute the total in code and compare. Any mismatch is an alert."
+	fix="Let code compute totals. The LLM only extracts line items into a schema (structured outputs), and Python does the math."
+/>
+
+## Back to the incident
+
+<IncidentDrill
+	id="refund-policy"
+	title="The invented refund policy"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Friday 16:40. A screenshot of the bot promising "90 days, no questions asked" is going viral. The bot is still live. What do you do first?',
+			choices: [
+				{ label: 'Start rewriting the prompt to include the real policy', next: 's2bad', cost: 45, note: 'The bot keeps answering customers while you edit, and prompt changes take time to test.' },
+				{ label: 'Contain: switch the bot to a safe fallback ("A human will follow up") or disable refund topics', next: 's2', cost: 5, note: 'Stops the bleeding within minutes.' },
+				{ label: 'Wait for Monday to discuss with the team', next: 'end_bad', cost: 600, note: 'Thousands more conversations over the weekend.' },
+			],
+		},
+		s2bad: {
+			text: 'Forty minutes later you have a new prompt, but you can\'t tell whether it fixes every phrasing of the question, and the bot has kept talking meanwhile. Now what?',
+			choices: [
+				{ label: 'Ship it straight to production', next: 'end_ok', cost: 30, note: 'It works for the phrasing you tested. Other phrasings still invent policies.' },
+				{ label: 'Contain first (fallback), then test the fix', next: 's2', cost: 5 },
+			],
+		},
+		s2: {
+			text: 'The bot is contained. Legal asks: "How many customers received a wrong refund answer?" You have no conversation logs. What now?',
+			choices: [
+				{ label: 'Estimate from support tickets mentioning refunds, and add logging (with PII handling) immediately', next: 's3', cost: 0, note: 'Imperfect, but honest. And it never happens again.' },
+				{ label: 'Tell legal it was probably only one customer', next: 'end_bad', cost: 120, note: 'Unverifiable claims to legal are a career-limiting move.' },
+			],
+		},
+		s3: {
+			text: 'Root-cause fix: what makes this class of failure impossible (or at least detectable)?',
+			choices: [
+				{ label: 'Ground answers in the real policy docs (RAG), require citations, refuse when no source supports the answer, and add an eval set of 50 refund questions', next: 'end_good', cost: 0 },
+				{ label: 'Add "never make up policies" to the prompt', next: 'end_ok', cost: 20, note: 'It helps a little, but instructions alone don\'t guarantee behaviour, and you still can\'t measure it.' },
+			],
+		},
+		end_good: { text: 'You contained fast, were honest about impact, and fixed the class of bug with grounding plus an eval that would catch a regression.', end: 'good' },
+		end_ok: { text: 'The fire is out, but the fix isn\'t verified, and the same failure can return with a different question.', end: 'ok' },
+		end_bad: { text: 'The bot kept misinforming customers, or you made claims you couldn\'t back up.', end: 'bad' },
+	}}
+/>
+
+<ThinkFirst question="For each task, decide: plain code, small model, or large LLM? (a) Convert '3rd of March next year' into an ISO date. (b) Route 2 million support emails a day into 6 queues. (c) Draft a reply to an angry customer whose shipment was lost, using their order history.">
+
+- **(a) Mostly code.** Date libraries handle this exactly. If the phrase is buried in a long message, an LLM can *extract* it, and code *resolves* it.
+- **(b) The smallest thing that passes your eval.** At 2M/day, cost dominates. Try a small model (or a fine-tuned classifier) and compare its accuracy against a large model on a labeled sample. A 1% accuracy gain rarely justifies a 40× cost increase, unless misroutes are very expensive.
+- **(c) A large LLM**, with grounding (order history via tools), tone guidance, and probably human review before sending. This is real ambiguity and empathy, which is the LLM's sweet spot.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** take the 10-line prototype above and list, for each line, the exception or failure you'd expect at 10,000 requests a day.
+- **Stretch:** run the same prompt 20 times against a model and save the outputs. How many distinct answers did you get? Which differences would matter to a user?
+- **Boss level:** build a tiny "LLM or not?" benchmark: 5 tasks (math, dates, lookup, classification, drafting). Solve each with code *and* with an LLM. Record accuracy, latency and cost in a table. You now have real data for every future "should we use an LLM?" debate.
+
+</Practice>
+
+<Quiz
+	id="start-reality"
+	questions={[
+		{
+			q: 'The model call returns `stop_reason == "max_tokens"`. What happened?',
+			options: ['The request failed', 'The output was cut off at the token limit and is probably incomplete', 'The model refused', 'The model finished normally'],
+			answer: 1,
+			why: 'The response hit `max_tokens` before finishing. The text is valid but **truncated**, which is a silent failure if you don\'t check `stop_reason`. A finished answer has `end_turn`.',
+		},
+		{
+			q: 'Your team wants reproducible tests, so they plan to set temperature to 0 and assert exact outputs. What is the problem?',
+			options: [
+				'Nothing, that works reliably',
+				'Outputs can still vary (batching, hardware, model updates), and some newest APIs reject sampling parameters entirely',
+				'Temperature 0 makes the model slower',
+				'Tests should never call models',
+			],
+			answer: 1,
+			why: 'Low-randomness settings reduce variation but don\'t guarantee identical outputs, and the knobs are disappearing on new models. Test **properties** (schema valid, cites a source, contains no invented dates) and **rates**, not exact strings.',
+		},
+		{
+			q: 'Which task is the clearest anti-pattern for an LLM?',
+			options: [
+				'Summarizing a long email thread',
+				'Computing the sum of 40 invoice line items',
+				'Extracting the customer\'s intent from a messy message',
+				'Drafting a polite reply',
+			],
+			answer: 1,
+			why: 'Arithmetic is deterministic, so code is free and exact. Let the LLM **extract** the line items, and let code **add** them.',
+		},
+		{
+			q: 'What is the most dangerous property of LLM failures in production?',
+			options: ['They throw exceptions', 'They are slow', 'They are often fluent and confident, so they look correct', 'They always cost money'],
+			answer: 2,
+			why: 'Exceptions are easy to catch. **Plausible wrong answers** pass straight through to users unless you have grounding, validation and evals.',
+		},
+	]}
+/>
+
+<LessonComplete id="start/reality-check" />

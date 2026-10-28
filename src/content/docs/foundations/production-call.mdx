@@ -1,0 +1,270 @@
+---
+title: The production-grade LLM call
+description: Timeouts, retries with backoff, typed errors, stop reasons, refusals and fallbacks. Turning one API call into a dependency you can trust.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The retry storm" severity="SEV1">
+At 14:02 the provider started returning 429 (rate limited) for 20% of requests. Relay's code retried immediately, up to 10 times, on every error. Within 3 minutes request volume to the provider was 6× normal, the rate limiting got worse, and **100%** of requests were failing. The provider's partial problem became Relay's total outage.
+</Incident>
+
+In Module 0 you saw a 10-line prototype with many hidden failures. This lesson fixes the call itself. The result is the `complete()` function that every later module builds on.
+
+## What can go wrong with one call
+
+<Diagram
+	caption="Every arrow out of 'Call model' is a case your code must handle explicitly."
+	code={`flowchart TD
+    A["Call model"] --> B{"Response?"}
+    B -- "Connection error / timeout" --> R["Retry with backoff<br/>if attempts and budget remain"]
+    B -- "429 rate limited / 529 overloaded / 5xx" --> R
+    B -- "400 / 401 / 403 / 404" --> X["Don't retry: fix the request,<br/>config or credentials. Alert"]
+    B -- "200 OK" --> C{"stop_reason"}
+    C -- end_turn --> OK["Use the answer"]
+    C -- max_tokens --> T["Truncated: retry with a higher limit,<br/>continue, or fail loudly"]
+    C -- refusal --> F["Handle: safe message,<br/>fallback model, or human"]
+    C -- tool_use --> TU["Run tools (Module 6)"]
+    R --> A
+    R -- "out of attempts" --> FB["Fallback model/provider<br/>or graceful degradation"]`}
+/>
+
+## Errors: retryable vs not
+
+| Error | Meaning | Retry? |
+|---|---|---|
+| Connection error, timeout | Network or provider slowness | ✅ with backoff |
+| **429** rate limit | You exceeded your quota | ✅ with backoff, honouring `retry-after` |
+| **529 / 503** overloaded, **500** | Provider-side trouble | ✅ with backoff, then fall back |
+| **400** invalid request | Your request is wrong (too long, bad params) | ❌ Retrying the same request gives the same error |
+| **401 / 403** | Bad key or no permission | ❌ Page someone |
+| **404** | Model doesn't exist (or was retired) | ❌ Config bug |
+
+## Backoff, jitter, and a retry budget
+
+- **Exponential backoff:** wait 1s, 2s, 4s… so you stop hammering a struggling service.
+- **Jitter:** randomize each wait so thousands of clients don't retry in sync (the "thundering herd").
+- **Max attempts:** 2–3 is plenty for interactive requests. Users won't wait for 10.
+- **Retry budget:** cap retries at a fraction of traffic (e.g. 10%). When the provider is truly down, retries only add load. Fail fast and fall back.
+- **Timeouts:** set them per use case. Interactive: 20–60s, plus streaming so users see progress. Background jobs: longer.
+
+The official SDKs already retry connection errors, 408, 409, 429 and 5xx with backoff (2 retries by default). Configure that **deliberately** rather than stacking your own retry loop on top. Stacked retries multiply: 3 × 3 = 9 attempts.
+
+## The `complete()` function
+
+```python
+# app/llm.py
+import logging
+import time
+from dataclasses import dataclass
+
+import anthropic
+
+from app.config import settings
+
+log = logging.getLogger("relay.llm")
+
+client = anthropic.Anthropic(
+    timeout=settings.request_timeout_s,  # never rely on the long default for interactive paths
+    max_retries=2,                        # SDK retries 429/5xx/connection errors with backoff
+)
+
+
+class LLMError(Exception):
+    """A failure the caller should handle (show fallback UI, queue for a human, ...)."""
+
+
+@dataclass
+class Completion:
+    text: str
+    model: str
+    stop_reason: str
+    input_tokens: int
+    output_tokens: int
+    latency_s: float
+
+
+def complete(
+    messages: list[dict],
+    *,
+    system: str = "",
+    model: str = settings.model,
+    max_tokens: int = 4000,
+    fallback_model: str | None = settings.fallback_model,
+) -> Completion:
+    start = time.perf_counter()
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=messages,
+            **({"system": system} if system else {}),
+        )
+    except (anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APIConnectionError) as exc:
+        # The SDK already retried. Try a different model once, then give up cleanly.
+        if fallback_model and fallback_model != model:
+            log.warning("primary model failed (%s); falling back to %s", type(exc).__name__, fallback_model)
+            return complete(messages, system=system, model=fallback_model,
+                            max_tokens=max_tokens, fallback_model=None)
+        raise LLMError("model unavailable") from exc
+    except anthropic.NotFoundError as exc:
+        # Wrong or retired model ID: a config bug. Page someone.
+        log.error("model not found: %s", model)
+        raise LLMError("model not found") from exc
+    except anthropic.BadRequestError as exc:
+        # Our bug (too long, invalid params). Retrying won't help.
+        log.error("bad request to model: %s", exc)
+        raise LLMError("invalid request") from exc
+
+    if msg.stop_reason == "refusal":
+        raise LLMError("model declined this request")
+
+    text = "".join(block.text for block in msg.content if block.type == "text")
+    if msg.stop_reason == "max_tokens":
+        # Truncated output is a bug waiting to happen downstream. Make it loud.
+        log.warning("output truncated at max_tokens=%s", max_tokens)
+
+    result = Completion(
+        text=text,
+        model=msg.model,
+        stop_reason=msg.stop_reason,
+        input_tokens=msg.usage.input_tokens,
+        output_tokens=msg.usage.output_tokens,
+        latency_s=round(time.perf_counter() - start, 3),
+    )
+    log.info("llm_call", extra={"llm": result.__dict__})
+    return result
+```
+
+Notice what the **caller** gets: either a `Completion` with metrics, or a single `LLMError` type to handle with a graceful fallback in the UI. Provider-specific exceptions never leak into the rest of the codebase.
+
+:::note[Add `fallback_model` to settings]
+Add `fallback_model: str | None = "claude-sonnet-5-5"` to `Settings`. A fallback from another **provider** is even more resilient. Module 11 moves this into a gateway.
+:::
+
+<FailureCard
+	title="The silently truncated JSON"
+	symptom="1 in 50 responses fails to parse as JSON, always on long tickets."
+	cause="Output hit `max_tokens`, so the JSON was cut off mid-object. The code never checked `stop_reason`."
+	detect="Count `stop_reason` values per feature in your metrics. Any `max_tokens` on a structured output is an alert."
+	fix="Size `max_tokens` from p99 output length plus headroom (and remember thinking tokens), treat `max_tokens` as an error for structured outputs, and use structured outputs (lesson 6)."
+/>
+
+<FailureCard
+	title="The worker pool exhaustion"
+	symptom="During a provider slowdown, your whole API (even non-AI endpoints) becomes unresponsive."
+	cause="Synchronous LLM calls with long timeouts tied up every worker thread. Requests to unrelated endpoints queued behind them."
+	detect="Saturation metrics: worker utilization, queue depth, and latency of *non-AI* endpoints."
+	fix="Short timeouts, async I/O (lesson 5), separate worker pools or services for AI endpoints, and a circuit breaker that fails fast after repeated failures."
+/>
+
+<IncidentDrill
+	id="retry-storm"
+	title="Replay the retry storm"
+	start="s1"
+	nodes={{
+		s1: {
+			text: '14:02. Error rate is 20% (429s from the provider) and rising fast. Your retry loop retries everything up to 10 times, with no backoff. What now?',
+			choices: [
+				{ label: 'Increase retries to 20 so more requests eventually succeed', next: 'end_bad', cost: 90, note: 'More retries mean more load, which means more 429s. Error rate hits 100%.' },
+				{ label: 'Hot-fix: cap attempts at 3, add exponential backoff with jitter, honour retry-after', next: 's2', cost: 10, note: 'Load on the provider drops sharply within minutes.' },
+				{ label: 'Turn off the AI feature entirely', next: 's2b', cost: 30, note: 'It stops the storm, but 80% of requests were still succeeding.' },
+			],
+		},
+		s2b: { text: 'The feature is off and users are annoyed. You still need a proper fix before turning it back on.', choices: [{ label: 'Implement backoff, jitter and capped retries, then re-enable gradually', next: 's2', cost: 10 }] },
+		s2: {
+			text: '14:15. The error rate falls to 8%. Some users still see failures. Final improvement?',
+			choices: [
+				{ label: 'Add a fallback model for requests that exhaust their retries, plus a friendly "taking longer than usual" message', next: 'end_good', cost: 0 },
+				{ label: 'Nothing more, 8% is fine', next: 'end_ok', cost: 20, note: 'One in 12 users still gets an error page.' },
+			],
+		},
+		end_good: { text: 'Backoff stopped the self-inflicted load, and the fallback covered the remaining failures. Post-mortem action: add a retry-rate alert and a retry budget.', end: 'good' },
+		end_ok: { text: 'Stable, but users still hit hard failures that a fallback would have absorbed.', end: 'ok' },
+		end_bad: { text: 'Retries without backoff turned a partial provider problem into your total outage.', end: 'bad' },
+	}}
+/>
+
+<ThinkFirst question="Relay's refund agent calls the model, which calls a `issue_refund` tool. The tool's HTTP request to Acme's payment API times out after 30s. Is it safe to retry? What do you need to make it safe?">
+
+**Not automatically.** A timeout doesn't mean it failed. The payment API may have processed the refund and only the *response* was lost. A blind retry can refund twice.
+
+To make retries safe:
+
+1. **Idempotency keys:** send a unique key per logical refund (e.g. `refund:{ticket_id}:{amount}`). The payment API stores it and returns the original result on a duplicate request instead of acting again.
+2. **Check before retrying:** query the refund status by that key first.
+3. **Separate model retries from side-effect retries.** Retrying an LLM *call* is cheap and safe. Retrying an *action* needs idempotency.
+
+This idea returns in Module 6 (durable agents) and Module 8 (tool safety).
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** wrap your existing `llm.py` with the `complete()` above and write unit tests using a fake client that raises each error type. Assert the right behaviour for each one.
+- **Stretch:** build a tiny **fault-injection proxy** (a FastAPI app that forwards to the provider but randomly returns 429, 529, or sleeps 40s). Point your client at it with `base_url` and watch your retries, timeouts and fallback work.
+- **Boss level:** implement a **circuit breaker**: after N failures within a window, skip the primary model for 30s and go straight to the fallback, then probe again. Graph the error rate with and without it under your fault-injection proxy.
+
+</Practice>
+
+<Quiz
+	id="m1-call"
+	questions={[
+		{
+			q: 'Which error should NOT be retried?',
+			options: ['429 rate limited', '529 overloaded', '400 invalid request (prompt too long)', 'Connection reset'],
+			answer: 2,
+			why: 'A 400 means the request itself is wrong. The same request fails the same way. Fix it (e.g. trim the input) instead of retrying.',
+		},
+		{
+			q: 'Why add jitter to backoff?',
+			options: [
+				'To make retries faster',
+				'So that many clients don\'t retry at the same moment and create synchronized load spikes',
+				'It\'s required by HTTP',
+				'To reduce token usage',
+			],
+			answer: 1,
+			why: 'Without jitter, every client that failed at the same time retries at the same time, a "thundering herd" that keeps the provider overloaded.',
+		},
+		{
+			q: 'Your code retries 3 times, around an SDK that also retries 2 times. How many attempts can one request make?',
+			options: ['3', '5', 'Up to 9', '2'],
+			answer: 2,
+			why: 'Each of your 3 attempts triggers up to 3 SDK attempts (1 + 2 retries): up to 9 calls. Stacked retry layers multiply. Configure **one** layer deliberately.',
+		},
+		{
+			q: 'A response comes back with `stop_reason == "refusal"`. What is the right handling?',
+			options: [
+				'Retry the same request until it works',
+				'Show the empty text to the user',
+				'Treat it as a distinct outcome: safe message to the user, log it, and optionally route to a fallback model or a human',
+				'Ignore it',
+			],
+			answer: 2,
+			why: 'A refusal is a valid response, not a transport error. Handle it explicitly, track how often it happens (false positives show up in evals), and decide on a fallback policy.',
+		},
+		{
+			q: 'Why is retrying a timed-out `issue_refund` call dangerous?',
+			options: [
+				'Refund APIs are slow',
+				'The refund might have succeeded with only the response lost, so a retry could refund twice unless you use idempotency keys',
+				'Models can\'t call tools twice',
+				'It is not dangerous',
+			],
+			answer: 1,
+			why: 'Timeouts are ambiguous. Side effects need **idempotency** (and a status check) before you retry.',
+		},
+	]}
+/>
+
+<LessonComplete id="foundations/production-call" />

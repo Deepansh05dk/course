@@ -1,0 +1,196 @@
+---
+title: How LLMs behave (for engineers)
+description: Tokens, context windows, generation speed, thinking models and statelessness. The mental model you need to predict cost, latency and failure.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import ContextBudget from '../../../components/ContextBudget.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'It worked yesterday' — the chatbot that forgot everything at message 40" severity="SEV3">
+Acme's pilot agents report that after long conversations, Relay "forgets" the customer's order number and starts contradicting itself. Then some conversations start failing outright with a 400 error. The code didn't change. **The conversations got longer.**
+</Incident>
+
+You don't need to know transformer maths for this job. You need an accurate **engineering model** of what an LLM does, because that model is what lets you predict cost, latency, and failure.
+
+## 1. Everything is tokens
+
+Models don't read characters or words. They read **tokens**: chunks of text from a fixed vocabulary.
+
+- In English, one token is roughly **¾ of a word** (about 4 characters). "Relay handles refunds" is about 4–5 tokens.
+- **Other languages often use more tokens** for the same meaning. Hindi, Japanese and Arabic can take 2–3× as many tokens as English, so they cost more and fill the context faster.
+- **Code, JSON, URLs and IDs are token-hungry**: `"shipment_id": "ACM-2025-000183"` is far more tokens than its length suggests.
+- Tokenizers differ between model families, so **the same text has different token counts on different models.** Measure with the provider's token-counting endpoint, not a rule of thumb, when it matters.
+
+Why you care: **you pay per token, latency grows with tokens, and limits are in tokens.**
+
+## 2. Generation is one token at a time
+
+<Diagram
+	caption="Autoregressive generation: every output token requires another step that depends on all previous tokens. Input is processed in parallel (fast); output is sequential (slow)."
+	code={`flowchart LR
+    A["Prompt tokens<br/>processed in parallel"] --> B["Predict token 1"]
+    B --> C["Predict token 2<br/>sees prompt + token 1"]
+    C --> D["Predict token 3<br/>sees prompt + 1 + 2"]
+    D --> E["... until a stop condition<br/>end of turn, max_tokens, stop sequence, tool call"]`}
+/>
+
+This explains the latency profile of every LLM feature:
+
+| Metric | What it is | What drives it |
+|---|---|---|
+| **TTFT** (time to first token) | Wait before anything appears | Input length, model size, queueing at the provider, thinking time |
+| **TPS** (output tokens/sec) | Streaming speed | Model size and provider load |
+| **Total latency** | TTFT + output tokens ÷ TPS | Mostly **output length** |
+
+**Rule of thumb:** output tokens dominate latency. A 1,000-token answer at 60 tokens/sec takes about 17 seconds no matter how fast your servers are. That's why we stream (lesson 5) and why "be concise" in a prompt is also a latency optimization.
+
+## 3. The context window is a hard budget
+
+The **context window** is the maximum number of tokens a model can handle in one request: **input plus output combined**. Current frontier models offer 200K to 1M tokens. Everything competes for that space: system prompt, tool definitions, conversation history, retrieved documents, and room for the answer.
+
+Play with the budget. Then push "Conversation history" to the right, which is what happened in the incident above:
+
+<ContextBudget />
+
+Three things that are true even when you're **under** the limit:
+
+1. **Cost and latency scale with input.** A 150K-token request is slower and more expensive than a 5K one.
+2. **Quality on buried details can drop.** Models are much better at long context than they used to be, but a crucial fact in the middle of 300 pages is still more likely to be missed than one in a focused 3-page context. Measure this on your own data rather than trusting rules of thumb.
+3. **More context isn't free accuracy.** Irrelevant context distracts. The best systems send *less, but more relevant*, context. That's the whole game of RAG and context engineering.
+
+## 4. The API is stateless
+
+The model remembers nothing between requests. A "conversation" is your code **re-sending the entire history every turn**:
+
+```python
+messages = [
+    {"role": "user", "content": "Where is shipment ACM-183?"},
+    {"role": "assistant", "content": "It's in Rotterdam, arriving Thursday."},
+    {"role": "user", "content": "Can I change the delivery address?"},  # turn 3 re-sends turns 1–2
+]
+```
+
+Consequences:
+
+- **Cost grows with every turn** (turn 40 re-sends turns 1–39).
+- **Memory is your responsibility.** Truncate, summarize, or extract facts (like the order number) into structured state.
+- It's also an advantage: you control exactly what the model sees, which makes requests reproducible and debuggable.
+
+## 5. Thinking (reasoning) models
+
+Many current models can **think before answering**: they generate internal reasoning tokens, then the answer.
+
+- Thinking tokens are **billed as output tokens** and add latency, sometimes a lot.
+- You usually control *how much* the model thinks with an **effort** setting (e.g. `low` / `medium` / `high`), not by writing "think step by step."
+- Higher effort helps with hard reasoning, coding and multi-step agent work. For simple classification or chat, low effort is often just as accurate, and faster and cheaper.
+- The response contains **multiple content blocks** (thinking, text, tool calls). Never assume `content[0]` is the answer text.
+
+```python
+response = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=4000,
+    output_config={"effort": "low"},  # simple task: think less, answer faster
+    messages=[{"role": "user", "content": "Classify this ticket: 'my parcel is late'"}],
+)
+answer = "".join(b.text for b in response.content if b.type == "text")
+```
+
+## 6. Models know things, until they don't
+
+A model's built-in knowledge is **frozen at its training cutoff**, and it's **compressed and lossy**. Ask it something it doesn't know, and it doesn't return "unknown". It produces the most *plausible* continuation. That's a hallucination.
+
+**Engineering rule:** treat the model as a **reasoning engine over the context you give it**, not as a database. Facts that matter (policies, prices, order status) come from your systems, via retrieval or tools.
+
+<FailureCard
+	title="The 400 at message 40"
+	symptom="Long support conversations start failing with `400 invalid_request_error`, and before that the bot 'forgets' early details."
+	cause="The full history was re-sent each turn with no limit. It grew until **input + max_tokens exceeded the context window**. Before the hard failure, the important early details were diluted by thousands of tokens of chatter."
+	detect="Track input tokens per request (p95 and max) and alert at around 70% of the window; log `400` errors by type."
+	fix="Manage memory explicitly: keep the last N turns verbatim, **summarize** older turns, and pin critical facts (order number, customer ID) in a structured 'case state' block that's always included."
+/>
+
+<FailureCard
+	title="The Hindi support queue costs 2.5× more"
+	symptom="After launching in India, cost per ticket jumps, and some long tickets hit token limits."
+	cause="The same content in Hindi uses **2–3× as many tokens** as in English with many tokenizers. Budgets and limits were sized for English."
+	detect="Break down token usage and cost **by language** (and by customer segment) in your dashboards."
+	fix="Size budgets per language from real samples, compare tokenizer efficiency across models during model selection, and summarize long threads."
+/>
+
+<ThinkFirst question="Relay drafts replies of about 400 tokens. Users complain it 'feels slow'. Without changing the model, name two different changes that would make it feel faster, and say which metric each one improves.">
+
+1. **Stream the response.** Total latency is unchanged, but users see text within TTFT (about 1s) instead of waiting for the whole answer. This improves **perceived latency**, and it's usually the biggest UX win.
+2. **Reduce output tokens.** Ask for a shorter draft (e.g. 150 tokens) when that's acceptable, or use a structured format. This improves **total latency**, because output length dominates it.
+3. (Bonus) **Lower the thinking effort** for this simple task, which improves **TTFT**, since less reasoning happens before the first answer token.
+4. (Bonus) **Trim the input** (less history and irrelevant context), which reduces TTFT and cost.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** use your provider's token-counting endpoint (or tokenizer tool) to count tokens for the same paragraph in English, in another language you know, and as JSON. Record the ratios.
+- **Stretch:** measure TTFT and tokens/sec for one model at two effort levels, with 10 runs each. Plot the results. Does higher effort change TTFT, total time, or both?
+- **Boss level:** build a small "conversation memory" module for Relay: last 6 turns verbatim, a rolling summary of older turns, and a pinned `case_state` dict (order ID, customer, issue). Write a test that simulates a 60-turn conversation and asserts that input tokens stay under a budget **and** the order ID is never lost.
+
+</Practice>
+
+<Quiz
+	id="m1-how-llms-work"
+	questions={[
+		{
+			q: 'Which change most reduces **total** latency for a long generated answer?',
+			options: ['A faster web server', 'Fewer output tokens', 'A shorter system prompt', 'Using HTTP/2'],
+			answer: 1,
+			why: 'Output is generated sequentially, one token after another, so **output length dominates total latency**. A shorter prompt mostly improves time-to-first-token, and your web server is rarely the bottleneck.',
+		},
+		{
+			q: 'Conversation turn 30 costs much more than turn 3. Why?',
+			options: [
+				'Providers charge more for long conversations',
+				'The API is stateless, so your code re-sends the whole history every turn, and input tokens grow',
+				'The model gets tired',
+				'Caching stops working after 10 turns',
+			],
+			answer: 1,
+			why: 'Each request includes all previous turns. Without truncation or summarization, cost and latency per turn keep climbing until you hit the context window.',
+		},
+		{
+			q: 'Which statement about thinking tokens is correct?',
+			options: [
+				'They are free',
+				'They are billed as output tokens and add latency; effort settings control how much the model thinks',
+				'They only exist when you write "think step by step"',
+				'They are returned as the first text block',
+			],
+			answer: 1,
+			why: 'Reasoning has a real cost in money and time. Tune effort per task: high for hard reasoning and agents, low for simple classification.',
+		},
+		{
+			q: 'Relay needs the current refund policy. What is the right source of truth?',
+			options: [
+				'The model\'s training knowledge',
+				'The policy documents, provided in context through retrieval',
+				'A bigger model',
+				'A higher effort setting',
+			],
+			answer: 1,
+			why: 'Training knowledge is frozen and lossy, and it doesn\'t contain Acme\'s private policies anyway. **Ground answers in your data**, and the model reasons over it.',
+		},
+		{
+			q: 'The context window is 200K tokens. Your input is 195K and `max_tokens` is 16K. What happens?',
+			options: ['It works fine', 'The output is limited to 5K tokens automatically', 'The request is likely rejected, because input + output must fit in the window', 'The provider truncates your input'],
+			answer: 2,
+			why: 'The window covers input **and** output. Budget for the answer explicitly. Some APIs reject the request, others cut the output short, and neither is something to discover in production.',
+		},
+	]}
+/>
+
+<LessonComplete id="foundations/how-llms-work" />

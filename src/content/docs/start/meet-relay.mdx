@@ -1,0 +1,200 @@
+---
+title: Meet Relay + dev setup
+description: The customer, the project you'll build throughout the course, and the project skeleton every lab uses.
+sidebar:
+  order: 5
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+## The customer: Acme Logistics
+
+*Acme Logistics (fictional) moves freight for 4,000 business customers.* Their support team of 60 agents handles about 9,000 tickets a week:
+
+- **45%** are "where is my shipment?" questions, which need a lookup in the shipment database.
+- **25%** are policy questions (refunds, damages, customs), which need answers from 200 PDFs, many of them outdated.
+- **20%** are requests that need an action: refunds, address changes, re-deliveries.
+- **10%** are angry escalations.
+
+Average first response time is 9 hours. The VP of Support wants it under 1 hour **without** hiring 40 more people, and **without** the bot making promises the company can't keep.
+
+You're the engineer deployed to make that happen. Your product is **Relay**.
+
+<Diagram
+	caption="Where Relay ends up by the end of the course. You start with one box."
+	code={`flowchart LR
+    A["Acme agent<br/>Relay UI"] --> B["Relay API<br/>FastAPI"]
+    B --> C["Triage<br/>classify and draft"]
+    B --> D["Policy Q&A<br/>RAG over 200 PDFs"]
+    B --> E["Ops agent<br/>lookups, refunds with approval"]
+    E --> F["MCP servers<br/>CRM and shipment DB"]
+    B --> G["Gateway<br/>fallbacks, budgets"]
+    B -.-> H[("Traces + evals")]`}
+/>
+
+## Your toolbox
+
+| Tool | Why |
+|---|---|
+| **Python 3.12+** | The language of most AI backends |
+| **[uv](https://docs.astral.sh/uv/)** | Fast package and virtualenv manager |
+| **FastAPI + Uvicorn** | Relay's API layer (you already know it) |
+| **Node 22+** | For the Relay UI (React + Vercel AI SDK, Module 2) |
+| **Docker** | Postgres/pgvector, Langfuse, and deployment later |
+| **An LLM API key** | Examples use the Anthropic SDK; the concepts transfer to any provider |
+
+## Create the project
+
+```bash
+uv init relay && cd relay
+```
+
+```bash
+uv add fastapi "uvicorn[standard]" anthropic pydantic pydantic-settings
+```
+
+```bash
+uv add --dev pytest pytest-asyncio ruff
+```
+
+```text
+relay/
+├── app/
+│   ├── main.py          # FastAPI app
+│   ├── config.py        # settings from env
+│   ├── llm.py           # the ONE module that talks to model providers
+│   └── routes/
+├── evals/               # datasets + eval scripts (from Module 1)
+├── tests/
+├── docs/architecture.md # your evolving diagram
+├── .env                 # never committed
+└── pyproject.toml
+```
+
+:::tip[Put the provider behind one module]
+Every model call goes through `app/llm.py`. When you add tracing (Module 9), caching (Module 10) or a second provider (Module 11), you change one file instead of thirty. This is the cheapest architecture decision you'll ever make.
+:::
+
+## Configuration and secrets
+
+```python
+# app/config.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
+    anthropic_api_key: str
+    model: str = "claude-opus-5-5"
+    request_timeout_s: float = 30.0
+
+
+settings = Settings()
+```
+
+```bash
+# .env  (add .env to .gitignore BEFORE your first commit)
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+<FailureCard
+	title="The key in the commit history"
+	symptom="Your provider emails you: 'unusual usage detected'. $2,300 spent overnight from an IP you don't recognize."
+	cause="The API key was committed to a public repo in an early commit. It was removed later, but it's **still in git history**, and bots scan GitHub for keys within minutes."
+	detect="Provider usage alerts; secret scanning (GitHub secret scanning, `gitleaks` in pre-commit)."
+	fix="**Revoke the key immediately** (deleting the file isn't enough), issue a new one, add `.env` to `.gitignore`, add a pre-commit secret scanner, set spend limits, and use separate keys per environment."
+/>
+
+## Smoke test: your first call, measured from day 1
+
+Even the smoke test logs tokens and cost. That's the habit this course builds.
+
+```python
+# smoke.py
+import time
+
+import anthropic
+
+PRICE_PER_M = {"input": 4.00, "output": 20.00}  # USD per million tokens; check your provider's pricing page
+
+client = anthropic.Anthropic(timeout=30.0)  # reads ANTHROPIC_API_KEY
+
+start = time.perf_counter()
+msg = client.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=1000,
+    messages=[{"role": "user", "content": "In one sentence: what does a logistics support agent do?"}],
+)
+elapsed = time.perf_counter() - start
+
+# The response is a list of content blocks (it can include "thinking" blocks),
+# so collect the text blocks instead of assuming content[0] is text.
+text = "".join(block.text for block in msg.content if block.type == "text")
+cost = (
+    msg.usage.input_tokens * PRICE_PER_M["input"] + msg.usage.output_tokens * PRICE_PER_M["output"]
+) / 1_000_000
+
+print(text)
+print(f"stop_reason={msg.stop_reason} in={msg.usage.input_tokens} out={msg.usage.output_tokens} "
+      f"latency={elapsed:.2f}s cost=${cost:.5f}")
+```
+
+```bash
+uv run --env-file .env python smoke.py
+```
+
+You should see an answer plus a line like `stop_reason=end_turn in=24 out=61 latency=2.1s cost=$0.00132`. Those four numbers (finish reason, tokens, latency, cost) will appear in every trace you build from now on.
+
+<Practice>
+
+- **Warm-up:** run the smoke test five times. Record latency and output tokens for each run. How much do they vary?
+- **Stretch:** add `gitleaks` (or `detect-secrets`) as a pre-commit hook in `relay/`, then try to commit a fake key and watch it get blocked.
+- **Boss level:** turn the smoke test into `app/llm.py` with a function `complete(prompt) -> Completion` that returns text **and** a metrics object (tokens, latency, cost, stop reason), and appends a JSON line to `logs/calls.jsonl`. You've just built a tiny observability layer, and the next module builds on it.
+
+</Practice>
+
+<Quiz
+	id="start-relay"
+	questions={[
+		{
+			q: 'You accidentally pushed an API key and removed it in the next commit. What must you do?',
+			options: [
+				'Nothing, it was removed',
+				'Make the repo private',
+				'Revoke the key immediately and issue a new one. It stays in git history and bots scan for keys within minutes',
+				'Force-push to rewrite history, and that\'s enough',
+			],
+			answer: 2,
+			why: 'Treat any exposed key as compromised. Rewriting history and going private help, but the key may already be copied. **Revocation** is the only real fix.',
+		},
+		{
+			q: 'Why route every model call through a single `app/llm.py` module?',
+			options: [
+				'Python requires it',
+				'It makes later cross-cutting concerns (tracing, caching, retries, fallbacks, cost tracking) a one-file change',
+				'It makes calls faster',
+				'Providers require a single client',
+			],
+			answer: 1,
+			why: 'It\'s a seam for cross-cutting concerns. Teams that scatter SDK calls everywhere end up with inconsistent timeouts, no tracing, and painful provider migrations.',
+		},
+		{
+			q: 'Roughly 45% of Acme tickets are "where is my shipment?". What should Relay rely on to answer them?',
+			options: [
+				'The model\'s general knowledge',
+				'A lookup in the shipment database (a tool call), with the model handling language understanding and phrasing',
+				'Fine-tuning on old tickets',
+				'A static FAQ page',
+			],
+			answer: 1,
+			why: 'Shipment status is live, exact data, which makes it a **lookup** (remember "when not to use an LLM"). The model understands the question and phrases the answer; the database provides the truth.',
+		},
+	]}
+/>
+
+<LessonComplete id="start/meet-relay" />

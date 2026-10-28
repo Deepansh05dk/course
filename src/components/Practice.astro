@@ -1,0 +1,14 @@
+---
+interface Props {
+	title?: string;
+}
+
+const { title = 'Build it yourself' } = Astro.props;
+---
+
+<aside class="practice">
+	<p class="practice__head">🏋️ {title}</p>
+	<div class="practice__body">
+		<slot />
+	</div>
+</aside>

@@ -14,8 +14,11 @@ export default defineConfig({
 			customCss: ['./src/styles/custom.css'],
 			lastUpdated: false,
 			sidebar: [
-				{ label: 'Curriculum (draft for review)', link: '/curriculum/' },
+				{ label: 'Curriculum', link: '/curriculum/' },
 				{ label: 'Research: roles & skills', link: '/research/' },
+				{ label: '0 · Start Here', items: [{ autogenerate: { directory: 'start' } }] },
+				{ label: '1 · LLM Foundations', items: [{ autogenerate: { directory: 'foundations' } }] },
+				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
 			],
 		}),
 	],

@@ -1,0 +1,127 @@
+---
+import { inline } from './fmt';
+
+interface Question {
+	q: string;
+	options: string[];
+	answer: number;
+	why: string;
+}
+interface Props {
+	id: string;
+	title?: string;
+	questions: Question[];
+}
+
+const { id, title = 'Quiz', questions } = Astro.props;
+---
+
+<section class="quiz not-content" data-quiz={id} data-total={questions.length}>
+	<header class="quiz__head">
+		<span class="quiz__badge">✅ {title}</span>
+		<span class="quiz__score" aria-live="polite">0 / {questions.length}</span>
+	</header>
+	{
+		questions.map((question, qi) => (
+			<fieldset class="quiz__q" data-answer={question.answer}>
+				<legend>
+					<span class="quiz__num">{qi + 1}.</span> <Fragment set:html={inline(question.q)} />
+				</legend>
+				<div class="quiz__opts">
+					{question.options.map((opt, oi) => (
+						<button type="button" class="quiz__opt" data-index={oi}>
+							<span class="quiz__letter">{String.fromCharCode(65 + oi)}</span>
+							<span set:html={inline(opt)} />
+						</button>
+					))}
+				</div>
+				<p class="quiz__why" hidden>
+					<Fragment set:html={inline(question.why)} />
+				</p>
+			</fieldset>
+		))
+	}
+	<footer class="quiz__foot" hidden>
+		<p class="quiz__result"></p>
+		<button type="button" class="quiz__retry">Retry quiz</button>
+	</footer>
+</section>
+
+<script>
+	const store = {
+		get(key: string) {
+			try {
+				return localStorage.getItem(key);
+			} catch {
+				return null;
+			}
+		},
+		set(key: string, value: string) {
+			try {
+				localStorage.setItem(key, value);
+			} catch {
+				/* storage unavailable: the quiz still works, it just won't remember */
+			}
+		},
+	};
+
+	function verdict(pct: number) {
+		if (pct === 100) return 'Perfect. You could explain this in a design review. 🏆';
+		if (pct >= 70) return 'Solid. Re-read the explanations for the ones you missed. 💪';
+		return 'Worth a second pass. Re-read the lesson, then retry. 🔁';
+	}
+
+	for (const quiz of document.querySelectorAll<HTMLElement>('[data-quiz]')) {
+		const id = quiz.dataset.quiz!;
+		const total = Number(quiz.dataset.total);
+		const scoreEl = quiz.querySelector<HTMLElement>('.quiz__score')!;
+		const foot = quiz.querySelector<HTMLElement>('.quiz__foot')!;
+		const result = quiz.querySelector<HTMLElement>('.quiz__result')!;
+		let answered = 0;
+		let correct = 0;
+
+		const best = store.get(`quiz:${id}`);
+		if (best) scoreEl.textContent = `0 / ${total} · best ${best}`;
+
+		for (const fs of quiz.querySelectorAll<HTMLElement>('.quiz__q')) {
+			const answer = Number(fs.dataset.answer);
+			const buttons = [...fs.querySelectorAll<HTMLButtonElement>('.quiz__opt')];
+			buttons.forEach((btn) =>
+				btn.addEventListener('click', () => {
+					if (fs.dataset.done) return;
+					fs.dataset.done = '1';
+					const picked = Number(btn.dataset.index);
+					buttons[answer].classList.add('is-correct');
+					if (picked !== answer) btn.classList.add('is-wrong');
+					else correct++;
+					buttons.forEach((b) => (b.disabled = true));
+					fs.querySelector<HTMLElement>('.quiz__why')!.hidden = false;
+					answered++;
+					scoreEl.textContent = `${correct} / ${total}`;
+					if (answered === total) {
+						const pct = Math.round((correct / total) * 100);
+						result.textContent = `You scored ${correct}/${total} (${pct}%). ${verdict(pct)}`;
+						foot.hidden = false;
+						const prev = Number((store.get(`quiz:${id}`) ?? '0/').split('/')[0]);
+						if (correct >= prev) store.set(`quiz:${id}`, `${correct}/${total}`);
+					}
+				}),
+			);
+		}
+
+		quiz.querySelector('.quiz__retry')!.addEventListener('click', () => {
+			answered = 0;
+			correct = 0;
+			scoreEl.textContent = `0 / ${total}`;
+			foot.hidden = true;
+			for (const fs of quiz.querySelectorAll<HTMLElement>('.quiz__q')) {
+				delete fs.dataset.done;
+				fs.querySelector<HTMLElement>('.quiz__why')!.hidden = true;
+				for (const b of fs.querySelectorAll<HTMLButtonElement>('.quiz__opt')) {
+					b.disabled = false;
+					b.classList.remove('is-correct', 'is-wrong');
+				}
+			}
+		});
+	}
+</script>

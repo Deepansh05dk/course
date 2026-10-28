@@ -1,0 +1,160 @@
+---
+title: Anatomy of a production AI system
+description: The reference architecture you'll build during the course. What each component does, what fails without it, and what to build first.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The provider outage that took down checkout" severity="SEV1">
+An e-commerce company added an "AI product Q&A" widget to its product pages. The model provider had a 40-minute partial outage. The widget's API calls hung for 10 minutes each (default timeout), exhausting the web server's worker pool, and **checkout went down with it**. The AI feature wasn't even on the checkout page. It just shared the same servers.
+</Incident>
+
+The lesson: an LLM call is a **network dependency with seconds of latency, real failure rates, and per-call cost**. Production architecture exists to contain that. This is the system you'll build piece by piece as Relay.
+
+## The reference architecture
+
+<Diagram
+	caption="The production AI stack. Every box exists because something went wrong without it. Dashed lines are offline or asynchronous flows."
+	code={`flowchart TB
+    U["Client UI<br/>streaming, stop, citations, feedback"] --> API["App API<br/>FastAPI: auth, sessions, timeouts"]
+    API --> IG["Input guardrails<br/>PII redaction, injection checks, policy"]
+    IG --> CACHE{"Cache<br/>prompt and semantic"}
+    CACHE -- hit --> OUT
+    CACHE -- miss --> ROUTER["Model router<br/>pick tier by task and difficulty"]
+    ROUTER --> CTX["Context assembly<br/>RAG, memory, tool results"]
+    CTX --> AG["Agent / workflow engine<br/>loop, tools, budgets, approvals"]
+    AG --> GW["AI gateway<br/>keys, rate limits, retries, fallbacks"]
+    GW --> P1["Provider A"]
+    GW --> P2["Provider B / self-hosted"]
+    AG --> OUT["Output validation<br/>schemas, grounding, policy checks"]
+    OUT --> U
+    API -. traces .-> OBS[("Observability<br/>traces, cost, latency")]
+    OBS -. samples .-> EV["Evals<br/>offline CI gates and online scoring"]
+    U -. feedback .-> EV
+    EV -. regressions block deploys .-> API`}
+/>
+
+## Each component: why it exists and what breaks without it
+
+| Component | Why it exists | What breaks without it | Module |
+|---|---|---|---|
+| **Client UI** | Hides latency (streaming), shows evidence (citations), collects feedback | Users stare at spinners, over-trust wrong answers, and you have no signal | 2 |
+| **App API** | Owns auth, sessions, timeouts, and isolates the model from the rest of your system | The checkout incident above | 1 |
+| **Input guardrails** | Removes PII, catches injection attempts, enforces policy *before* tokens are spent | Data leaks to third parties; prompt injection reaches tools | 8 |
+| **Cache** | Re-uses work: provider prompt caching for stable prefixes, semantic caching for repeated questions | You pay full price for the same 10K-token system prompt millions of times | 10 |
+| **Model router** | Sends easy tasks to cheap models and hard ones to strong models | Either overpaying everywhere or failing on hard cases | 1, 10 |
+| **Context assembly** | Decides what the model sees: retrieved docs, memory, tool outputs | Hallucinations (missing facts) or confusion and cost (too many facts) | 1, 3–4 |
+| **Agent / workflow engine** | Runs multi-step work: tool calls, loops, approvals, budgets | Infinite loops, runaway cost, irreversible actions without a human | 6 |
+| **AI gateway** | One place for provider keys, rate limits, retries, fallbacks, spend caps | A provider outage becomes *your* outage; keys scattered across services | 9, 11 |
+| **Output validation** | Checks schema, grounding and policy before the user sees it | Broken JSON crashes the app; invented facts reach customers | 1, 8 |
+| **Observability** | Traces every call with inputs, outputs, tokens, cost, latency | "Who else got this answer?" has no answer | 9 |
+| **Evals** | Measures quality offline (CI) and online (sampled traffic) | Every change is a gamble; regressions found by customers | 5 |
+
+## The life of one request
+
+<Diagram
+	caption="A Relay request end to end. Notice how many steps happen before and after the model call, and how each one can fail independently."
+	code={`sequenceDiagram
+    autonumber
+    participant UI as Relay UI
+    participant API as FastAPI
+    participant G as Guardrails
+    participant R as Retriever
+    participant GW as Gateway
+    participant M as Model
+    participant T as Traces
+    UI->>API: POST /chat (question, session)
+    API->>G: check input (PII, injection, policy)
+    G-->>API: ok (redacted)
+    API->>R: hybrid search (user permissions)
+    R-->>API: top 5 chunks + sources
+    API->>GW: messages + context (timeout 30s, budget)
+    GW->>M: stream request
+    M-->>GW: tokens...
+    GW-->>API: tokens...
+    API-->>UI: SSE stream (text + citations)
+    API->>API: validate (grounded? schema? policy?)
+    API->>T: trace: inputs, outputs, tokens, cost, latency
+    UI->>API: thumbs down + comment
+    API->>T: attach feedback to trace`}
+/>
+
+## You don't build it all on day 1
+
+Production maturity is a ladder. Climbing it in the right order is a core FDE skill: customers need value *soon*, but not at the cost of a SEV1.
+
+| Stage | Must have | Can wait |
+|---|---|---|
+| **Internal prototype** | Timeouts, logging of inputs/outputs, cost tracking | Gateway, router, semantic cache |
+| **Pilot with real users** | + Streaming UI, output validation, a small eval set, basic guardrails, spend alerts | Multi-provider fallback, advanced routing |
+| **Production** | + Tracing, CI evals, fallbacks, permission-aware retrieval, incident runbook | Fine-tuning, self-hosting |
+| **Scale** | + Caching strategy, routing, online evals, cost optimization | Whatever the data says next |
+
+<ThinkFirst question="Relay's first pilot goes to 20 Acme support agents in two weeks. You only have time for three things from the table above. Which three, and why those?">
+
+A strong answer picks the three that prevent the worst outcomes for a **small, internal-but-real** audience:
+
+1. **Logging/tracing of every request** (inputs, outputs, tokens, latency). Without it you can't debug the pilot, measure it, or answer "what happened?" This is the foundation everything else needs.
+2. **A small eval set (30–50 real tickets) plus output validation.** It tells you whether the pilot is good enough, and catches regressions as you iterate daily.
+3. **Timeouts plus a graceful fallback in a streaming UI.** Agents use it all day, so hanging requests destroy trust fastest.
+
+What can wait: semantic caching (20 users won't hit cost limits), routing, multi-provider fallback. A spend alert is a 5-minute bonus worth adding anyway.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** pick an AI product you use (an IDE assistant, a support chatbot, an AI search engine). Draw its likely architecture using the boxes above. Which boxes are visible from the outside?
+- **Stretch:** for the checkout incident, write a one-paragraph post-mortem: timeline, root cause, three action items. Name the architecture components that would have prevented it.
+- **Boss level:** sketch Relay's architecture (Excalidraw, Mermaid, or paper) and commit it to your repo as `docs/architecture.md`. You'll update it at the end of every module, so by the end it's your interview whiteboard answer.
+
+</Practice>
+
+<Quiz
+	id="start-stack"
+	questions={[
+		{
+			q: 'In the checkout incident, what was the core architectural mistake?',
+			options: [
+				'Using the wrong model',
+				'The AI feature shared resources with checkout and had no timeout or isolation, so a slow dependency took everything down',
+				'Not using a vector database',
+				'Not streaming',
+			],
+			answer: 1,
+			why: 'It\'s classic dependency isolation. Short timeouts, separate worker pools (or services), and a fallback would have contained the outage to the widget. This is plain distributed-systems hygiene applied to LLM calls.',
+		},
+		{
+			q: 'Where should PII redaction happen?',
+			options: [
+				'After the model responds',
+				'Before the request leaves your system (input guardrails), and also in logs',
+				'Only in the UI',
+				'It\'s the model provider\'s job',
+			],
+			answer: 1,
+			why: 'Once PII is sent to a third-party model, it can\'t be unsent. Redact on the way in, and don\'t forget that **your own traces** can also leak PII.',
+		},
+		{
+			q: 'Which component lets you survive a single provider outage?',
+			options: ['Semantic cache', 'Model router', 'AI gateway with fallbacks', 'Output validation'],
+			answer: 2,
+			why: 'A gateway centralizes retries and **fallbacks to another provider or model**. Caches help a little (cached answers still work), but they can\'t serve new questions.',
+		},
+		{
+			q: 'For a 20-user internal pilot, which is the LEAST urgent?',
+			options: ['Request logging', 'A small eval set', 'Semantic caching', 'Timeouts with fallbacks'],
+			answer: 2,
+			why: 'Semantic caching is a **scale** optimization with its own risks (wrong cached answers). At 20 users, visibility, quality measurement and resilience matter far more.',
+		},
+	]}
+/>
+
+<LessonComplete id="start/production-stack" />

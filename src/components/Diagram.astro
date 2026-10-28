@@ -1,0 +1,67 @@
+---
+interface Props {
+	code: string;
+	caption?: string;
+}
+
+const { code, caption } = Astro.props;
+---
+
+<figure class="diagram not-content" data-diagram={code}>
+	<div class="diagram__svg" aria-busy="true">Rendering diagram…</div>
+	{caption && <figcaption>{caption}</figcaption>}
+	<button type="button" class="diagram__zoom" aria-label="Enlarge diagram">⤢ Enlarge</button>
+</figure>
+
+<script>
+	let counter = 0;
+
+	async function renderAll() {
+		const figures = document.querySelectorAll<HTMLElement>('[data-diagram]');
+		if (!figures.length) return;
+		const { default: mermaid } = await import('mermaid');
+		const dark = document.documentElement.dataset.theme !== 'light';
+		mermaid.initialize({
+			startOnLoad: false,
+			theme: dark ? 'dark' : 'default',
+			securityLevel: 'strict',
+			fontFamily: 'inherit',
+		});
+		for (const fig of figures) {
+			const target = fig.querySelector<HTMLElement>('.diagram__svg')!;
+			try {
+				const { svg } = await mermaid.render(`mmd-${counter++}`, fig.dataset.diagram!);
+				target.innerHTML = svg;
+			} catch (err) {
+				target.textContent = `Diagram failed to render: ${(err as Error).message}`;
+			}
+			target.removeAttribute('aria-busy');
+		}
+	}
+
+	// Enlarged view uses a native <dialog>: it renders in the browser's top layer,
+	// above Starlight's header and sidebars, and closes on Escape for free.
+	let dialog: HTMLDialogElement | undefined;
+	document.addEventListener('click', (event) => {
+		const btn = (event.target as Element).closest('.diagram__zoom');
+		if (!btn) return;
+		if (!dialog) {
+			dialog = document.createElement('dialog');
+			dialog.className = 'diagram-dialog';
+			dialog.innerHTML = '<button type="button" class="diagram-dialog__close">✕ Close</button><div class="diagram-dialog__body"></div>';
+			dialog.querySelector('button')!.addEventListener('click', () => dialog!.close());
+			dialog.addEventListener('click', (e) => e.target === dialog && dialog!.close());
+			document.body.append(dialog);
+		}
+		const svg = btn.closest('[data-diagram]')!.querySelector('.diagram__svg')!.innerHTML;
+		dialog.querySelector('.diagram-dialog__body')!.innerHTML = svg;
+		dialog.showModal();
+	});
+
+	renderAll();
+	// Re-render when the reader flips Starlight's light/dark theme.
+	new MutationObserver(renderAll).observe(document.documentElement, {
+		attributes: true,
+		attributeFilter: ['data-theme'],
+	});
+</script>

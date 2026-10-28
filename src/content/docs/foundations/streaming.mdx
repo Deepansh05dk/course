@@ -1,0 +1,253 @@
+---
+title: Streaming end to end
+description: Async FastAPI, Server-Sent Events and a browser stream reader, plus the production problems (cancellation, buffering, mid-stream errors) most tutorials skip.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'The assistant freezes and then dumps a wall of text'" severity="SEV3">
+Support tickets about Relay doubled in a week. Nothing was broken: responses took 12 seconds on average and arrived all at once. Agents assumed it had hung, clicked again (creating duplicate requests), or gave up. After streaming shipped, average latency was **still 12 seconds**, and the complaints stopped.
+</Incident>
+
+Streaming doesn't make the model faster. It changes **when** the user sees progress, from total latency (about 12s) to time-to-first-token (about 1s). For interactive features it's the single biggest UX win, and you already have the frontend skills to do it well.
+
+## The pipeline
+
+<Diagram
+	caption="Tokens flow through three hops. Every hop can buffer, break, or keep running after the user leaves."
+	code={`sequenceDiagram
+    participant B as Browser
+    participant P as Proxy / CDN
+    participant A as FastAPI (async)
+    participant M as Model API
+    B->>P: POST /chat/stream
+    P->>A: forward
+    A->>M: messages.stream(...)
+    M-->>A: text delta "Your"
+    A-->>P: data: {"type":"delta","text":"Your"}
+    P-->>B: (must NOT buffer)
+    M-->>A: text delta " shipment"
+    A-->>B: data: {"type":"delta","text":" shipment"}
+    Note over B: user clicks Stop
+    B--xA: connection closed (AbortController)
+    A--xM: cancel upstream stream (stop paying)
+    M-->>A: (no more tokens)`}
+/>
+
+**Why SSE (Server-Sent Events)?** It's plain HTTP, one direction (server → client), and works through most infrastructure. WebSockets are bidirectional but heavier to operate. Use them when you need real duplex communication, such as voice.
+
+## Backend: async FastAPI + SSE
+
+```python
+# app/routes/chat.py
+import json
+
+import anthropic
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from app.config import settings
+
+router = APIRouter()
+client = anthropic.AsyncAnthropic(timeout=settings.request_timeout_s, max_retries=2)
+
+
+class ChatRequest(BaseModel):
+    messages: list[dict]
+
+
+def sse(event: dict) -> str:
+    # JSON-encode every event so newlines inside tokens can't break the SSE framing.
+    return f"data: {json.dumps(event)}\n\n"
+
+
+@router.post("/chat/stream")
+async def chat_stream(body: ChatRequest, request: Request):
+    async def events():
+        try:
+            async with client.messages.stream(
+                model=settings.model,
+                max_tokens=4000,
+                system="You are Relay, Acme Logistics' support assistant. Be concise.",
+                messages=body.messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    if await request.is_disconnected():
+                        # User left: exiting the `async with` closes the upstream stream.
+                        return
+                    yield sse({"type": "delta", "text": text})
+                final = await stream.get_final_message()
+                yield sse({
+                    "type": "done",
+                    "stop_reason": final.stop_reason,
+                    "usage": {"in": final.usage.input_tokens, "out": final.usage.output_tokens},
+                })
+        except anthropic.APIError:
+            # Headers (200 OK) are already sent, so errors must travel *inside* the stream.
+            yield sse({"type": "error", "message": "Relay is having trouble. Please retry."})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},  # tell nginx not to buffer
+    )
+```
+
+Three details that matter in production:
+
+1. **`AsyncAnthropic` + `async def`:** while a stream waits on the network, the worker serves other requests. A sync client inside an async endpoint blocks the event loop and freezes *every* request on that worker.
+2. **Errors after the first byte:** once streaming starts, the HTTP status is already `200`. Failures must be sent as an `error` event the UI understands.
+3. **A `done` event with `stop_reason` and usage:** the UI needs to know whether the answer finished or was truncated, and you need the usage for cost tracking.
+
+## Frontend: reading the stream
+
+The browser's `EventSource` only supports GET, so for a POST with a JSON body we read the stream with `fetch`:
+
+```ts
+// relay-ui/src/lib/streamChat.ts
+export type StreamEvent =
+	| { type: 'delta'; text: string }
+	| { type: 'done'; stop_reason: string; usage: { in: number; out: number } }
+	| { type: 'error'; message: string };
+
+export async function streamChat(
+	messages: { role: string; content: string }[],
+	onEvent: (e: StreamEvent) => void,
+	signal: AbortSignal,
+) {
+	const res = await fetch('/api/chat/stream', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ messages }),
+		signal, // aborting closes the connection, and the server stops generating
+	});
+	if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+	const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+	let buffer = '';
+	while (true) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		buffer += value;
+		// SSE events are separated by a blank line; keep any partial event in the buffer.
+		const events = buffer.split('\n\n');
+		buffer = events.pop() ?? '';
+		for (const raw of events) {
+			const line = raw.split('\n').find((l) => l.startsWith('data: '));
+			if (line) onEvent(JSON.parse(line.slice(6)));
+		}
+	}
+}
+```
+
+```ts
+// usage in a component
+const controller = new AbortController();
+stopButton.onclick = () => controller.abort();
+await streamChat(history, (e) => {
+	if (e.type === 'delta') appendToMessage(e.text);
+	if (e.type === 'done' && e.stop_reason === 'max_tokens') showTruncatedNotice();
+	if (e.type === 'error') showRetryBanner(e.message);
+}, controller.signal);
+```
+
+:::tip[Coming in Module 2: the Vercel AI SDK]
+In Module 2 you'll replace this hand-written reader with the AI SDK's UI hooks, which handle message state, streaming, tool-call rendering and stop/regenerate for you. Writing it by hand first means you'll know exactly what to debug when the abstraction misbehaves.
+:::
+
+<FailureCard
+	title="Streaming works locally, not in production"
+	symptom="On localhost tokens stream smoothly. Behind the production load balancer, the whole answer arrives at once after 12 seconds."
+	cause="A proxy layer (nginx, a CDN, an ingress, or compression middleware) **buffers** the response until it completes or a buffer fills."
+	detect="Test streaming *through the real infrastructure* in staging: `curl -N` against the public URL and watch whether the bytes arrive in pieces."
+	fix="Disable buffering for SSE routes (`X-Accel-Buffering: no`, `proxy_buffering off`), exclude `text/event-stream` from gzip middleware, and check your CDN's streaming support."
+/>
+
+<FailureCard
+	title="Stop doesn't stop the bill"
+	symptom="Users click Stop on long answers, but token usage per request doesn't drop at all."
+	cause="The browser closed the connection, but the backend kept consuming the model stream to the end and paid for every token."
+	detect="Compare the number of tokens the client *displayed* vs tokens *billed* per request; log disconnect events."
+	fix="Propagate cancellation end to end: `AbortController` in the browser, disconnect detection in the server, and close the upstream stream (exit the `async with`)."
+/>
+
+<FailureCard
+	title="Duplicate requests from impatient users"
+	symptom="Some conversations have two identical assistant replies, and costs are about 15% above estimate."
+	cause="Users clicked Send again while waiting. The UI didn't disable input or show progress."
+	detect="Count requests with an identical session and message within a few seconds."
+	fix="Disable Send while streaming, show a typing indicator immediately, and make the endpoint idempotent with a client-generated `request_id`."
+/>
+
+<ThinkFirst question="Acme's warehouse staff use Relay on handheld devices over flaky Wi-Fi that drops for 2–5 seconds at a time. Long answers get cut off mid-stream. How would you redesign the streaming so an answer survives a disconnect?">
+
+**Make the generation independent of the connection, and make the stream resumable:**
+
+1. **Decouple generation from delivery:** start generation as a background task keyed by `message_id`, and write tokens to a store (Redis stream or Postgres) as they arrive.
+2. **Resumable SSE:** each event carries an incrementing `id`. On reconnect, the client sends `Last-Event-ID` (or `?after=123`) and the server replays missed events, then continues live.
+3. **Idempotent start:** the client generates `message_id` up front, so a retried "send" doesn't start a second generation.
+4. **Cancellation becomes explicit:** a `POST /messages/{id}/cancel` endpoint, since a closed connection no longer means "stop".
+5. **UX:** show "reconnecting…" instead of an error, and keep the partial text visible.
+
+The trade-off is more moving parts (a store, background workers), so you only pay this complexity where the network is truly unreliable.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the endpoint and stream it with `curl -N -X POST ... ` in the terminal. Measure TTFT vs total time.
+- **Stretch:** build a minimal React (or plain HTML) chat page using `streamChat`, with a Stop button, a disabled Send button while streaming, and a "truncated" notice. Verify in your server logs that Stop actually ends generation.
+- **Boss level:** implement the **resumable stream** from the design drill with Redis Streams: background generation, event IDs, and replay on reconnect. Kill your Wi-Fi mid-answer and watch it resume.
+
+</Practice>
+
+<Quiz
+	id="m1-streaming"
+	questions={[
+		{
+			q: 'What does streaming primarily improve?',
+			options: ['Total generation time', 'Perceived latency, because users see progress after the time to first token', 'Token cost', 'Model accuracy'],
+			answer: 1,
+			why: 'Total time is about the same, but the user sees text after about 1s instead of waiting for the whole answer. Perceived latency drives user trust.',
+		},
+		{
+			q: 'Why use `AsyncAnthropic` inside an `async def` FastAPI endpoint?',
+			options: [
+				'It is cheaper',
+				'A blocking (sync) client would freeze the event loop, stalling every other request on that worker while it waits',
+				'Sync clients cannot stream',
+				'FastAPI requires it',
+			],
+			answer: 1,
+			why: 'In async frameworks, blocking I/O on the event loop serializes all requests. Use the async client (or run sync code in a threadpool).',
+		},
+		{
+			q: 'The model API fails halfway through a streamed answer. What can your server still do?',
+			options: [
+				'Change the HTTP status to 500',
+				'Send an error event inside the stream that the UI knows how to show',
+				'Nothing',
+				'Redirect the user',
+			],
+			answer: 1,
+			why: 'The status line (200) and headers were sent with the first byte. In-band error events are the only channel left, so design your event protocol for them.',
+		},
+		{
+			q: 'Streaming works locally but arrives all at once in production. The most likely cause?',
+			options: ['The model is slower in production', 'A proxy, CDN or compression layer is buffering the response', 'SSE is not supported by browsers', 'Python is too slow'],
+			answer: 1,
+			why: 'Buffering intermediaries are the classic culprit. Always test streaming through the real infrastructure.',
+		},
+	]}
+/>
+
+<LessonComplete id="foundations/streaming" />

@@ -1,0 +1,123 @@
+---
+title: "The roles: FDE vs Applied AI vs GenAI Engineer"
+description: What each role does day to day, how they overlap, and which one to target first.
+sidebar:
+  order: 2
+---
+
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+Three job titles dominate AI-engineering hiring in 2026. They share most of their skills and differ in **where you spend your time** and **who you answer to**.
+
+<Diagram
+	caption="The shared core is large. Each role adds its own specialty on top."
+	code={`flowchart TB
+    core["Shared core: LLM APIs · context engineering · RAG · agents · evals · observability · Python/FastAPI"]
+    fde["FDE: customer discovery · integration with messy systems · deploying in customer environments · communication"]
+    aai["Applied AI Eng: eval depth · error analysis · quality/cost/latency tuning · product UX"]
+    gen["GenAI Eng: RAG pipelines · agent frameworks · MCP · cloud AI platforms · sometimes fine-tuning"]
+    core --> fde
+    core --> aai
+    core --> gen`}
+/>
+
+## Forward Deployed Engineer (FDE)
+
+You **sit with the customer** and make the AI product work in *their* world, with their data, systems, security rules and people.
+
+- **A typical week:** a discovery call with operations staff, reading a CSV export that turns out to have 14 date formats, writing a connector to a 15-year-old SOAP API, demoing a pilot to a VP, and debugging why the deployment can't reach the model endpoint from inside their VPC.
+- **What's distinctive:** you own the outcome from discovery through system design, implementation, evaluation and production rollout. You're judged on whether the customer gets value, not on how elegant the code is.
+- **Who hires:** model labs, AI-native startups, data/AI platforms (Palantir popularized the title), consultancies, defense tech.
+- **Demand:** one analysis counted FDE and adjacent postings rising from about 640 (April 2025) to about 5,300 (April 2026). Treat the exact numbers loosely; the trend is clear.
+
+## Applied AI Engineer
+
+You **build AI features into a product** and you're accountable for their quality in production.
+
+- **A typical week:** reading 100 production traces to categorize failures, adding a reranker, writing an LLM-judge for "did the answer cite the right policy," cutting p95 latency with streaming and caching, and evaluating whether a new model can replace the current one.
+- **What's distinctive:** depth on reliability. A common 2026 framing is that the job is "reliability engineering around models, not model building."
+
+## GenAI Engineer
+
+This is the title enterprises and consultancies use most. Postings lean toward **building blocks and platforms**.
+
+- **A typical week:** building an ingestion pipeline for 50,000 documents, wiring an agent with LangGraph, exposing an internal system as an MCP server, and deploying on Azure AI Foundry or Bedrock.
+- **What's distinctive:** more tool- and platform-specific requirements, and occasionally fine-tuning (LoRA/QLoRA).
+
+## Side by side
+
+| | FDE | Applied AI Eng. | GenAI Eng. |
+|---|---|---|---|
+| Main stakeholder | The customer | Product team and users | Business units and clients |
+| Core output | A deployment that proves value | A reliable AI feature | AI pipelines and platforms |
+| Weighted skills | Integration, field debugging, scoping, communication | Evals, context engineering, observability, cost | RAG, agents, MCP, cloud AI platforms |
+| Customer-facing | High | Low | Medium |
+| Typical experience asked | ~3–6 yrs, but strong portfolios get in earlier | 2–5 yrs | 3–5 yrs, with 1–2 in GenAI |
+
+## Which one should you target first?
+
+<ThinkFirst
+	title="Career drill"
+	question="You have about 2 years of experience, strong frontend skills, and you're comfortable with Python/FastAPI. Which role would you target first, and what is the biggest gap you'd need to close?"
+>
+
+**Recommended path: Applied AI Engineer first, then FDE.**
+
+- Your frontend skill is a real differentiator. Many AI engineers can build the pipeline, but few can ship a UX that handles streaming, citations, approvals and wrong answers well.
+- FastAPI already covers the backend half of most AI products.
+- The gap is **LLM-specific engineering**: evals, retrieval, agents, observability, cost. Modules 1–11 cover it.
+- FDE comes next. FDE interviews test end-to-end ownership and customer judgment, which Module 12 and Capstone 4 build. FDE experience bars are often higher, so **deployed projects with honest post-mortems** matter more than certificates.
+
+</ThinkFirst>
+
+:::note[What none of these roles usually require]
+Training models from scratch, heavy maths, or research publications. Fine-tuning appears in some postings, but the consistent industry advice is that prompting plus retrieval solves most production problems more cheaply. We treat fine-tuning as a "know when to use it" skill in Module 11.
+:::
+
+<Practice>
+
+- **Warm-up:** collect 10 real job postings (5 FDE, 5 Applied AI/GenAI). Highlight every skill and count how often each appears. Compare your list with the [research page](/research/).
+- **Stretch:** write the three-sentence pitch you'd give in an FDE interview: who you are, one thing you shipped, and what you'd do in a customer's first week.
+- **Boss level:** create a `career.md` in your repo with a skills matrix (skill × "can explain / can build / have shipped"). Update it at the end of every module, and you'll watch the "shipped" column fill up.
+
+</Practice>
+
+<Quiz
+	id="start-roles"
+	questions={[
+		{
+			q: 'Which activity is most characteristic of an FDE rather than an Applied AI Engineer?',
+			options: [
+				'Writing an LLM-as-judge eval',
+				'Running a discovery session with a customer to find which workflow to automate',
+				'Adding a reranker to a RAG pipeline',
+				'Tuning prompt caching',
+			],
+			answer: 1,
+			why: 'Everyone on an AI team writes evals and tunes pipelines. **Customer discovery** and owning the deployment inside the customer\'s environment is what defines the FDE.',
+		},
+		{
+			q: 'A posting asks for "custom MCP servers using the official SDKs to expose internal databases to agents." Which title is it most likely under?',
+			options: ['Frontend Engineer', 'GenAI Engineer', 'Data Analyst', 'ML Research Scientist'],
+			answer: 1,
+			why: 'MCP server development appears as a named requirement in 2026 **GenAI Engineer** postings, and increasingly in FDE ones too. Research scientists focus on models, not integrations.',
+		},
+		{
+			q: 'What do hiring managers say counts most for these roles?',
+			options: [
+				'Certificates from online courses',
+				'Knowing every agent framework',
+				'Deployed projects with evals and a written post-mortem of what failed',
+				'A list of models you have used',
+			],
+			answer: 2,
+			why: 'Deployed work plus evidence that you **measured** it and **learned from failures** is the strongest signal. Framework lists and certificates are easy to fake and say little about judgment.',
+		},
+	]}
+/>
+
+<LessonComplete id="start/roles" />

@@ -1,0 +1,128 @@
+---
+title: How this course works
+description: The lesson format, the interactive pieces, and how to get the most out of them.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+Welcome. This course turns a software engineer into someone companies trust to put LLM systems in front of real users. The fastest way to explain how it works is to show you, so here's a lesson in miniature.
+
+<Incident title="The demo that worked" severity="SEV2">
+A team demos an "AI email summarizer" to leadership. It's flawless on five hand-picked emails. It ships on Monday. By Wednesday:
+
+- 3% of summaries invent a meeting time that isn't in the email.
+- Long email threads time out after 60 seconds and show users a blank card.
+- The finance team asks why the API bill is 11× the estimate.
+
+Nobody wrote bad code. They wrote **demo code** and called it a product.
+</Incident>
+
+That gap between demo and product is what this course is about.
+
+## The five questions
+
+Every lesson trains the same reflex. Before you ship *anything* that touches a model, you ask:
+
+1. **Why does this exist?** What breaks if we skip it?
+2. **What can fail?** Wrong, slow, missing, expensive, or unsafe output.
+3. **How would we know?** Which metric, eval, trace or alert?
+4. **What's the blast radius?** Who gets hurt, how much does it cost, can it be undone?
+5. **What's the trade-off?** Quality vs latency vs cost vs complexity.
+
+Run the summarizer incident through them: invented meeting times are **wrong output**, and nobody knew because there was **no eval**. Timeouts are **missing output** with no fallback UI. The bill is **expensive output** that nobody estimated. All three would have been caught by asking these questions before shipping.
+
+## The interactive pieces
+
+### 💥 Failure cards: diagnose before you peek
+
+You'll see a symptom. **Form a hypothesis first**, then reveal. Guessing wrong and then reading the answer teaches you more than reading it straight away.
+
+<FailureCard
+	title="The 11× bill"
+	symptom="The cost estimate assumed 500 input tokens per request. Production averages 5,600."
+	cause="The estimate used a single email. Production sends **whole threads**, plus a growing system prompt and a few examples, and **retries resend everything**."
+	detect="Log `usage.input_tokens` and `usage.output_tokens` on every call, and chart p50/p95 tokens per request from day 1."
+	fix="Estimate from real samples (p95, not average). Trim threads, cache the stable prefix, and set per-request token caps and spend alerts."
+/>
+
+### 🏗️ Design drills: commit before the reveal
+
+The expert answer stays locked until you write your own. This feels slow, and that's the point. Interviews and customer calls won't give you a reveal button.
+
+<ThinkFirst question="The summarizer must ship again next week. List the three changes you would make first, and say why.">
+
+A strong answer covers the three failure classes:
+
+1. **Measure correctness:** build a 50–100 email eval set from *real* threads (including long and messy ones), with a check that every time and date in the summary appears in the source. Run it on every change.
+2. **Handle slowness:** stream the summary so users see progress, set a timeout, and show a graceful fallback ("Summary unavailable, open the email") instead of a blank card.
+3. **Control cost:** estimate from the p95 token count, truncate or summarize very long threads first, cache the stable prompt prefix, and set a spend alert.
+
+Bonus points: log every input/output pair (with PII handling) so the next incident can be debugged from traces instead of guesswork.
+
+</ThinkFirst>
+
+### 🏋️ Build it yourself
+
+Every lesson ends with a practice ladder. **Warm-up** takes about 30 minutes, **Stretch** an evening, and **Boss level** a weekend project that's portfolio-worthy. You learn this field by building, so don't skip them.
+
+<Practice>
+
+- **Warm-up:** pick any AI feature you use daily (autocomplete, a summarizer, a chatbot). Write down how it could fail in each of the five ways.
+- **Stretch:** find a public post-mortem or news story about an AI feature failing. Map it to the five questions.
+- **Boss level:** start a "failure journal" (a markdown file in your repo). Every time something in this course surprises you, log it. It becomes interview material.
+
+</Practice>
+
+### 🔥 Incident drills and ✅ quizzes
+
+Incident drills are branching simulations: you're paged, you choose what to do, and each choice costs (or saves) minutes of user impact. Quizzes explain **every** option, including why the wrong ones are wrong, and your best score is saved in your browser.
+
+<Quiz
+	id="welcome"
+	title="Warm-up quiz"
+	questions={[
+		{
+			q: 'The summarizer invents meeting times in 3% of outputs. Which of the five failure classes is this?',
+			options: ['Slow output', 'Wrong output', 'Expensive output', 'Unsafe output'],
+			answer: 1,
+			why: "It's **wrong output**, and the dangerous kind, because it looks fluent and confident. Wrong output is mostly invisible without evals, which is why evals show up in every module.",
+		},
+		{
+			q: 'What is the most reliable way to estimate the token cost of a feature before launch?',
+			options: [
+				'Use one representative example',
+				'Ask the model how many tokens it will use',
+				'Measure p50 and p95 tokens on a sample of real inputs, including retries and history',
+				'Use the context window size as the estimate',
+			],
+			answer: 2,
+			why: 'Real inputs have a long tail, and the tail drives cost. One example (A) is how teams get 11× bills. Models can\'t predict their own usage (B). The context window (D) is a limit, not an estimate.',
+		},
+		{
+			q: 'Why do design drills hide the answer until you type?',
+			options: [
+				'To slow you down for no reason',
+				'Because committing to an answer first and then comparing produces much stronger learning than reading',
+				'To collect your data',
+				'Because the answer is long',
+			],
+			answer: 1,
+			why: 'This is the "generation effect": producing an answer before seeing the solution improves retention. Nothing you type leaves your browser.',
+		},
+	]}
+/>
+
+## How to study
+
+- Do the lessons **in order** within a module. The Relay project builds on itself.
+- Keep a repo called `relay` from Module 0 onward. Commit after every lesson.
+- When a lesson says "measure it," actually measure it. Numbers you produced yourself beat numbers you read in a blog post, and they're what you'll talk about in interviews.
+
+<LessonComplete id="start/welcome" />

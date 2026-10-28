@@ -1,0 +1,202 @@
+---
+title: Choosing a model
+description: Frontier vs small vs open-weight models, the dimensions that actually matter, and how to run a model bake-off on your own data.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The leaderboard winner that lost" severity="SEV3">
+A team switched their contract-extraction pipeline to the model at the top of a public leaderboard. Benchmarks said it was better. In production, extraction accuracy on *their* contracts dropped 6 points, latency doubled, and it wasn't available in the cloud region their enterprise customers required. They rolled back after two weeks.
+</Incident>
+
+**There is no "best model".** There's a best model *for your task, data, latency budget, cost budget and constraints*, and the only way to find it is to measure.
+
+## The dimensions that matter
+
+| Dimension | Questions to ask |
+|---|---|
+| **Quality on your task** | Does it pass *your* eval set? Public benchmarks are a starting filter, not an answer |
+| **Latency** | What are TTFT and tokens/sec at your input sizes? With thinking on or off? |
+| **Cost** | Per completed task, including retries, thinking and agent turns |
+| **Context window** | Does your worst-case input fit with room for output? |
+| **Capabilities** | Tool use, structured outputs, vision/PDF input, long output, caching, batch |
+| **Data and compliance** | Retention terms, zero-data-retention options, regions, certifications (critical for FDE work) |
+| **Availability** | Which clouds offer it (direct API, Bedrock, Vertex, Azure)? Rate limits for your tier? |
+| **Lifecycle** | When will it be deprecated? How painful is migration? |
+
+## The landscape in tiers
+
+Names change every few months; the tiers don't.
+
+| Tier | Strengths | Typical uses |
+|---|---|---|
+| **Frontier** (largest models from major labs) | Hardest reasoning, long agentic tasks, coding, nuanced writing | Agents, complex analysis, the "teacher" in evals |
+| **Mid tier** | Strong quality at a lower price and latency | Most production chat, RAG answers, tool use |
+| **Small / fast** | Very cheap, very fast | Classification, routing, extraction, high-volume pipelines |
+| **Open-weight** (e.g. Llama, Mistral, Qwen, DeepSeek families) | Self-hostable, fine-tunable, full data control | Air-gapped or regulated environments, very high volume, custom fine-tunes |
+
+<Diagram
+	caption="A practical starting heuristic. Then let your eval decide."
+	code={`flowchart TD
+    A["New feature"] --> B{"Must data stay in<br/>your own infrastructure?"}
+    B -- Yes --> C["Open-weight, self-hosted<br/>or a private cloud deployment"]
+    B -- No --> D{"Hard reasoning, long agent loops,<br/>or complex code?"}
+    D -- Yes --> E["Start with frontier"]
+    D -- No --> F{"Very high volume and<br/>narrow task?"}
+    F -- Yes --> G["Start small, step up only if the eval fails"]
+    F -- No --> H["Start mid tier"]
+    E --> I["Run a bake-off on your eval set"]
+    G --> I
+    H --> I
+    C --> I`}
+/>
+
+:::tip[Start strong, then step down]
+Prototype with a strong model to learn what's *possible*, build the eval, then try cheaper models against it. Starting with a weak model risks concluding "AI can't do this" when the model was simply too small.
+:::
+
+## Run a bake-off
+
+A bake-off is a small, repeatable experiment: same inputs, several models, scored the same way.
+
+```python
+# evals/bakeoff.py
+import json
+import statistics
+import time
+
+import anthropic
+
+client = anthropic.Anthropic(timeout=60.0)
+MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+CASES = [json.loads(line) for line in open("evals/triage_golden.jsonl")]
+# each case: {"ticket": "...", "expected_category": "refund"}
+
+SYSTEM = "Classify the support ticket into exactly one of: tracking, refund, damage, address_change, other. Reply with the category only."
+
+
+def run(model: str) -> dict:
+    correct, latencies, out_tokens = 0, [], []
+    for case in CASES:
+        start = time.perf_counter()
+        msg = client.messages.create(
+            model=model,
+            max_tokens=2000,
+            system=SYSTEM,
+            messages=[{"role": "user", "content": case["ticket"]}],
+        )
+        latencies.append(time.perf_counter() - start)
+        out_tokens.append(msg.usage.output_tokens)
+        text = "".join(b.text for b in msg.content if b.type == "text").strip().lower()
+        correct += text == case["expected_category"]
+    return {
+        "model": model,
+        "accuracy": round(correct / len(CASES), 3),
+        "p50_latency_s": round(statistics.median(latencies), 2),
+        "p95_latency_s": round(statistics.quantiles(latencies, n=20)[-1], 2),
+        "avg_output_tokens": round(statistics.mean(out_tokens)),
+    }
+
+
+for model in MODELS:
+    print(run(model))
+```
+
+Then put the results in a decision table and add cost per 1K tasks from the [cost calculator](/foundations/cost-math/):
+
+| Model | Accuracy | p95 latency | $ / 1K tickets | Verdict |
+|---|---|---|---|---|
+| Frontier | 0.96 | 4.1s | $18 | Ceiling: shows what's achievable |
+| Mid | 0.95 | 2.3s | $9 | ✅ Best trade-off? |
+| Small | 0.89 | 0.8s | $0.5 | Fails the 0.93 bar, unless used as a first-pass router |
+
+*(The numbers above are illustrative. Your job is to produce real ones.)*
+
+:::note[Bake-off hygiene]
+Use **50–200 real examples**, including hard and weird ones. Run each model **more than once** (outputs vary). Report **p95**, not just averages. Fix the prompt *before* comparing models, and note that each model may need small prompt tweaks to be at its best.
+:::
+
+<FailureCard
+	title="The silent model retirement"
+	symptom="One morning every request returns `404 not_found_error: model not found`. The feature is completely down."
+	cause="The pinned model version reached its **retirement date**. Deprecation notices went to an unmonitored email address."
+	detect="Track provider deprecation pages and emails; put the model ID in config with an owner; alert on any 404/400 spike."
+	fix="Keep model IDs in config, not code. Plan migrations: run the bake-off on the replacement **before** the deadline, and keep a tested fallback model configured in the gateway."
+/>
+
+<FailureCard
+	title="Wrong region, no deal"
+	symptom="An FDE pilot is blocked by the customer's security review: 'data must not leave the EU'."
+	cause="The chosen model wasn't available in an EU region on the customer's approved cloud platform."
+	detect="Ask about data residency and approved vendors in **discovery**, before building anything."
+	fix="Include region, cloud availability and data-retention terms in model selection. Often the answer is the same model family via the customer's cloud (Bedrock, Vertex, Azure)."
+/>
+
+<ThinkFirst question="Acme wants Relay to (1) classify 9,000 tickets a week, (2) answer policy questions from documents, and (3) run an agent that issues refunds with approval. Would you use one model for all three? Explain your choice per feature.">
+
+**Probably not one model. Pick per feature by task difficulty and stakes:**
+
+1. **Classification:** start with a **small/fast** model. It's high volume, narrow, and easy to evaluate. Step up only if it fails your accuracy bar (or use it as a router with a fallback to a bigger model when it's uncertain).
+2. **Policy Q&A (RAG):** a **mid-tier** model is often enough when retrieval is good. The answer quality depends more on retrieving the right chunks than on raw model power. Verify faithfulness with evals.
+3. **Refund agent:** a **frontier or strong mid** model. It does multi-step reasoning with tool calls and real money at stake. Errors cost more than tokens.
+
+Keep all three behind your `llm.py` and gateway so swapping models is a config change, and re-run the bake-off whenever a new model generation ships.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** write 30 labeled triage examples (`evals/triage_golden.jsonl`) from realistic logistics tickets, including 5 tricky ones (sarcasm, two issues in one ticket, other languages).
+- **Stretch:** run the bake-off across three models from at least **two providers**. Produce the decision table with real numbers.
+- **Boss level:** build a **cascade**: the small model classifies, but when it's unsure (it answers `other`, or a cheap self-check disagrees), escalate to the bigger model. Measure the accuracy and cost of the cascade against each single model. That's a result worth putting in your portfolio.
+
+</Practice>
+
+<Quiz
+	id="m1-models"
+	questions={[
+		{
+			q: 'Why is a public leaderboard insufficient for choosing a production model?',
+			options: [
+				'Leaderboards are always fake',
+				'They don\'t measure your task, your data, your latency/cost constraints, or region and compliance requirements',
+				'Bigger models are always better',
+				'You can\'t use the top model commercially',
+			],
+			answer: 1,
+			why: 'Benchmarks are a coarse filter. Production fit is decided by **your** eval set plus constraints like latency, cost, region and data terms.',
+		},
+		{
+			q: 'Recommended order when exploring a new feature?',
+			options: [
+				'Start with the cheapest model and stay there',
+				'Prototype with a strong model, build an eval, then test cheaper models against it',
+				'Fine-tune first',
+				'Pick whichever model has the longest context',
+			],
+			answer: 1,
+			why: 'A strong model shows what\'s possible; the eval tells you how far down you can step. Starting weak can make you wrongly conclude the task is impossible.',
+		},
+		{
+			q: 'Which practice prevents an outage when a model is retired?',
+			options: [
+				'Hard-coding the model ID in every file',
+				'Model IDs in config with an owner, monitoring deprecation notices, and a tested fallback model',
+				'Never upgrading',
+				'Using the "latest" alias everywhere without evals',
+			],
+			answer: 1,
+			why: 'Retirements are scheduled and announced, so outages from them are self-inflicted. Note that floating "latest" aliases can also change behaviour under you without an eval.',
+		},
+	]}
+/>
+
+<LessonComplete id="foundations/choosing-a-model" />

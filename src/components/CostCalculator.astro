@@ -1,0 +1,74 @@
+---
+// Prices are per million tokens, as published in October 2026.
+// They change often: the calculator lets you overwrite them.
+const presets = [
+	{ name: 'Frontier (Claude Opus 5.5)', input: 4, output: 20, cacheRead: 0.2 },
+	{ name: 'Mid tier (Claude Sonnet 5.5)', input: 2, output: 10, cacheRead: 0.2 },
+	{ name: 'Small (Claude Haiku 5.5)', input: 0.1, output: 0.5, cacheRead: 0.01 },
+];
+---
+
+<section class="calc not-content" data-calc data-presets={JSON.stringify(presets)}>
+	<p class="calc__badge">🧮 Cost calculator</p>
+	<div class="calc__grid">
+		<label>Model tier
+			<select name="preset">
+				{presets.map((p, i) => <option value={i}>{p.name}</option>)}
+			</select>
+		</label>
+		<label>Requests / day <input name="rpd" type="number" min="0" value="5000" /></label>
+		<label>Input tokens / request <input name="in" type="number" min="0" value="3000" /></label>
+		<label>Output tokens / request <input name="out" type="number" min="0" value="400" /></label>
+		<label>Cached share of input (%) <input name="cache" type="range" min="0" max="95" value="0" /><output name="cacheOut">0%</output></label>
+		<label>Input $/M <input name="pin" type="number" step="0.01" min="0" /></label>
+		<label>Output $/M <input name="pout" type="number" step="0.01" min="0" /></label>
+		<label>Cache read $/M <input name="pcache" type="number" step="0.01" min="0" /></label>
+	</div>
+	<div class="calc__out">
+		<div><span>Per request</span><strong data-o="req">-</strong></div>
+		<div><span>Per day</span><strong data-o="day">-</strong></div>
+		<div><span>Per month (30d)</span><strong data-o="month">-</strong></div>
+	</div>
+	<p class="calc__note">
+		Prices are a snapshot (Oct 2026) and ignore cache-write premiums, retries and tool-call loops. In an agent loop,
+		<em>each turn</em> re-sends the history, so multiply input by the number of turns.
+	</p>
+</section>
+
+<script>
+	const money = (n: number) =>
+		n >= 100 ? `$${Math.round(n).toLocaleString()}` : `$${n.toFixed(n < 0.01 ? 5 : 2)}`;
+
+	for (const calc of document.querySelectorAll<HTMLElement>('[data-calc]')) {
+		const presets = JSON.parse(calc.dataset.presets!);
+		const field = (name: string) => calc.querySelector<HTMLInputElement>(`[name="${name}"]`)!;
+		const num = (name: string) => Number(field(name).value) || 0;
+		const out = (key: string) => calc.querySelector<HTMLElement>(`[data-o="${key}"]`)!;
+
+		const applyPreset = () => {
+			const p = presets[num('preset')];
+			field('pin').value = String(p.input);
+			field('pout').value = String(p.output);
+			field('pcache').value = String(p.cacheRead);
+		};
+
+		const update = () => {
+			const cached = num('cache') / 100;
+			calc.querySelector<HTMLOutputElement>('[name="cacheOut"]')!.value = `${num('cache')}%`;
+			const inTok = num('in');
+			const perReq =
+				(inTok * (1 - cached) * num('pin') + inTok * cached * num('pcache') + num('out') * num('pout')) / 1e6;
+			out('req').textContent = money(perReq);
+			out('day').textContent = money(perReq * num('rpd'));
+			out('month').textContent = money(perReq * num('rpd') * 30);
+		};
+
+		field('preset').addEventListener('change', () => {
+			applyPreset();
+			update();
+		});
+		calc.addEventListener('input', update);
+		applyPreset();
+		update();
+	}
+</script>
