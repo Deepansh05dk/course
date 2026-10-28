@@ -1,6 +1,11 @@
 ---
 // Data comes from public/data/embedding-demo.json (built by scripts/build-embedding-demo.mjs).
 const dataUrl = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/data/embedding-demo.json`;
+interface Props {
+	/** Show a third column fusing both rankings with Reciprocal Rank Fusion. */
+	hybrid?: boolean;
+}
+const { hybrid = false } = Astro.props;
 const topics = {
 	refunds: '#ef4444',
 	tracking: '#0ea5e9',
@@ -12,8 +17,8 @@ const topics = {
 };
 ---
 
-<section class="emb not-content" data-emb={dataUrl} data-topics={JSON.stringify(topics)}>
-	<p class="emb__badge">🧭 Embedding playground: semantic vs keyword search</p>
+<section class="emb not-content" data-emb={dataUrl} data-topics={JSON.stringify(topics)} data-hybrid={hybrid ? '1' : undefined}>
+	<p class="emb__badge">🧭 {hybrid ? 'Hybrid search playground: semantic + keyword, fused with RRF' : 'Embedding playground: semantic vs keyword search'}</p>
 	<p class="emb__status">Loading 4,000 word vectors (about 600 KB)…</p>
 	<div class="emb__ui" hidden>
 		<label class="emb__q">
@@ -31,6 +36,18 @@ const topics = {
 				<p class="emb__colhead">🔤 Keyword (BM25)</p>
 				<ol class="emb__list" data-list="kw"></ol>
 			</div>
+			{
+				hybrid && (
+					<div>
+						<p class="emb__colhead">⚗️ Hybrid (RRF)</p>
+						<label class="emb__k">
+							k = <output name="kOut">60</output>
+							<input type="range" name="k" min="1" max="100" value="60" />
+						</label>
+						<ol class="emb__list" data-list="hyb" />
+					</div>
+				)
+			}
 		</div>
 		<details class="emb__mapwrap" open>
 			<summary>Map of the embedding space (2-D projection of 100 dimensions)</summary>
@@ -127,13 +144,14 @@ const topics = {
 			.join('');
 
 		const input = box.querySelector<HTMLInputElement>('.emb__q input')!;
+		const hybridOn = box.dataset.hybrid === '1';
 		const oovEl = box.querySelector<HTMLElement>('.emb__oov')!;
 		const renderList = (key: string, rows: { doc: (typeof docs)[number]; score: number }[], max: number) => {
 			box.querySelector(`[data-list="${key}"]`)!.innerHTML = rows
 				.map(
 					({ doc, score }) =>
 						`<li><span class="emb__bar" style="width:${Math.max(0, (score / (max || 1)) * 100)}%;background:${topics[doc.topic]}"></span>` +
-						`<span class="emb__score">${score.toFixed(2)}</span> ${esc(doc.text)}</li>`,
+						`<span class="emb__score">${score < 0.1 ? score.toFixed(4) : score.toFixed(2)}</span> ${esc(doc.text)}</li>`,
 				)
 				.join('');
 		};
@@ -146,15 +164,34 @@ const topics = {
 				oovEl.textContent = '';
 				renderList('sem', [], 1);
 				renderList('kw', [], 1);
+				if (hybridOn) renderList('hyb', [], 1);
 				return;
 			}
 			const { vec, oov } = embed(q);
-			const kw = docs
+			const kwAll = docs
 				.map((doc) => ({ doc, score: bm25(q, doc) }))
 				.sort((a, b) => b.score - a.score)
-				.slice(0, 5)
 				.filter((r) => r.score > 0);
+			const kw = kwAll.slice(0, 5);
 			renderList('kw', kw, kw[0]?.score ?? 1);
+			if (hybridOn) {
+				// Reciprocal Rank Fusion: each list contributes 1 / (k + rank); raw scores are never mixed.
+				const semAll = vec
+					? docs.map((doc) => ({ doc, score: dot(vec, doc.vec) })).sort((a, b) => b.score - a.score).slice(0, 20)
+					: [];
+				const k = Number(box.querySelector<HTMLInputElement>('[name="k"]')!.value);
+				box.querySelector<HTMLOutputElement>('[name="kOut"]')!.value = String(k);
+				const fused = new Map<string, { doc: (typeof docs)[number]; score: number }>();
+				for (const list of [semAll, kwAll]) {
+					list.forEach((r, i) => {
+						const entry = fused.get(r.doc.id) ?? { doc: r.doc, score: 0 };
+						entry.score += 1 / (k + i + 1);
+						fused.set(r.doc.id, entry);
+					});
+				}
+				const hyb = [...fused.values()].sort((a, b) => b.score - a.score).slice(0, 5);
+				renderList('hyb', hyb, hyb[0]?.score ?? 1);
+			}
 			if (!kw.length) box.querySelector('[data-list="kw"]')!.innerHTML = '<li class="emb__empty">No document shares a word with the query.</li>';
 
 			if (!vec) {
@@ -185,6 +222,7 @@ const topics = {
 			presets.append(b);
 		}
 		input.addEventListener('input', run);
+		box.querySelector('[name="k"]')?.addEventListener('input', run);
 
 		const [a, b] = [...box.querySelectorAll<HTMLInputElement>('[data-cmp]')];
 		const cmpOut = box.querySelector<HTMLElement>('.emb__cmpout')!;

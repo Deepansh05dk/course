@@ -20,6 +20,8 @@ export default defineConfig({
 				{ label: '1 · LLM Foundations', items: [{ autogenerate: { directory: 'foundations' } }] },
 				{ label: '2 · AI-Native UX', items: [{ autogenerate: { directory: 'ai-ux' } }] },
 				{ label: '3 · Embeddings & Vector Search', items: [{ autogenerate: { directory: 'embeddings' } }] },
+				{ label: '4 · Production RAG', items: [{ autogenerate: { directory: 'rag' } }] },
+				{ label: '5 · Evals & CI', items: [{ autogenerate: { directory: 'evals' } }] },
 				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
 			],
 		}),

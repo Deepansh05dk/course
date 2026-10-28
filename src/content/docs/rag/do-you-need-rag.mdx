@@ -1,0 +1,146 @@
+---
+title: Do you even need RAG?
+description: The RAG pipeline end to end, the alternatives (long context with caching, search, fine-tuning), and how to decide before building anything.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Six weeks of RAG for a 40-page handbook" severity="SEV3">
+A team spent six weeks building a RAG pipeline (chunking, a vector DB, a reranker, an ingestion service) for an HR assistant. The entire source was one 40-page employee handbook, about 25,000 tokens. Putting the whole handbook in the prompt with caching would have been more accurate (no retrieval misses), cheaper to build, and live in an afternoon. **They solved a problem they didn't have.**
+</Incident>
+
+**Retrieval-Augmented Generation (RAG)** means finding the relevant pieces of your data at question time and putting them in the model's context, so the model answers from **your** facts instead of its training memory. It's the most common architecture in applied AI, and often the most over-engineered one.
+
+## The RAG pipeline
+
+<Diagram
+	caption="Two pipelines: offline ingestion (keeps the index fresh) and online querying (answers a question). Each box is a place where quality is won or lost."
+	code={`flowchart TB
+    subgraph Offline["Offline: ingestion (lesson 2-3)"]
+        S["Sources<br/>PDFs, wiki, tickets, DB"] --> P["Parse<br/>text, tables, structure"]
+        P --> C["Chunk<br/>+ metadata, permissions"]
+        C --> E["Embed + keyword index"]
+        E --> IX[("Index<br/>vectors + full-text")]
+    end
+    subgraph Online["Online: answering (lessons 4-8)"]
+        Q["Question"] --> QT["Query transform<br/>rewrite, expand"]
+        QT --> R["Hybrid retrieve<br/>top 50"]
+        IX --> R
+        R --> RR["Rerank<br/>top 5"]
+        RR --> G["Generate<br/>grounded, cited, may refuse"]
+        G --> V["Verify<br/>citations, policy"]
+        V --> A["Answer"]
+    end`}
+/>
+
+Every stage can fail independently, which is why the rest of this module takes them one at a time, and why Module 5 teaches you to measure **retrieval** and **generation** separately.
+
+## The alternatives
+
+| Approach | How it works | Wins when | Loses when |
+|---|---|---|---|
+| **Put it all in context** (+ prompt caching) | Send the whole corpus with every request; cache the prefix | Corpus fits comfortably (tens to a few hundred thousand tokens) and changes rarely | Corpus is large, changes constantly, or needs per-user permissions |
+| **RAG** | Retrieve the relevant chunks per question | Large or growing corpora; freshness; permissions; citations | Questions that need *everything* at once ("summarize all 10,000 tickets") |
+| **Plain search** (no LLM) | Show ranked documents | Users want the document itself; navigation; exact lookups | Users want a synthesized answer |
+| **Tools / database queries** | The model calls APIs or SQL | Live, structured facts ("status of order 8812") | Unstructured knowledge |
+| **Fine-tuning** | Train the model on your data | Teaching *style, format or a skill* | Teaching *facts* (they go stale, can't be cited, and are hard to remove) |
+
+:::tip[Fine-tuning is not how you add knowledge]
+A common misconception: "fine-tune the model on our documents so it knows them." Fine-tuning shapes **behaviour**. It's a poor way to add **facts**, which become frozen, uncitable, and impossible to delete when a policy changes. Facts belong in retrieval or context.
+:::
+
+## A decision guide
+
+<Diagram
+	caption="Start with the simplest thing that can work, and measure."
+	code={`flowchart TD
+    A["Knowledge source"] --> B{"Structured, live data?<br/>orders, inventory, accounts"}
+    B -- Yes --> T["Tools / SQL<br/>the model queries your systems"]
+    B -- No --> C{"Fits in context with room to spare,<br/>changes rarely, one permission level?"}
+    C -- Yes --> L["Full context + prompt caching<br/>simplest, often most accurate"]
+    C -- No --> D{"Do users need a synthesized<br/>answer, or the document?"}
+    D -- Document --> S["Search (keyword + semantic),<br/>maybe an AI summary"]
+    D -- Answer --> R["RAG<br/>with evals from day 1"]`}
+/>
+
+Real systems combine these. Relay ends up with **tools** for shipments and refunds, **RAG** for 200 policy PDFs, and **full context** for a short tone-of-voice guide that goes into the system prompt.
+
+<FailureCard
+	title="Facts baked into a fine-tune"
+	symptom="After a policy change (refund window from 30 to 14 days), the assistant keeps saying 30 days, confidently."
+	cause="The policy had been 'taught' through fine-tuning. The fact was frozen into the weights, with no way to update or cite it without retraining."
+	detect="Freshness evals: questions whose answers changed recently, run after each policy update."
+	fix="Move factual knowledge into retrieval or context. Use fine-tuning only for behaviour and format, and only when prompting can't get there."
+/>
+
+<FailureCard
+	title="The 'summarize everything' question"
+	symptom="Users ask 'what are the most common complaints this quarter?' and get a confident answer based on 5 random tickets."
+	cause="RAG retrieves a handful of chunks. Aggregate questions need **all** the data, so retrieval quietly returns a tiny, unrepresentative sample."
+	detect="Classify incoming questions. Aggregate or analytical questions ('most common', 'how many', 'trend') are a different workload."
+	fix="Route aggregate questions to a different pipeline: batch summarization (map-reduce over all items), SQL or analytics, or precomputed reports. Make the system say what it looked at."
+/>
+
+<ThinkFirst question="For each Acme knowledge source, choose full context, RAG, tools or search: (a) a 6-page tone-of-voice guide; (b) 200 policy PDFs (about 2M tokens), updated monthly, some visible only to managers; (c) live shipment status for 4,000 customers; (d) 3 years of resolved tickets, which agents browse to find similar past cases.">
+
+- **(a) Full context**, in the cached system prompt. It's small, stable, and always relevant.
+- **(b) RAG**: too big for context, updated monthly (needs an ingestion pipeline), and has **permissions** (manager-only documents need permission-aware retrieval, lesson 7).
+- **(c) Tools**: live, exact, structured data. The model calls `getShipment(id)` and never "remembers" a status.
+- **(d) Search, plus RAG later.** Agents want to *see* similar past tickets (search UI with hybrid ranking). Later, the same index can feed "suggest a reply based on similar resolved tickets."
+
+Notice that one product uses four techniques. Choosing per source is the skill.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** list every knowledge source in a product you know (or Relay's). Classify each with the decision guide.
+- **Stretch:** take a document under 50K tokens. Build two answerers: full-context (with prompt caching) and a naive RAG (fixed chunks, top 5). Write 15 questions and compare accuracy, latency and cost.
+- **Boss level:** add a **question router** to Relay: classify each question as `policy`, `shipment`, `aggregate` or `other` (structured output), and send it to RAG, tools, a batch-summary pipeline, or a polite fallback. Measure the router's accuracy on 50 labelled questions.
+
+</Practice>
+
+<Quiz
+	id="m4-need-rag"
+	questions={[
+		{
+			q: 'Your entire knowledge base is a 25,000-token handbook that changes twice a year. What is usually the best first approach?',
+			options: ['A full RAG pipeline with a vector DB', 'Fine-tune a model on it', 'Put it all in the prompt with prompt caching', 'Keyword search only'],
+			answer: 2,
+			why: 'It fits easily, rarely changes, and full context avoids retrieval misses entirely. Caching keeps it cheap. Add RAG only when the corpus or its constraints outgrow this.',
+		},
+		{
+			q: 'Why is fine-tuning a poor way to add factual knowledge?',
+			options: [
+				'It is always more expensive than RAG',
+				'Facts become frozen in weights: hard to update or delete, and impossible to cite',
+				'Models can\'t learn facts',
+				'It is illegal',
+			],
+			answer: 1,
+			why: 'Fine-tuning shapes behaviour and format. Facts change, need citations, and sometimes must be removed, so keep them in retrieval or context.',
+		},
+		{
+			q: 'Which question is a poor fit for standard top-k RAG?',
+			options: ['"What is the refund window?"', '"What are the most common complaint themes across all tickets this quarter?"', '"Do insured shipments need an invoice?"', '"What does error ERR_AUTH_8091 mean?"'],
+			answer: 1,
+			why: 'Aggregate questions need all the data, but top-k returns a few chunks. Route them to batch summarization or analytics.',
+		},
+		{
+			q: 'What is the right source for "Where is shipment ACM-2025-000183?"',
+			options: ['RAG over shipping docs', 'The model\'s memory', 'A tool call to the live shipment system', 'A fine-tuned model'],
+			answer: 2,
+			why: 'Live, exact, structured data comes from the system of record through a tool.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/do-you-need-rag" />

@@ -1,0 +1,176 @@
+---
+title: Calibrating your judge
+description: Measuring an LLM judge against human labels with TPR and TNR, fixing it iteratively on a dev split, and correcting reported pass rates for the judge's own errors.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import JudgeCalculator from '../../../components/JudgeCalculator.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="91% accurate, and useless" severity="SEV2">
+The team validated their faithfulness judge: it agreed with human labels 91% of the time. They trusted it. Then an audit found that it caught only **3 of 20** real hallucinations. The validation set was 90% passing answers, so a judge that said "pass" to almost everything still scored 91% accuracy. **Accuracy hid the only thing that mattered: catching failures.**
+</Incident>
+
+An LLM judge is a model, and models make mistakes. Before you trust a number produced by a judge, measure the judge itself against human labels, the same way you'd validate any classifier.
+
+## The four outcomes
+
+On a set of outputs labelled by humans (lesson 2), compare the judge's verdicts:
+
+| | Judge says **pass** | Judge says **fail** |
+|---|---|---|
+| **Human says pass** | True positive (TP) | False negative (FN): judge is too strict |
+| **Human says fail** | False positive (FP): **judge misses a real failure** | True negative (TN) |
+
+Two numbers matter, and they must be reported **separately**:
+
+- **TPR (true positive rate)** = TP / (TP + FN): of the truly good outputs, how many does the judge pass?
+- **TNR (true negative rate)** = TN / (TN + FP): of the truly bad outputs, how many does the judge **catch**?
+
+In the incident: high accuracy, high TPR, and a TNR of 3/20 = 15%. For a judge whose job is catching hallucinations, TNR is the number that matters.
+
+## The calibration loop
+
+<Diagram
+	caption="Treat the judge prompt like a model you're training: iterate on a dev split, report on a held-out test split."
+	code={`flowchart LR
+    L["Human-labelled outputs<br/>(balanced: plenty of fails)"] --> S{"Split"}
+    S --> DEV["Dev split"]
+    S --> TEST["Test split<br/>(don't look while tuning)"]
+    DEV --> J["Run judge, read disagreements"]
+    J --> F["Fix rubric/examples"]
+    F --> J
+    J -- "TPR and TNR good on dev" --> T["Measure once on test"]
+    TEST --> T
+    T --> OK["Report TPR/TNR; use the judge"]`}
+/>
+
+1. **Label a balanced set:** you need enough **failures** to measure TNR. If failures are rare, sample them deliberately (thumbs-down, error analysis finds). Aim for dozens of each class, not 3.
+2. **Split** into dev and test.
+3. **Iterate on dev:** run the judge, read every disagreement, fix the rubric (clearer rules, better examples), and repeat.
+4. **Measure once on test** and report TPR and TNR.
+5. **Re-calibrate** whenever the judge prompt, judge model, or the system being judged changes significantly.
+
+```python
+# evals/judge_calibration.py
+def judge_agreement(human: list[bool], judge: list[bool]) -> dict:
+    """Compare an LLM judge's pass/fail labels with human labels on the same cases."""
+    tp = sum(h and j for h, j in zip(human, judge))           # both say pass
+    tn = sum(not h and not j for h, j in zip(human, judge))   # both say fail
+    fp = sum(not h and j for h, j in zip(human, judge))       # judge passes a real failure
+    fn = sum(h and not j for h, j in zip(human, judge))       # judge fails a real pass
+    return {
+        "tpr": tp / (tp + fn) if tp + fn else float("nan"),   # passes recognised
+        "tnr": tn / (tn + fp) if tn + fp else float("nan"),   # failures caught
+        "accuracy": (tp + tn) / len(human),
+        "confusion": {"tp": tp, "tn": tn, "fp": fp, "fn": fn},
+    }
+```
+
+## Correcting the pass rate you report
+
+Even a well-calibrated judge makes mistakes, so its raw pass rate on new traffic is biased. If you know its TPR and TNR, you can estimate the **true** pass rate:
+
+> true pass rate ≈ (observed pass rate + TNR − 1) / (TPR + TNR − 1)
+
+```python
+def corrected_pass_rate(observed: float, tpr: float, tnr: float) -> float:
+    """Estimate the true pass rate from the judge's observed rate and its measured error rates."""
+    denom = tpr + tnr - 1
+    if denom <= 0:
+        raise ValueError("judge is no better than chance; fix the judge before trusting any rate")
+    return min(1.0, max(0.0, (observed + tnr - 1) / denom))
+```
+
+For example, with TPR = 0.95 and TNR = 0.75, a judge reporting an 81% pass rate implies a true pass rate of about 80%. (Both functions are unit-tested with exactly these numbers.) Play with it:
+
+<JudgeCalculator />
+
+Try lowering TN and raising FP: as the judge misses more failures, the raw pass rate becomes increasingly optimistic. And notice that with only a handful of human-labelled failures, the TNR estimate itself is too noisy to trust.
+
+<FailureCard
+	title="Calibrated once, trusted forever"
+	symptom="Judge-reported faithfulness stays at 95% for months, but a human audit finds it's really closer to 85%."
+	cause="The system changed (new model, longer answers, new policy types), and the judge, calibrated on old outputs, didn't generalise to the new failure patterns."
+	detect="A small recurring human audit (e.g. 30 labelled outputs a month) compared with judge verdicts."
+	fix="Re-calibrate on fresh labels when the system or judge changes, and track judge TPR/TNR over time like any other model metric."
+/>
+
+<FailureCard
+	title="Tuning the judge on the test set"
+	symptom="The judge shows 98% TPR and 96% TNR in the report, then disagrees with humans constantly in practice."
+	cause="The team iterated on the judge prompt while looking at the same cases they reported on, so the rubric memorised those examples."
+	detect="A fresh, never-seen labelled sample gives much lower agreement."
+	fix="Dev/test split for judge development, exactly like for the system itself."
+/>
+
+<ThinkFirst question="Your hallucination judge on the test split: TPR = 0.97, TNR = 0.60. Product wants to use it as a CI gate that blocks releases if faithfulness drops. Is it ready? What would you do?">
+
+**Not ready as a gate.** A TNR of 0.60 means it **misses 40% of real hallucinations**. A release could double the hallucination rate and the gate would still often pass. (The high TPR only means it rarely flags good answers.)
+
+**What to do:**
+
+1. **Read the false positives** (hallucinations the judge passed). What do they have in common? Often subtle numeric changes, added conditions, or claims that sound generic.
+2. **Improve the judge:** a sharper rubric ("any number, deadline or condition not in the excerpts is a FAIL"), fail examples of exactly those types, and claim-by-claim checking (list the claims, then check each).
+3. **Offload what code can do:** the deterministic number/date grounding check catches a large class of hallucinations with perfect consistency. Combine it with the judge.
+4. **Re-measure on test.** Only gate on it once the TNR is high enough for the risk (and say what "enough" means in writing).
+5. Meanwhile, use it as a **monitor** (trend lines, sampled human review), not a gate.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** with the calculator, find the TNR below which a 90% raw pass rate actually means less than 80% true quality (with TPR = 0.95).
+- **Stretch:** label 60 Relay answers yourself (at least 20 failures), run your faithfulness judge on them, and compute TPR and TNR with `judge_agreement`.
+- **Boss level:** run the full calibration loop: dev/test split, three iterations on the rubric with a log of what you changed and why, and final TPR/TNR on test. Publish the before/after table, a great demonstration of eval maturity.
+
+</Practice>
+
+<Quiz
+	id="m5-calibration"
+	questions={[
+		{
+			q: 'A judge has 91% accuracy, but the labelled set is 90% passing outputs. What is the risk?',
+			options: [
+				'None, 91% is excellent',
+				'It might pass almost everything and still look accurate, so check TNR (failures caught) separately',
+				'The judge is too strict',
+				'Accuracy can\'t exceed 90% here',
+			],
+			answer: 1,
+			why: 'With imbalanced data, accuracy hides failure detection. Always report TPR and TNR.',
+		},
+		{
+			q: 'What does TNR measure for a judge?',
+			options: ['How often it passes good outputs', 'How often it catches outputs that humans labelled as failures', 'Its latency', 'Its cost'],
+			answer: 1,
+			why: 'TNR = TN / (TN + FP): the share of real failures the judge flags.',
+		},
+		{
+			q: 'Why might you report a corrected pass rate rather than the judge\'s raw pass rate?',
+			options: [
+				'To make numbers look better',
+				'The raw rate is biased by the judge\'s own errors; TPR and TNR let you estimate the true rate',
+				'Corrected rates are required by law',
+				'Raw rates are always too low',
+			],
+			answer: 1,
+			why: 'A lenient judge (low TNR) inflates the pass rate. Correcting for it gives a more honest estimate.',
+		},
+		{
+			q: 'When must a judge be re-calibrated?',
+			options: ['Never', 'When the judge prompt, judge model, or the system being judged changes significantly, and periodically anyway', 'Only yearly', 'Only when users complain'],
+			answer: 1,
+			why: 'Judges are models; their error rates shift as their inputs shift.',
+		},
+	]}
+/>
+
+<LessonComplete id="evals/judge-calibration" />

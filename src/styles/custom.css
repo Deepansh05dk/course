@@ -239,3 +239,61 @@
 .sdemo__out { min-height: 7.5rem; font-size: 0.9rem; }
 .sdemo__spin { color: var(--sl-color-gray-2); font-style: italic; }
 .sdemo__stop { margin-top: 0.4rem; font-size: 0.85rem; }
+.emb__k { display: flex; gap: 0.4rem; align-items: center; font-size: 0.8rem; }
+.emb__k input { flex: 1; }
+
+/* chunking playground, labeling exercise, judge calculator */
+.chunk, .label, .judge {
+	margin-block: 1.5rem; border: 1px solid var(--c-border); border-radius: var(--c-radius);
+	padding: 1rem 1.15rem; background: var(--c-card);
+}
+:is(.chunk, .label, .judge) p { margin: 0.4rem 0; }
+.chunk__badge, .label__badge, .judge__badge { font-weight: 700; }
+:is(.chunk, .label, .judge) :is(select, input[type='number'], textarea) {
+	font: inherit; padding: 0.35rem 0.5rem; border-radius: 0.4rem;
+	border: 1px solid var(--c-border); background: var(--sl-color-bg); color: var(--sl-color-text);
+}
+:is(.chunk, .label, .judge) button {
+	font: inherit; cursor: pointer; border-radius: 0.4rem; border: 1px solid var(--c-border);
+	background: var(--sl-color-bg); color: var(--sl-color-text); padding: 0.4rem 0.8rem;
+}
+.chunk__controls { display: grid; gap: 0.6rem; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); font-size: 0.9rem; }
+.chunk__controls label { display: grid; gap: 0.25rem; }
+.chunk__controls .chunk__check { display: block; align-self: end; }
+.chunk__src { margin: 0.6rem 0; }
+.chunk__src summary { cursor: pointer; font-size: 0.9rem; font-weight: 600; }
+.chunk__src textarea { width: 100%; font-family: var(--sl-font-mono); font-size: 0.8rem; margin-top: 0.4rem; }
+.chunk__summary { font-weight: 600; font-size: 0.9rem; }
+.chunk__list { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+.chunk__list li { background: var(--sl-color-bg); border-left: 5px solid; border-radius: 0.4rem; padding: 0.4rem 0.6rem; }
+.chunk__list pre { margin: 0.2rem 0; white-space: pre-wrap; word-break: break-word; font-size: 0.78rem; background: none; padding: 0; border: 0; }
+.chunk__meta { font-size: 0.75rem; color: var(--sl-color-gray-2); }
+.chunk__warn { font-size: 0.8rem; color: var(--c-warn); font-weight: 600; }
+
+.label__list { padding-left: 1.2rem; display: grid; gap: 0.75rem; }
+.label__trace { background: var(--sl-color-bg); border-radius: 0.4rem; padding: 0.5rem 0.75rem; border-left: 4px solid var(--sl-color-gray-4); }
+.label__trace[data-result='agree'] { border-left-color: var(--c-ok); }
+.label__trace[data-result='disagree'] { border-left-color: var(--c-bad); }
+.label__q, .label__a { font-size: 0.9rem; }
+.label__ctx { font-size: 0.82rem; color: var(--sl-color-gray-2); }
+.label__controls { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; font-size: 0.9rem; }
+.label__expert { font-size: 0.85rem; border-top: 1px dashed var(--c-border); padding-top: 0.4rem; }
+.label__compare { margin-top: 0.75rem; }
+.label__result { margin-top: 0.75rem; }
+.label__bar { display: grid; grid-template-columns: 11rem 1fr 2rem; gap: 0.5rem; align-items: center; font-size: 0.85rem; margin: 0.2rem 0; }
+.label__bar i { height: 0.7rem; border-radius: 0.3rem; background: var(--c-bad); opacity: 0.7; }
+.label__tip { font-size: 0.85rem; color: var(--sl-color-gray-2); }
+
+.judge__intro { font-size: 0.9rem; }
+.judge__grid { display: grid; grid-template-columns: auto 1fr 1fr; gap: 0.4rem 0.75rem; align-items: center; margin: 0.75rem 0; font-size: 0.9rem; }
+.judge__grid label { display: flex; gap: 0.4rem; align-items: center; }
+.judge__grid input { width: 5.5rem; }
+.judge__obs { display: grid; gap: 0.25rem; font-size: 0.9rem; }
+.judge__out { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.6rem; margin-top: 0.75rem; }
+.judge__out div { background: var(--sl-color-bg); border-radius: 0.4rem; padding: 0.6rem; display: grid; }
+.judge__out span { font-size: 0.8rem; color: var(--sl-color-gray-2); }
+.judge__out strong { font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+.judge__verdict { font-weight: 600; }
+@media (max-width: 30rem) { .label__bar { grid-template-columns: 7rem 1fr 2rem; } }
+.chunk__controls label { min-width: 0; }
+.chunk__controls select { max-width: 100%; min-width: 0; }

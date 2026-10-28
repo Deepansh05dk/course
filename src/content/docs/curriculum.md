@@ -95,29 +95,26 @@ You build one product the whole way through, like a real FDE engagement. *Acme L
 5. [pgvector in production](/embeddings/pgvector/): schema, the filtering pitfall, iterative scans, multitenancy, blue/green re-indexing, and the Module 3 lab
 
 #### Module 4 · Production RAG *(weeks 7–9)*
-- Do you even need RAG? Long context + caching vs RAG vs search vs fine-tuning
-- Ingestion reality: PDFs, tables, scans, HTML. Freshness and re-indexing pipelines
-- Chunking: recursive, markdown-aware, semantic; **prepending titles/sections** to chunks
-- Hybrid search: BM25 for exact codes like `ERR_AUTH_8091`, plus vectors, fused with **Reciprocal Rank Fusion**
-- Two-stage retrieval: bi-encoders vs **cross-encoder rerankers**
-- Query transformations: rewriting, **HyDE**, multi-query
-- **Parent-document retrieval** (small chunks to search, big chunks to read)
-- Grounded answers: citations, "I don't know," conflicting sources
-- **Permission-aware retrieval** (no document leaks)
-- Agentic and multi-hop RAG
-- 🎮 Chunking playground, retrieval playground, incident drill: "The bot quoted last year's refund policy to 3,000 customers"
+1. [Do you even need RAG?](/rag/do-you-need-rag/): the pipeline end to end; long context + caching vs RAG vs search vs tools vs fine-tuning
+2. [Ingestion: garbage in, garbage out](/rag/ingestion/): PDFs, tables, scans, metadata, incremental sync **with deletions**, freshness
+3. [Chunking](/rag/chunking/): fixed vs recursive vs structure-aware (live playground), prepended context, contextual retrieval, parent-document retrieval
+4. [Hybrid search and measuring retrieval](/rag/hybrid-search/): BM25, Reciprocal Rank Fusion (live playground), Postgres SQL, recall@k and MRR
+5. [Reranking and query transformations](/rag/reranking-and-query-transforms/): cross-encoders, conversational rewriting, HyDE, multi-query
+6. [Grounded generation with citations](/rag/grounded-generation/): native API citations, refusing before generating, conflicting versions
+7. [Permission-aware retrieval](/rag/permission-aware-retrieval/): ACL sync, row-level security that fails closed, leakage paths
+8. [Agentic and multi-hop RAG](/rag/agentic-rag/): retrieval as a tool, budgets, routing, and the Module 4 lab
 
 ### Phase 3: Quality
 
 #### Module 5 · Evals & CI Regression Testing *(weeks 10–11)*: moved earlier so everything after it gets measured
-- Why `assert output == "Paris"` dies: silent prompt regressions
-- **Error analysis first:** read 100 traces, build a failure taxonomy, *then* choose metrics
-- Datasets: production samples, synthetic data, edge cases, golden sets
-- Code-based checks vs **LLM-as-judge** (rubrics, G-Eval style), and **calibrating judges** against human labels
-- RAG metrics: faithfulness, answer relevance, context precision/recall (RAGAS-style), diagnosing retrieval vs generation bugs
-- Agent evals: trajectory vs outcome
-- CI gates in GitHub Actions; online evals on sampled production traffic
-- Tool tour: promptfoo, DeepEval, RAGAS, Braintrust, Langfuse datasets
+1. [Why evals are the core skill](/evals/why-evals/): properties not strings, the eval pyramid, the eval-driven loop
+2. [Error analysis first](/evals/error-analysis/): open and axial coding, failure taxonomies, a hands-on trace-labelling exercise
+3. [Building eval datasets](/evals/datasets/): production samples, dimension-based synthetic data, splits, versioning, leakage
+4. [Code checks and LLM-as-judge](/evals/llm-as-judge/): deterministic scorers, binary rubrics, critique-before-verdict, judge biases
+5. [Calibrating your judge](/evals/judge-calibration/): TPR/TNR against human labels, corrected pass rates (live calculator)
+6. [Evaluating RAG and agents](/evals/rag-and-agent-evals/): the RAG triad, outcome vs trajectory evals, sandbox end-state checks
+7. [Evals in CI](/evals/evals-in-ci/): critical vs quality cases, noise and bootstrap intervals, promptfoo, the tool landscape
+8. [Online evals and monitoring](/evals/online-evals/): guardrails vs monitors, drift, shadow mode, A/B tests, and the Module 5 lab
 
 ### Phase 4: Agents
 
@@ -226,5 +223,7 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 | Module 1 · LLM Foundations | ✅ Ready |
 | Module 2 · AI-Native UX | ✅ Ready |
 | Module 3 · Embeddings & Vector Search | ✅ Ready |
+| Module 4 · Production RAG | ✅ Ready |
+| Module 5 · Evals & CI | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
-| Modules 4–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
+| Modules 6–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |

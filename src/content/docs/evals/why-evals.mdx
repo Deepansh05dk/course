@@ -1,0 +1,155 @@
+---
+title: Why evals are the core skill
+description: Why exact asserts die with LLMs, what an eval actually is, the eval pyramid, and how evals turn "vibes" into engineering.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Three weeks of 'it feels better'" severity="SEV3">
+Relay's team spent three weeks tweaking prompts, chunk sizes and models. Every change was judged by an engineer trying five favourite questions and saying "feels better." After three weeks, nobody could say whether the system had improved overall, and two things that used to work (refund conditions, customs exceptions) had quietly broken. The team had been **optimizing in the dark**.
+</Incident>
+
+Every applied-AI job posting in the [research](/research/) asks for evals, and for a reason: **evals are what turn LLM work from guessing into engineering.** Without them, you can't tell whether a change helped, you can't safely upgrade a model, and you can't prove to a customer that the system works.
+
+## Why exact asserts die
+
+```python
+# Traditional software: works forever
+assert add(2, 2) == 4
+
+# LLM software: fails on harmless rewording, passes on harmful nonsense
+assert answer("What is the refund window?") == "The refund window is 30 days."
+```
+
+LLM output varies in wording, length and order, even when it's correct. So evals check **properties** ("mentions 30 days", "cites the refund policy", "doesn't promise a refund") and report **rates** ("94% of 200 cases pass"), not exact strings.
+
+## What an eval is
+
+An eval is three things:
+
+1. **A dataset:** inputs (and sometimes reference outputs or labels) that represent what users actually do.
+2. **A task runner:** runs your system (prompt, retrieval, agent…) on each input and records the full trace.
+3. **Scorers:** functions that judge each output: code checks, LLM judges, or human review.
+
+The output is a **scorecard** you can compare across versions: "v7: 91% pass, v8: 94% pass, but refunds dropped from 98% to 90%."
+
+## The eval pyramid
+
+<Diagram
+	caption="Like the testing pyramid: many cheap, fast checks at the bottom; fewer expensive, high-signal ones at the top."
+	code={`flowchart TB
+    A["Production monitoring + A/B tests<br/>real users, real outcomes"] --> B
+    B["Human review<br/>expert labels on samples, highest trust, slowest"] --> C
+    C["LLM-as-judge<br/>nuanced criteria at scale, must be calibrated"] --> D
+    D["Code-based checks<br/>schema, regex, exact facts, citations exist<br/>fast, cheap, deterministic"]`}
+/>
+
+| Level | Example for Relay | Cost | Runs |
+|---|---|---|---|
+| **Code checks** | Valid JSON; cited chunk IDs were retrieved; every number in the answer appears in a source; no refund promise (regex) | ~free | Every commit, every request |
+| **LLM judge** | "Does the answer address the customer's actual question?" "Is it faithful to the sources?" | $ | Every PR (on the eval set); a sample of production |
+| **Human review** | A policy expert grades 50 answers a week | $$$ | Weekly; to calibrate judges |
+| **Online / A/B** | Edit ratio, ticket reopen rate, escalation rate | Free to measure, slow to read | Continuously |
+
+**Push every check as low as it can go.** If code can check it, don't use a judge. If a judge can check it reliably (calibrated against humans), don't spend expert time on it.
+
+## How evals fit into the development loop
+
+<Diagram
+	caption="The eval-driven development loop: look at data, decide what to fix, prove the fix, protect it forever."
+	code={`flowchart LR
+    A["Look at traces<br/>error analysis"] --> B["Name the failure<br/>taxonomy"]
+    B --> C["Write eval cases<br/>+ scorer for it"]
+    C --> D["Change the system"]
+    D --> E["Run evals:<br/>better? anything worse?"]
+    E -- "regression" --> D
+    E -- "improved" --> F["Ship + keep the cases<br/>in CI forever"]
+    F --> A`}
+/>
+
+This module walks through each step: error analysis (lesson 2), datasets (3), judges (4–5), RAG and agent evals (6), CI (7), and production (8).
+
+<FailureCard
+	title="The vanity metric"
+	symptom="The eval dashboard shows 97% and climbing, but customer complaints are rising."
+	cause="The eval measured something easy (valid JSON, polite tone) instead of what users care about (a correct refund answer). It also used generic, clean test questions unlike real traffic."
+	detect="Compare eval results with real outcomes (complaints, edit ratios, escalations). If they move independently, the eval measures the wrong thing."
+	fix="Derive eval criteria from **error analysis of real failures** (next lesson), and fill the dataset from production samples."
+/>
+
+<FailureCard
+	title="Eval set frozen in time"
+	symptom="Eval scores stay high for months while production quality slowly drops."
+	cause="The dataset was written once, at launch. Users' questions, policies and products moved on; the eval didn't."
+	detect="Coverage checks: what share of recent production question types appear in the eval set?"
+	fix="Keep the dataset alive: add cases from production failures every week (the feedback flywheel from Module 2), and retire cases about removed policies."
+/>
+
+<ThinkFirst question="Your manager asks: 'We have 3 weeks. Should we spend the first week building evals, or start improving the prompts right away?' Make the case either way, then give your recommendation.">
+
+**The case for prompts first:** visible progress, quick wins, and stakeholders want demos.
+
+**The case for evals first:** without them, three weeks of changes can't be measured, regressions go unnoticed (as in the incident), and you can't tell the customer how good the system is.
+
+**Recommendation: a thin eval first, in 1–2 days, not a week.**
+
+1. Day 1: read 50–100 real traces and write down the main failure types (error analysis).
+2. Day 2: turn them into 30–50 cases with simple code checks, plus one LLM judge for the most important criterion.
+3. Then improve the system **against** that eval, adding cases as you discover new failures.
+
+Evals don't have to be big to be useful. They have to exist **before** the changes they measure.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** for one AI feature you've built (or Relay's triage), list three properties you could check with code, and two that need judgment.
+- **Stretch:** take your Module 1 triage eval and split its checks into the pyramid levels. What's missing at each level?
+- **Boss level:** write a one-page "eval plan" for Relay's policy Q&A: what you'll measure, the dataset sources, the scorers at each pyramid level, when each runs, and what thresholds block a release. This is a document FDEs write in the first week of an engagement.
+
+</Practice>
+
+<Quiz
+	id="m5-why"
+	questions={[
+		{
+			q: 'Why do exact-match assertions fail for LLM outputs?',
+			options: [
+				'LLMs are always wrong',
+				'Correct outputs vary in wording, so exact matching fails on harmless differences and misses harmful near-matches',
+				'Python can\'t compare long strings',
+				'They are too slow',
+			],
+			answer: 1,
+			why: 'Test **properties** (facts, citations, forbidden content) and report **rates** across many cases.',
+		},
+		{
+			q: 'What are the three components of an eval?',
+			options: ['Prompt, model, temperature', 'Dataset, task runner, scorers', 'Logs, metrics, alerts', 'Embeddings, index, reranker'],
+			answer: 1,
+			why: 'Inputs that represent reality, a way to run your system on them, and a way to judge each output.',
+		},
+		{
+			q: 'A check can be done either with a regex or with an LLM judge. Which should you choose?',
+			options: ['The LLM judge, since it is smarter', 'The regex: cheaper, faster and deterministic. Push checks as low in the pyramid as they reliably go', 'Both always', 'Neither'],
+			answer: 1,
+			why: 'Use judges for what code can\'t check. Deterministic checks are free and never drift.',
+		},
+		{
+			q: 'Eval scores are rising while complaints rise too. What is most likely?',
+			options: ['Users are wrong', 'The eval measures the wrong things, or its dataset doesn\'t reflect real traffic', 'The model is improving', 'A logging bug'],
+			answer: 1,
+			why: 'Evals must be grounded in real failures and real inputs, or they become vanity metrics.',
+		},
+	]}
+/>
+
+<LessonComplete id="evals/why-evals" />

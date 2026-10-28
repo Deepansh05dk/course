@@ -1,0 +1,190 @@
+---
+title: Grounded generation with citations
+description: Prompting the generator to stay within the sources, native API citations, refusing when evidence is missing, and resolving conflicting or outdated sources.
+sidebar:
+  order: 6
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Right documents, wrong answer" severity="SEV2">
+Relay retrieved exactly the right chunk for "Can customers return opened electronics?" (Policy 3.4: "Opened electronics can be returned within 14 days if all accessories are included"). It answered: "Yes, within 30 days." Retrieval was perfect. **Generation** mixed the retrieved text with the general 30-day refund rule it had seen elsewhere in the context, and nobody checked the answer against the source.
+</Incident>
+
+Retrieval gets the evidence into the room; **generation** must stick to it. This lesson covers the last mile: instructions, citations, refusals, and conflicting sources.
+
+## The grounding prompt
+
+```python
+SYSTEM = """You are Relay, the support assistant for Acme Logistics.
+
+Answer ONLY from the policy documents provided in this conversation.
+- If the documents do not contain the answer, say: "The policy documents don't cover this." and suggest escalating to the policy team.
+- If documents conflict, prefer the one with the latest effective date, and mention the conflict.
+- Quote exact numbers, deadlines and conditions as written. Don't round or generalise them.
+- Never use general knowledge about refunds, shipping or customs. Acme's documents are the only source."""
+```
+
+That's necessary, but not sufficient: prompts reduce ungrounded answers; they don't eliminate them. You also need citations you can verify, and evals that measure **faithfulness** (Module 5).
+
+## Native citations: provable pointers into your sources
+
+Rather than asking the model to write `[S1]` markers (which it can invent), several APIs offer **native citations**. With Claude, you pass each retrieved chunk as a `document` block with citations enabled. The response comes back as text blocks, and cited claims carry pointers to the exact passage, which the API guarantees are valid locations in the documents you provided:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+
+def answer_with_citations(question: str, chunks: list[dict]) -> dict:
+    documents = [
+        {
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": c["content"]},
+            "title": f'{c["doc_title"]}, {c["section"]}',
+            "context": f'Effective date: {c["effective_date"]}',
+            "citations": {"enabled": True},
+        }
+        for c in chunks
+    ]
+    response = client.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=4000,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": [*documents, {"type": "text", "text": question}]}],
+    )
+    parts, sources = [], []
+    for block in response.content:
+        if block.type != "text":
+            continue
+        parts.append(block.text)
+        for cite in block.citations or []:
+            sources.append({
+                "chunk_id": chunks[cite.document_index]["id"],  # map back to your chunk
+                "quote": cite.cited_text,                        # the exact supporting passage
+            })
+    return {"answer": "".join(parts), "sources": sources}
+```
+
+Each `char_location` citation includes the `document_index`, the `cited_text`, and character offsets, which is everything your UI needs to render the citation chips with highlighted excerpts from Module 2. Two notes from the API docs: `cited_text` doesn't count toward output tokens, and citations **can't be combined with structured outputs** in the same request. If you need both, generate the cited answer first and extract structured fields in a second step.
+
+:::note[Valid pointer ≠ supported claim]
+The API guarantees the citation points at real text in your documents. It doesn't guarantee that the passage *supports* the sentence it's attached to. Checking support is a faithfulness eval (Module 5): code checks for numbers and dates, plus an LLM judge.
+:::
+
+## Refuse before you generate
+
+<Diagram
+	caption="Don't ask the model to answer when the evidence isn't there. Gate on retrieval quality first."
+	code={`flowchart TD
+    Q["Question"] --> R["Retrieve + rerank"]
+    R --> G{"Best rerank score<br/>above threshold?"}
+    G -- No --> N["Designed 'not covered' response<br/>+ escalate button<br/>(no generation call)"]
+    G -- Yes --> C{"Sources conflict?<br/>different versions/dates"}
+    C -- Yes --> L["Answer from the latest effective version,<br/>and flag the conflict"]
+    C -- No --> A["Grounded answer with citations"]
+    A --> V["Verify: numbers/dates in answer<br/>appear in cited text"]
+    L --> V`}
+/>
+
+Calibrate the threshold on your eval set: include unanswerable questions, and tune the threshold so that most of them refuse while few answerable ones do.
+
+## Conflicting and outdated sources
+
+Real corpora contradict themselves: a 2023 policy and its 2026 replacement, a regional exception, a draft that was never deleted. Make conflicts **resolvable**:
+
+- Store `effective_date`, `version` and `status` (draft or active) as metadata (ingestion lesson), and pass them to the model (the `context` field above).
+- Filter out drafts and superseded versions at **retrieval time** when you can. Don't rely on the model to ignore them.
+- When two active sources disagree, show both to the user rather than silently picking one.
+
+<FailureCard
+	title="The rounded deadline"
+	symptom="Answers say 'about two weeks' when the policy says '10 business days', and customers complain about the mismatch."
+	cause="The model paraphrased precise conditions into approximations, a common behaviour without explicit instructions."
+	detect="A deterministic check: every number and date in the answer must appear in the cited text."
+	fix="Instruct the model to quote exact numbers and conditions, and run the number/date check on every answer, routing mismatches to review."
+/>
+
+<FailureCard
+	title="Citations that point at the wrong version"
+	symptom="Every claim has a citation, yet some answers quote the 2023 refund window."
+	cause="Both the 2023 and 2026 policies were retrieved; the model cited the older one. The citation was valid; the source was stale."
+	detect="Eval cases for recently changed policies; flag answers citing documents with an `effective_date` older than a newer document on the same topic."
+	fix="Exclude superseded versions at retrieval time, include effective dates in the document context, and instruct the model to prefer the latest."
+/>
+
+<ThinkFirst question="An Acme agent asks: 'Can an insured shipment of glassware to Norway get full declared-value compensation?' Relevant chunks: the damage policy table (fragile items capped at 100 EUR), the insurance policy (insured = declared value), and a Norway customs note. What should a well-grounded answer look like, and what should the system do with it?">
+
+**A good answer surfaces the conflict instead of picking one rule:**
+
+> "The policies conflict for this case. Insured shipments are compensated up to the declared value [Insurance policy §2], but fragile items (glass, ceramics) are capped at 100 EUR [Damage policy §2, table]. The documents don't say which rule takes precedence for insured fragile items. Escalate to the claims team before promising an amount."
+
+**What the system should do:**
+
+1. Render each citation as a chip with the highlighted excerpt.
+2. Detect the conflict signal ("conflict", or two sources with different numeric limits on the same topic) and show a "sources disagree" banner with an escalation button (Module 2).
+3. Log the case. It's a **policy gap**, and a valuable output of the AI system: the policy team should resolve it, and the resolution becomes an eval case.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run `answer_with_citations` on 5 questions with your own documents. Print the citations and check each quote by hand: does it support the sentence it's attached to?
+- **Stretch:** implement the deterministic check: extract all numbers, amounts and dates from the answer, and verify each appears in at least one cited passage. Flag violations.
+- **Boss level:** build the full "refuse before you generate" gate: rerank threshold tuned on 20 answerable and 10 unanswerable questions, conflict detection by effective date, and a report of refusal precision and recall.
+
+</Practice>
+
+<Quiz
+	id="m4-grounded"
+	questions={[
+		{
+			q: 'Retrieval returned the right chunk, but the answer contradicts it. Which stage failed?',
+			options: ['Ingestion', 'Retrieval', 'Generation (grounding)', 'Embedding'],
+			answer: 2,
+			why: 'This is why you measure retrieval (recall) and generation (faithfulness) separately: the fixes are completely different.',
+		},
+		{
+			q: 'What do native API citations guarantee?',
+			options: [
+				'That every claim is true',
+				'That citations point at real passages in the documents you provided, though support for the claim still needs checking',
+				'That the model never hallucinates',
+				'That answers are shorter',
+			],
+			answer: 1,
+			why: 'Valid pointers remove invented references. Whether the passage supports the sentence is a separate faithfulness check.',
+		},
+		{
+			q: 'When should the system skip generation and return "not covered"?',
+			options: [
+				'Never, always let the model try',
+				'When retrieval quality (e.g. the best rerank score) is below a threshold tuned on answerable and unanswerable questions',
+				'When the question is long',
+				'Only on weekends',
+			],
+			answer: 1,
+			why: 'No evidence means no answer. Gating before generation is cheaper and more honest than hoping the model refuses.',
+		},
+		{
+			q: 'Both the 2023 and 2026 refund policies are in the index. What is the most robust fix?',
+			options: [
+				'Ask the model to guess which is newer',
+				'Store effective dates and status, exclude superseded versions at retrieval time, and pass dates in the document context',
+				'Delete all old documents manually every month',
+				'Use a bigger model',
+			],
+			answer: 1,
+			why: 'Make the conflict impossible (filtering) where you can, and resolvable (dates in context) where you can\'t.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/grounded-generation" />

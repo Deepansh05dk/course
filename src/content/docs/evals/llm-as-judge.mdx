@@ -1,0 +1,210 @@
+---
+title: Code checks and LLM-as-judge
+description: Deterministic scorers first, then LLM judges for what code can't check. Binary rubrics, critique-before-verdict, known judge biases, and how to keep judges honest.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The judge that loved long answers" severity="SEV3">
+Relay's team used an LLM judge with the prompt "Rate this answer's quality from 1 to 10." A prompt change made answers 40% longer, with more caveats and repetition. The judge's average rose from 7.1 to 8.3, and the change shipped. Agents hated it: the drafts took longer to edit. The judge had been rewarding **length**, not quality.
+</Incident>
+
+Once error analysis tells you *what* to measure, you need **scorers**: functions that look at an output and return pass or fail. Always try code first; use LLM judges for the rest.
+
+## Code-based checks
+
+These are cheap, fast, deterministic, and never drift. They cover more than people expect:
+
+```python
+# evals/checks.py
+import re
+
+PROMISE = re.compile(r"\b(we will|we'll|you will receive|approved?)\b.*\brefund", re.I)
+ORDER_ID = re.compile(r"ACM-\d{4}-\d{6}")
+NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def no_refund_promise(output: str) -> bool:
+    return not PROMISE.search(output)
+
+
+def does_not_ask_for_known_id(ticket: str, output: str) -> bool:
+    """The #1 failure from error analysis: asking for an order number already provided."""
+    asks = re.search(r"(share|provide|send).{0,30}(order|shipment) (number|id)", output, re.I)
+    return not (ORDER_ID.search(ticket) and asks)
+
+
+def numbers_are_grounded(output: str, sources: list[str]) -> bool:
+    """Every number in the answer must appear in at least one source passage."""
+    source_text = " ".join(sources)
+    return all(n in source_text for n in NUMBER.findall(output))
+
+
+def cited_ids_were_retrieved(cited: list[str], retrieved: list[str]) -> bool:
+    return set(cited) <= set(retrieved)
+```
+
+Each one maps directly to a failure category from your taxonomy. The table in the [error analysis lesson](/evals/error-analysis/) shows the pattern: **every category gets its own check.**
+
+## When you need a judge
+
+Some criteria need judgment: "Does the answer address what the customer actually asked?", "Is it faithful to the sources?", "Is the tone right for an angry customer?". An **LLM judge** is a model call that grades an output against a rubric.
+
+<Diagram
+	caption="A judge sees the input, the output, the relevant context, and a precise rubric. It writes its reasoning first, then a binary verdict."
+	code={`flowchart LR
+    I["Input<br/>(customer message)"] --> J["Judge model<br/>+ one-criterion rubric<br/>+ pass/fail examples"]
+    O["Output<br/>(Relay's reply)"] --> J
+    C["Context<br/>(sources, policy)"] --> J
+    J --> CR["Critique<br/>(short reasoning)"]
+    CR --> V["Verdict: pass / fail"]`}
+/>
+
+## Designing a judge that works
+
+| Do | Don't |
+|---|---|
+| **One criterion per judge** ("faithful to sources") | One judge that rates "overall quality" |
+| **Binary pass/fail** with an explicit rule | 1–10 scales (inconsistent, and they reward length) |
+| **Critique before verdict**, so the judge reasons first | Ask for the score alone |
+| Include **pass and fail examples** from your labelled data (lesson 2) | Leave "good" undefined |
+| Give the judge **the context** it needs (sources, the policy) | Ask it to judge facts it can't see |
+| **Calibrate against human labels** (next lesson) | Trust it because it sounds smart |
+
+```python
+# evals/judges.py
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.Anthropic()
+
+FAITHFULNESS_RUBRIC = """You are evaluating whether a support reply is FAITHFUL to the provided policy excerpts.
+
+PASS if every factual claim in the reply (deadlines, amounts, conditions, requirements) is directly supported by the excerpts.
+FAIL if the reply states any fact, number or condition that the excerpts do not support, or contradicts them.
+Ignore tone, length and style. Only judge factual support.
+
+Example FAIL: excerpts say "change the address until the parcel leaves the warehouse"; reply adds "for a 5 EUR fee".
+Example PASS: excerpts say "refunds within 30 days, not for perishables"; reply says "you can get a refund within 30 days unless the item is perishable"."""
+
+
+class Verdict(BaseModel):
+    critique: str = Field(description="Two or three sentences: which claims are or are not supported, and why")
+    passed: bool
+
+
+def judge_faithfulness(reply: str, excerpts: list[str]) -> Verdict:
+    response = client.messages.parse(
+        model="claude-sonnet-5-5",
+        max_tokens=4000,
+        system=FAITHFULNESS_RUBRIC,
+        messages=[{
+            "role": "user",
+            "content": "<excerpts>\n" + "\n---\n".join(excerpts) + "\n</excerpts>\n\n<reply>\n" + reply + "\n</reply>",
+        }],
+        output_format=Verdict,  # critique comes first in the schema, so reasoning precedes the verdict
+    )
+    return response.parsed_output
+```
+
+## Known judge biases
+
+| Bias | What happens | Mitigation |
+|---|---|---|
+| **Verbosity bias** | Longer answers judged better | Binary criteria that ignore length; pair with a length check |
+| **Position bias** | In A-vs-B comparisons, the first (or second) option is favoured | Run both orders and require agreement |
+| **Self-preference** | A judge favours outputs from its own model family | Use a different model family as judge, or calibrate carefully |
+| **Leniency** | Judges tend to pass borderline cases | Include hard fail examples; measure TNR (next lesson) |
+| **Rubric drift** | A changed judge prompt silently changes every historical score | Version judge prompts; re-calibrate after any change |
+
+<FailureCard
+	title="The judge that couldn't see the facts"
+	symptom="A 'correctness' judge passes answers with wrong refund deadlines."
+	cause="The judge was given only the question and the answer, not the policy. It judged plausibility, not correctness."
+	detect="Calibration against human labels shows a low TNR on factual errors."
+	fix="Give the judge the evidence (sources, reference answer or policy), and narrow the criterion to what it can verify."
+/>
+
+<FailureCard
+	title="One mega-judge"
+	symptom="The 'quality' judge passes 92% of answers; when it fails one, nobody can tell why or what to fix."
+	cause="One judge was asked to assess accuracy, tone, completeness and safety at once, producing a blended, unactionable verdict."
+	detect="Ask: if this check fails, do I know which code or prompt to change? If not, it's too broad."
+	fix="Split into one judge per failure category from the taxonomy, each with its own rubric, examples and calibration."
+/>
+
+<ThinkFirst question="Write the pass/fail rule for a judge that checks Relay's tone with angry customers. What would you put in the rubric, what examples would you include, and what would you deliberately exclude?">
+
+**Rubric (one criterion: empathetic acknowledgement):**
+
+> PASS if the reply, before any policy details, (1) acknowledges the customer's frustration specifically (not a generic "sorry for any inconvenience") and (2) takes ownership with a concrete next step. FAIL if it opens with policy, blames the customer, is sarcastic or defensive, or uses only a generic apology.
+
+**Examples:**
+
+- PASS: "I'm really sorry: two lost parcels in a month is not acceptable. I've opened a claim for ACM-…, and you'll hear from us by tomorrow."
+- FAIL: "Per policy, packages without updates for 14 days are treated as lost." (no acknowledgement)
+- FAIL: "We apologize for any inconvenience caused." (generic)
+
+**Exclude deliberately:** factual correctness, length, and grammar. Those belong to other checks. Mixing them in makes the verdict unactionable and introduces verbosity bias.
+
+Then label 50 real angry-customer replies yourself, and calibrate (next lesson).
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** implement two code checks from your failure taxonomy and run them over your eval set.
+- **Stretch:** implement `judge_faithfulness` and run it on 20 answers. Read every critique. Do you agree? Where does it go wrong?
+- **Boss level:** test the **verbosity bias** of your own judge: take 20 passing answers, create a padded version of each (same facts, plus filler and caveats), and see whether the judge's verdicts change. Then fix the rubric until they don't.
+
+</Practice>
+
+<Quiz
+	id="m5-judges"
+	questions={[
+		{
+			q: 'Which criterion should NOT need an LLM judge?',
+			options: ['"Does the reply address the customer\'s actual question?"', '"Is every cited chunk ID in the retrieved set?"', '"Is the tone appropriate for an angry customer?"', '"Is the reply faithful to the sources?"'],
+			answer: 1,
+			why: 'Set membership is a one-line code check. Reserve judges for judgment.',
+		},
+		{
+			q: 'Why ask the judge for a critique before the verdict?',
+			options: [
+				'It looks better in logs',
+				'Reasoning first tends to produce more careful verdicts, and the critique tells you why a case failed',
+				'It is cheaper',
+				'Verdicts can\'t be generated alone',
+			],
+			answer: 1,
+			why: 'The critique improves the decision and makes failures debuggable.',
+		},
+		{
+			q: 'A judge rates longer answers higher, regardless of quality. What is this called and how do you mitigate it?',
+			options: [
+				'Position bias; shuffle inputs',
+				'Verbosity bias; use binary criteria that ignore length, and pair the judge with a length check',
+				'Leniency; use a smaller model',
+				'Drift; add more examples',
+			],
+			answer: 1,
+			why: 'Fuzzy quality scales reward length. Narrow, binary criteria resist it.',
+		},
+		{
+			q: 'What must a "correctness" judge be given?',
+			options: ['Only the answer', 'The question and the answer', 'The question, the answer and the evidence (sources or reference)', 'Nothing, it knows the facts'],
+			answer: 2,
+			why: 'Without the evidence, a judge can only assess plausibility, which is exactly what hallucinations have plenty of.',
+		},
+	]}
+/>
+
+<LessonComplete id="evals/llm-as-judge" />

@@ -1,0 +1,207 @@
+---
+title: Hybrid search and measuring retrieval
+description: BM25 for exact terms, vectors for meaning, Reciprocal Rank Fusion to combine them, Postgres SQL for all three, and the recall@k / MRR harness that tells you if it worked.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import EmbeddingPlayground from '../../../components/EmbeddingPlayground.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The error code that semantic search couldn't find" severity="SEV3">
+After switching Relay's help search from keyword to "AI-powered" semantic search, satisfaction went **down**. Customers searching for `ERR_RATE_429` or a product SKU got vaguely related articles about errors in general. Keyword search had found those exactly. The upgrade had traded one blind spot for another.
+</Incident>
+
+You saw it in Module 3: **keyword search** nails exact identifiers, rare words and names; **semantic search** handles paraphrases and vocabulary mismatch. Production systems run **both** and fuse the results. That's **hybrid search**, and it's one of the cheapest, most reliable quality wins in RAG.
+
+## BM25 in one paragraph
+
+BM25 is the classic keyword-ranking formula behind most search engines. A document scores high when it contains the query's terms (**term frequency**, with diminishing returns), especially **rare** terms (**inverse document frequency**: "ERR_AUTH_8091" is worth far more than "the"), adjusted for document length. No model, no training, fast and explainable.
+
+## Combining rankings: Reciprocal Rank Fusion
+
+You can't simply add a cosine similarity (0.83) to a BM25 score (12.7): they're on different scales. **Reciprocal Rank Fusion (RRF)** sidesteps this by using only **ranks**:
+
+> score(d) = Σ over each result list of 1 / (k + rank of d in that list), with k usually 60
+
+A document ranked well in **both** lists rises to the top. A document that only one method finds still gets in. The constant `k` dampens the advantage of the very top ranks.
+
+```python
+# app/rag/fusion.py
+from collections import defaultdict
+
+
+def rrf(rankings: list[list[str]], k: int = 60, top_n: int = 10) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion: score(d) = sum over lists of 1 / (k + rank of d in that list)."""
+    scores: dict[str, float] = defaultdict(float)
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] += 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_n]
+```
+
+Try it live. The third column fuses the two others. Search for `ERR_AUTH_8091` (only keyword finds it, and hybrid keeps it), then `opening times` (only semantic finds it, and hybrid keeps it too):
+
+<EmbeddingPlayground hybrid />
+
+## All of it in Postgres
+
+Postgres has built-in full-text search (a `tsvector` column with a GIN index), and pgvector adds the vectors, so one database runs the whole hybrid query:
+
+```sql
+-- keyword index: kept in sync automatically, title weighted higher than body
+ALTER TABLE chunks ADD COLUMN search_tsv tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', title), 'A') || setweight(to_tsvector('english', content), 'B')
+) STORED;
+CREATE INDEX chunks_search_gin ON chunks USING gin (search_tsv);
+```
+
+```sql
+-- hybrid search with RRF (k = 60). $1 = query embedding, $2 = query text, $3 = tenant
+WITH semantic AS (
+    SELECT id, row_number() OVER (ORDER BY embedding <=> $1) AS rnk
+    FROM chunks
+    WHERE tenant_id = $3
+    ORDER BY embedding <=> $1
+    LIMIT 50
+),
+keyword AS (
+    SELECT id, row_number() OVER (ORDER BY ts_rank_cd(search_tsv, q) DESC) AS rnk
+    FROM chunks, websearch_to_tsquery('english', $2) q
+    WHERE tenant_id = $3 AND search_tsv @@ q
+    ORDER BY ts_rank_cd(search_tsv, q) DESC
+    LIMIT 50
+)
+SELECT c.id, c.title, c.content,
+       COALESCE(1.0 / (60 + s.rnk), 0) + COALESCE(1.0 / (60 + k.rnk), 0) AS rrf_score
+FROM semantic s
+FULL OUTER JOIN keyword k USING (id)
+JOIN chunks c USING (id)
+ORDER BY rrf_score DESC
+LIMIT 10;
+```
+
+The full-text search and RRF parts were run against PostgreSQL 16 while writing this lesson. A query for `ERR_AUTH_8091` matched the error-code chunk exactly, and the fused ranking kept chunks that only one method found. (The vector half uses the pgvector operator from Module 3.) `ts_rank_cd` is a simpler cousin of BM25. For true BM25 inside Postgres there are extensions, or you can use a search engine (OpenSearch, Elasticsearch) or a vector database with built-in hybrid search.
+
+## Measure it: recall@k and MRR
+
+Every retrieval change (chunking, embedding model, hybrid weights, reranker) must be **measured**, not eyeballed. You need a small labelled set: questions plus the chunk IDs that answer them.
+
+```python
+# evals/retrieval_metrics.py
+def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
+    """Share of the relevant chunks that appear in the top k."""
+    return len(set(retrieved[:k]) & relevant) / len(relevant) if relevant else 0.0
+
+
+def reciprocal_rank(retrieved: list[str], relevant: set[str]) -> float:
+    """1 / position of the first relevant result (0 if none). Averaged over queries = MRR."""
+    for position, doc_id in enumerate(retrieved, start=1):
+        if doc_id in relevant:
+            return 1.0 / position
+    return 0.0
+
+
+def evaluate(cases: list[dict], search, k: int = 5) -> dict:
+    """cases: [{"query": ..., "relevant": [...chunk ids]}]; search(query) -> ranked chunk ids."""
+    recalls, rrs = [], []
+    for case in cases:
+        retrieved = search(case["query"])
+        relevant = set(case["relevant"])
+        recalls.append(recall_at_k(retrieved, relevant, k))
+        rrs.append(reciprocal_rank(retrieved, relevant))
+    return {f"recall@{k}": sum(recalls) / len(recalls), "mrr": sum(rrs) / len(rrs), "n": len(cases)}
+```
+
+| Metric | Answers the question | Why you care |
+|---|---|---|
+| **recall@k** | Did the right chunk make it into the top k at all? | If it's not retrieved, the generator can't use it. This is the ceiling on answer quality |
+| **MRR** | How high up was the first right chunk? | Matters when you send few chunks, or when a reranker comes next |
+
+Then compare configurations side by side, for example `evaluate(cases, keyword_search)`, `evaluate(cases, semantic_search)`, and `evaluate(cases, hybrid_search)`. Your decision table writes itself.
+
+<FailureCard
+	title="Hybrid that was secretly keyword-only"
+	symptom="Hybrid search shows no improvement over keyword search on the eval, and semantic results never seem to appear."
+	cause="The semantic branch silently returned nothing (a dimension mismatch was caught and swallowed by an over-broad `except`), so RRF fused one list with an empty one."
+	detect="Log per-branch result counts; alert when one branch returns zero results for a large share of queries."
+	fix="Let errors in one branch surface (or at least alert), monitor each branch separately, and keep per-branch retrieval evals."
+/>
+
+<FailureCard
+	title="Language mismatch in full-text search"
+	symptom="Keyword search works for English documents but misses obvious matches in Dutch ones."
+	cause="Every document was indexed with `to_tsvector('english', …)`, so Dutch words were stemmed and stop-worded with English rules."
+	detect="Retrieval eval cases per language."
+	fix="Store a language per chunk and use the matching text-search configuration (or a language-agnostic one such as `simple` for codes and names)."
+/>
+
+<ThinkFirst question="Your retrieval eval shows: keyword recall@5 = 0.62, semantic = 0.71, hybrid (RRF) = 0.84. Product asks 'can we just use semantic, it's simpler?'. What do you answer, and what would you check before finalising hybrid?">
+
+**Answer:** hybrid finds the right chunk in the top 5 for **13 more questions out of 100** than semantic alone. Since generation can't use what isn't retrieved, that's a ceiling-raising improvement for one extra SQL CTE, which is a good trade.
+
+**Before finalising, check:**
+
+1. **Which questions hybrid fixes:** probably exact codes, names and rare terms. Make sure the eval represents real traffic proportions.
+2. **Latency:** two queries plus fusion. Measure p95 (usually small compared with LLM latency).
+3. **Statistical confidence:** with a small eval set, check that the gain is consistent (Module 5 covers confidence intervals).
+4. **Per-segment results:** by language, by document type, by tenant.
+5. **The next stage:** with recall@50 high, a reranker (next lesson) can turn "somewhere in the top 50" into "in the top 5".
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** in the playground, find a query where hybrid beats both single methods, and one where it's worse than the best single method. Why does that happen?
+- **Stretch:** write 30 labelled retrieval questions for your Relay corpus (question + relevant chunk IDs), and run `evaluate` for keyword, semantic and hybrid.
+- **Boss level:** make RRF **weighted** (e.g. `weight / (k + rank)` per list), and tune the weights and `k` on half your eval set. Report results on the *other* half only. You've just learned why tuning and testing on the same data is cheating.
+
+</Practice>
+
+<Quiz
+	id="m4-hybrid"
+	questions={[
+		{
+			q: 'Why use Reciprocal Rank Fusion instead of adding cosine similarity and BM25 scores?',
+			options: [
+				'RRF is more accurate in every case',
+				'The scores are on incompatible scales, while ranks are comparable, so RRF needs no score normalization',
+				'BM25 scores are always negative',
+				'Postgres cannot add numbers',
+			],
+			answer: 1,
+			why: 'Cosine is roughly 0–1, BM25 is unbounded and query-dependent. Ranks are a common currency.',
+		},
+		{
+			q: 'Which query benefits most from the keyword half of hybrid search?',
+			options: ['"how do I get my money back"', '"ERR_RATE_429"', '"opening times"', '"box arrived smashed"'],
+			answer: 1,
+			why: 'Exact, rare identifiers are BM25\'s strength, and embeddings blur them.',
+		},
+		{
+			q: 'What does recall@5 = 0.84 mean?',
+			options: [
+				'84% of answers are correct',
+				'On average, 84% of the relevant chunks appear in the top 5 retrieved results',
+				'The top result is right 84% of the time',
+				'84% of chunks were indexed',
+			],
+			answer: 1,
+			why: 'Recall@k measures retrieval coverage, which caps answer quality. Answer correctness is measured separately (Module 5).',
+		},
+		{
+			q: 'You tuned RRF weights on your whole eval set and got recall@5 = 0.91. What is wrong with reporting 0.91?',
+			options: ['Nothing', 'The number is optimistic: you tuned and tested on the same data. Hold out a test split', 'Recall can\'t exceed 0.9', 'RRF has no weights'],
+			answer: 1,
+			why: 'Tuning on test data overfits. Keep a held-out split for the number you report.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/hybrid-search" />

@@ -1,0 +1,190 @@
+---
+title: Agentic and multi-hop RAG
+description: Retrieval as a tool the model calls, multi-hop questions, when agentic retrieval is worth the cost, and the Module 4 lab.
+sidebar:
+  order: 8
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The question that needed three documents" severity="SEV3">
+"Customer ACM-C-2201 shipped insured glassware to Norway and it arrived broken. What can we offer?" Relay's single-shot RAG retrieved the damage policy and nothing else. The real answer needed the customer's contract tier (from the CRM), the insurance rules, the fragile-goods cap, **and** the Norway customs note about returns. No single query could retrieve all of that, because the second search depended on what the first one found.
+</Incident>
+
+Classic RAG is a fixed pipeline: one query, one retrieval, one answer. **Agentic RAG** gives the model retrieval as a **tool**: it can search, read, decide what's missing, and search again, combining documents with live data along the way.
+
+## Single-shot vs agentic
+
+<Diagram
+	caption="Single-shot RAG is a straight line. Agentic RAG is a loop with a budget."
+	code={`flowchart LR
+    subgraph Single["Single-shot RAG"]
+        A1["Question"] --> B1["Retrieve once"] --> C1["Answer"]
+    end
+    subgraph Agentic["Agentic RAG"]
+        A2["Question"] --> M["Model plans"]
+        M -- "search_policies(...)" --> T1["Search"]
+        M -- "get_customer(...)" --> T2["CRM lookup"]
+        T1 --> M
+        T2 --> M
+        M -- "enough evidence<br/>or budget spent" --> C2["Answer with citations"]
+    end`}
+/>
+
+Step through an agentic run of the incident's question:
+
+<AgentStepper
+	title="Multi-hop: insured glassware to Norway"
+	steps={[
+		{ kind: 'user', title: 'Question', body: 'Customer ACM-C-2201 shipped insured glassware to Norway and it arrived broken. What can we offer?' },
+		{ kind: 'model', title: 'Plan', body: 'Need: the customer\'s contract tier, damage rules for fragile items, insurance rules, and anything Norway-specific.' },
+		{ kind: 'tool_call', title: 'get_customer("ACM-C-2201")', body: 'Live CRM data via a tool, not retrieval.' },
+		{ kind: 'tool_result', title: 'Result', body: 'Tier: Business Plus (contract clause 7: fragile cap raised to 500 EUR).' },
+		{ kind: 'tool_call', title: 'search_policies("compensation insured fragile glass")', body: 'Hybrid search plus rerank, top 5.' },
+		{ kind: 'tool_result', title: 'Result', body: 'Damage policy §2 table (fragile cap 100 EUR), Insurance §2 (declared value).' },
+		{ kind: 'model', title: 'Notice the gap', body: 'The contract clause overrides the standard cap. Is there anything about returns from Norway?' },
+		{ kind: 'tool_call', title: 'search_policies("Norway return damaged goods customs")', body: 'A second hop that depends on the first findings.' },
+		{ kind: 'tool_result', title: 'Result', body: 'Customs note: damaged goods from Norway may be destroyed locally with a certificate instead of being returned.' },
+		{ kind: 'model', title: 'Answer', body: 'Offer up to 500 EUR (contract clause 7 overrides the 100 EUR fragile cap), or the declared value if lower, with photos within 48 h. Suggest local destruction with a certificate to avoid return customs. Citations attached to each claim.' },
+	]}
+/>
+
+## Retrieval as a tool
+
+The search tool is just your hybrid search plus reranker with a good description:
+
+```python
+SEARCH_TOOL = {
+    "name": "search_policies",
+    "description": (
+        "Search Acme's policy documents (refunds, damage, insurance, customs). "
+        "Returns up to 5 passages with document title, section and effective date. "
+        "Use specific queries; search again with different terms if results are not relevant. "
+        "Do not use this for live shipment or customer data."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "A specific search query, not the user's whole message"},
+        },
+        "required": ["query"],
+    },
+}
+```
+
+You'll build the full tool-calling loop in Module 6. The RAG-specific design points are:
+
+- **Return compact, cited results:** title, section, effective date, and the passage. Not whole documents.
+- **Budget the loop:** a maximum number of searches (e.g. 5) and a token budget. Agents happily search forever.
+- **Permission-aware, always:** the tool executes **as the user** (lesson 7). The agent can't search what the user can't see.
+
+## When is agentic RAG worth it?
+
+| Use single-shot RAG when… | Use agentic RAG when… |
+|---|---|
+| Most questions are answered by one passage | Questions need several sources, or combine docs with live data |
+| Latency budget is tight (chat, autocomplete) | Users accept a few extra seconds for a much better answer |
+| Volume is high and cost matters | Stakes per answer are high (claims, compliance, research) |
+| You want a predictable, testable pipeline | You have evals that measure trajectories (Module 5) |
+
+A common production pattern is **routing**: single-shot by default, agentic for questions a classifier flags as complex, or when single-shot retrieval quality is low.
+
+<FailureCard
+	title="The search loop"
+	symptom="Some questions take 40 seconds and cost 15× the average. Traces show 20+ near-identical searches."
+	cause="The agent kept rephrasing a query for information that doesn't exist in the corpus, with no stopping rule."
+	detect="Distribution of tool calls per question; alert on the tail."
+	fix="A hard limit on searches, detection of repeated similar queries, and an instruction plus a designed answer for 'I searched and the policies don't cover this.'"
+/>
+
+<FailureCard
+	title="Hops that drift"
+	symptom="Multi-hop answers occasionally cite documents about the wrong customer or country."
+	cause="An intermediate search drifted ('Norway' became 'Nordic countries' and pulled in a Sweden policy), and the agent treated it as relevant."
+	detect="Trajectory evals: check intermediate tool calls and retrieved documents, not just the final answer."
+	fix="Encourage specific queries, have the reranker threshold drop weak hits, and require citations for every claim so drift becomes visible."
+/>
+
+## 🧪 Module 4 lab: Relay policy Q&A
+
+Build it in `relay`, using the ingestion from this module and the pgvector store from Module 3. **Acceptance criteria:**
+
+1. **Ingestion** of at least 50 realistic policy documents (generate them, or use public policy PDFs), with tables and some scans: parsing, quality gate, structure-aware chunking with prepended context, content-hash sync **with deletions**, and permissions copied per chunk.
+2. **Hybrid search** (vector + full-text with RRF) and a **reranker**.
+3. **Conversational query rewriting** for follow-ups, preserving identifiers.
+4. **Grounded answers with native citations**, a "not covered" gate tuned on unanswerable questions, and the number/date verification check.
+5. **Row-level security** with a permission test suite using canary documents.
+6. **A retrieval eval** with at least 40 labelled questions (including 10 unanswerable and 5 multi-hop): recall@5 and MRR for keyword, semantic, hybrid, and hybrid with reranking, in a table.
+7. **The UI** from Module 2 showing citation chips, conflict banners, and the "not covered" state.
+8. `docs/module-4.md`: your ablation table, the chosen configuration with justification, and **the three worst failures you found** with their root causes.
+
+<ThinkFirst question="Your Module 4 eval: recall@5 = 0.88, but users still report wrong answers in about 10% of cases. Name three different root causes that could explain the gap between good retrieval and bad answers, and how you'd tell them apart.">
+
+1. **Generation isn't faithful:** the right chunk is in context, but the answer contradicts or paraphrases it wrongly. *Tell:* run a faithfulness check on the failing cases. If the answer isn't supported by the retrieved text, it's generation.
+2. **The eval set doesn't match real traffic:** your 40 questions are easier, or differently distributed, than what users ask. *Tell:* sample 50 real production questions and label them; compare recall on real versus eval questions.
+3. **Right topic, wrong version:** retrieval found a relevant chunk, but a superseded or conflicting one. *Tell:* check the cited documents' effective dates in the failing cases.
+
+Bonus causes: questions that need several hops (single-shot can't answer them), "correct but useless" answers that users mark wrong, and permission filtering hiding the needed document for that user.
+
+That's exactly the skill Module 5 builds: **error analysis on real traces to find out which stage fails, before fixing anything.**
+
+</ThinkFirst>
+
+<Practice title="Build it yourself: Module 4 wrap-up">
+
+- **Warm-up:** turn your hybrid search into a `search_policies` tool and call it from a simple tool-use loop for 5 multi-hop questions. Read the traces.
+- **Stretch:** add a router: single-shot RAG by default, agentic RAG when a cheap classifier marks the question as multi-part. Compare quality, latency and cost on your eval set.
+- **Boss level:** complete the Module 4 lab and publish the ablation table and the three-worst-failures write-up in your README. This is the strongest single artifact you can show in an Applied AI or GenAI interview.
+
+</Practice>
+
+<Quiz
+	id="m4-agentic"
+	title="Module 4 final quiz"
+	questions={[
+		{
+			q: 'What makes a question "multi-hop"?',
+			options: ['It is long', 'Answering it requires information whose search depends on what earlier searches found', 'It mentions two countries', 'It needs a bigger model'],
+			answer: 1,
+			why: 'The second retrieval depends on the first result, so a single fixed query can\'t gather all the evidence.',
+		},
+		{
+			q: 'Which control is essential for agentic RAG?',
+			options: ['A larger context window', 'A budget: maximum searches and tokens, plus detection of repeated queries', 'Disabling citations', 'A higher temperature'],
+			answer: 1,
+			why: 'Without a budget, agents can loop for a long time at great cost, especially when the answer doesn\'t exist.',
+		},
+		{
+			q: 'Good retrieval metrics, but answers are wrong. What should you do first?',
+			options: [
+				'Switch to a bigger LLM',
+				'Error analysis: inspect failing cases to see whether retrieval, generation, versions, or eval coverage is the cause',
+				'Increase top-k to 50',
+				'Fine-tune the embedding model',
+			],
+			answer: 1,
+			why: 'Diagnose the stage before choosing a fix. Different root causes need completely different fixes.',
+		},
+		{
+			q: 'Which knowledge source should NOT go into a RAG index?',
+			options: ['Policy PDFs', 'Live shipment status', 'Resolved ticket histories', 'Product manuals'],
+			answer: 1,
+			why: 'Live, structured data belongs behind tools that query the system of record. Indexed copies go stale immediately.',
+		},
+		{
+			q: 'The policy index contains a deleted promotion. Which pipeline step was missing?',
+			options: ['Reranking', 'Deletion handling in ingestion sync', 'Query rewriting', 'HyDE'],
+			answer: 1,
+			why: 'Sync must compute and apply deletions, or the index fills with ghosts the model will happily cite.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/agentic-rag" />

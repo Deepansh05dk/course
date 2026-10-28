@@ -1,0 +1,164 @@
+---
+title: Evaluating RAG and agents
+description: Separating retrieval from generation (the RAG triad), faithfulness and answer relevance, and evaluating agents by outcome and by trajectory.
+sidebar:
+  order: 6
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The agent that passed by accident" severity="SEV2">
+Relay's refund agent passed 95% of its end-to-end eval: the final reply was correct. Then a trace review found that in 20% of "passing" cases the agent had called `issueRefund` **twice** (the second call failed on the idempotency key), or looked up the **wrong customer** before correcting itself. Outcome-only scoring had hidden risky behaviour that would eventually cause a real incident.
+</Incident>
+
+RAG systems and agents are pipelines. A single end-to-end score tells you **that** something is wrong, not **where**. This lesson is about measuring each stage, so every failure points at its fix.
+
+## The RAG triad
+
+<Diagram
+	caption="Three relationships, three questions. Each failure mode has a different fix."
+	code={`flowchart LR
+    Q["Question"] -- "1. Context relevance:<br/>did we retrieve the right evidence?" --> C["Retrieved context"]
+    C -- "2. Faithfulness:<br/>is the answer supported by the context?" --> A["Answer"]
+    Q -- "3. Answer relevance:<br/>does it address the question?" --> A`}
+/>
+
+| Metric | Question | How to measure | If it fails, fix… |
+|---|---|---|---|
+| **Context recall / relevance** | Was the needed evidence retrieved (and how much noise came with it)? | recall@k and MRR against labelled chunks (Module 4); or a judge on retrieved chunks | Chunking, hybrid search, reranking, query rewriting |
+| **Faithfulness** (groundedness) | Is every claim in the answer supported by the retrieved context? | Number/date code check + faithfulness judge (lesson 4) | Grounding prompt, citations, generation model |
+| **Answer relevance** | Does the answer actually address the question? | Judge with a narrow rubric | Prompt, query understanding, refusal logic |
+| **Correctness** (needs a reference) | Does it match the known right answer? | Compare with expected properties or a reference answer | Any of the above, so diagnose with the first three |
+
+Libraries such as **RAGAS** and **DeepEval** implement versions of these metrics (context precision/recall, faithfulness, answer relevancy). They're a fast start, but they're still LLM judges, so **calibrate them on your data** (lesson 5) before trusting their numbers.
+
+## Reading the triad: a diagnosis table
+
+| Context recall | Faithfulness | Answer relevance | Diagnosis |
+|---|---|---|---|
+| Low | — | — | **Retrieval problem.** Generation can't use what isn't there |
+| High | Low | — | **Generation problem:** the model ignores or distorts the evidence |
+| High | High | Low | **Understanding problem:** a faithful answer to the wrong question (query rewriting, intent) |
+| High | High | High | The pipeline works on this case. If users still complain, check the dataset (lesson 3) |
+
+## Evaluating agents: outcome and trajectory
+
+Agents take multi-step paths with tools. Evaluate **both**:
+
+| | Outcome evals | Trajectory evals |
+|---|---|---|
+| Question | Did the agent achieve the goal? | **How** did it get there? |
+| Examples | The refund exists with the right amount; the reply is correct; the database ends in the right state | Right tools called, in a sensible order; no forbidden calls; no duplicate side effects; under the step and cost budget |
+| Strength | Tolerant of different valid paths | Catches risky behaviour that happens to end well |
+| Weakness | Misses dangerous paths that succeeded | Too strict if you demand one exact path |
+
+Practical trajectory checks are usually **properties**, not exact sequences:
+
+```python
+# evals/agent_checks.py
+def trajectory_checks(trace: list[dict]) -> dict[str, bool]:
+    """trace: [{"type": "tool_call", "name": ..., "input": {...}}, ...] from your agent's logs."""
+    calls = [step for step in trace if step["type"] == "tool_call"]
+    names = [c["name"] for c in calls]
+    refunds = [c for c in calls if c["name"] == "issueRefund"]
+
+    def looked_up_before_refund() -> bool:
+        if not refunds:
+            return True
+        first_refund = names.index("issueRefund")
+        return "getShipment" in names[:first_refund]
+
+    return {
+        "looked_up_before_refund": looked_up_before_refund(),
+        "at_most_one_refund": len(refunds) <= 1,
+        "no_forbidden_tools": not set(names) & {"deleteCustomer", "sendBulkEmail"},
+        "within_step_budget": len(calls) <= 8,
+    }
+```
+
+And for outcomes, the most reliable approach is **environment-based evaluation**: run the agent against a sandbox (a test database or mock APIs), then check the **end state** with code (the refund row exists, amount = 340, exactly one row), rather than judging the final text.
+
+<FailureCard
+	title="One end-to-end score for everything"
+	symptom="Overall pass rate dropped from 88% to 81% after a release, and the team spent two days guessing which change caused it."
+	cause="Only an end-to-end correctness score existed, with no stage-level metrics. Retrieval, generation and tool-use failures all looked the same."
+	detect="Ask, for any failing case: can I tell from the eval output which stage failed? If not, you need stage metrics."
+	fix="Log retrieval results and tool calls in every eval run; score context recall, faithfulness, relevance and trajectory properties separately."
+/>
+
+<FailureCard
+	title="The exact-path agent test"
+	symptom="Agent evals fail constantly after harmless model upgrades, and the team starts ignoring them."
+	cause="Tests required one exact sequence of tool calls; a new model found an equally valid, shorter path."
+	detect="Read failing trajectories: are they wrong, or just different?"
+	fix="Assert properties (required lookups happen before actions, no duplicate side effects, budget respected) and end states, not exact sequences."
+/>
+
+<ThinkFirst question="Relay's policy Q&A scores: context recall@5 = 0.92, faithfulness = 0.95, answer relevance = 0.71. Where is the problem, and what would you look at next?">
+
+**The problem is understanding the question, not retrieval or grounding.** The right evidence is retrieved (0.92) and answers stick to it (0.95), but almost 30% of answers don't address what was actually asked.
+
+**Next steps:**
+
+1. **Read the failing cases** (error analysis on the 29%). Typical patterns: multi-part questions where only one part is answered; follow-ups interpreted without conversation context; the model answering a more general question than the one asked.
+2. **Check query rewriting** for follow-ups (Module 4), and whether multi-part questions need decomposition.
+3. **Check the prompt:** does it tell the model to answer every part of the question, and to ask a clarifying question when the request is ambiguous?
+4. **Validate the judge** for answer relevance (calibration, lesson 5). A strict judge can produce low scores too, so confirm with a quick human check on 20 cases.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** for 10 failing cases from your Module 4 eval, fill in the triad by hand (retrieval OK? faithful? relevant?) and use the diagnosis table.
+- **Stretch:** add per-stage scoring to your eval runner: recall@5 from labelled chunks, the number-grounding check, and a calibrated faithfulness judge, reported in one table.
+- **Boss level:** build an **environment-based agent eval** for Relay's refund flow: a SQLite sandbox with customers and shipments, 15 scenarios, end-state assertions, and `trajectory_checks` on every run. Report outcome pass rate and trajectory pass rate separately.
+
+</Practice>
+
+<Quiz
+	id="m5-rag-agents"
+	questions={[
+		{
+			q: 'Context recall is high but faithfulness is low. Which stage needs work?',
+			options: ['Retrieval', 'Generation: the model ignores or distorts the evidence it was given', 'Ingestion', 'The embedding model'],
+			answer: 1,
+			why: 'The evidence was retrieved; the answer doesn\'t stick to it. Fix grounding, prompting and citations.',
+		},
+		{
+			q: 'Why are outcome-only agent evals risky?',
+			options: [
+				'They are too slow',
+				'Risky paths that happen to end well (duplicate refunds, wrong lookups) still pass',
+				'They can\'t measure success',
+				'They require humans',
+			],
+			answer: 1,
+			why: 'Trajectory checks catch dangerous behaviour before it causes a real incident.',
+		},
+		{
+			q: 'What is the most reliable way to check that an agent issued the right refund?',
+			options: [
+				'Ask a judge to read the final reply',
+				'Run it against a sandbox and assert the end state in the database with code',
+				'Check the reply contains the word "refund"',
+				'Trust the agent\'s summary',
+			],
+			answer: 1,
+			why: 'End-state assertions are deterministic and can\'t be fooled by a confident summary.',
+		},
+		{
+			q: 'Agent evals fail after a model upgrade because the new model takes a different but valid tool sequence. What should change?',
+			options: ['Pin the old model forever', 'Test properties and end states instead of one exact sequence', 'Delete the evals', 'Use a stricter judge'],
+			answer: 1,
+			why: 'Exact-path tests are brittle. Assert what must always be true, not one specific route.',
+		},
+	]}
+/>
+
+<LessonComplete id="evals/rag-and-agent-evals" />

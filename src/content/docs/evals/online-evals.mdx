@@ -1,0 +1,162 @@
+---
+title: Online evals and monitoring
+description: Evaluating live traffic. Guardrails vs monitors, sampling and scoring production, drift, shadow mode and A/B tests, and closing the loop. Plus the Module 5 lab.
+sidebar:
+  order: 8
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Green in CI, red in production" severity="SEV2">
+All offline evals passed. Two weeks after launch, Acme ran a promotion and 30% of incoming tickets were about a promo code system Relay had never seen. Relay confidently invented promo-code rules. The offline eval set had no promo questions, because promo questions didn't exist when it was built. Only an online signal (a spike in "not covered" questions answered anyway, and in agent edits) could have caught it.
+</Incident>
+
+Offline evals answer "is this version good on the cases we know about?". **Online evals** answer "is the system good on what users are doing **right now**?". You need both, because production keeps inventing cases your dataset doesn't have.
+
+## Guardrails vs monitors
+
+| | Guardrails (synchronous) | Monitors (asynchronous) |
+|---|---|---|
+| When | In the request path, before the user sees the output | After the fact, on a sample of traffic |
+| Purpose | **Block or fix** a bad output now | **Measure and alert** on trends |
+| Constraints | Must be fast, cheap and reliable (adds latency to every request) | Can be slower and more expensive (judges, humans) |
+| Relay examples | Refund-promise regex; number grounding; PII check; citation validity | Faithfulness judge on 5% of answers; topic drift; edit ratios; human review queue |
+
+Many checks start as monitors and get promoted to guardrails once they're fast and accurate enough.
+
+## The online eval loop
+
+<Diagram
+	caption="Production traffic is continuously sampled, scored and reviewed. Findings flow back into the offline dataset."
+	code={`flowchart LR
+    P["Production traces"] --> G["Guardrails<br/>(every request)"]
+    P --> S["Sample<br/>random 5% + all flagged"]
+    S --> J["Async scorers<br/>calibrated judges, code checks"]
+    J --> D["Dashboards + alerts<br/>by feature, tag, customer"]
+    S --> H["Human review queue<br/>(weekly error analysis)"]
+    H --> DS["Offline dataset<br/>new cases"]
+    J --> DS
+    DS --> CI["CI gates for<br/>future changes"]`}
+/>
+
+## What to monitor
+
+| Signal | Detects |
+|---|---|
+| **Judge scores on sampled traffic** (faithfulness, relevance) | Quality drops on real inputs |
+| **Code-check failure rates** (guardrail triggers) | Regressions, injection attempts, model behaviour changes |
+| **"Not covered" / refusal rate** | Too high: retrieval or coverage problem. Too low with new topics: confident guessing |
+| **Topic and intent mix** (cluster or classify incoming questions) | **Drift:** new kinds of questions your eval set doesn't contain (the promo incident) |
+| **User signals:** edit ratio, regenerate, thumbs, escalation, reopen | Real-world usefulness (Module 2) |
+| **Cost, latency, tokens per request** | Efficiency regressions (Modules 1, 9, 10) |
+
+Slice everything by **feature, customer, language and tag**. Averages hide the segment that's on fire.
+
+## Changing things safely: shadow mode and A/B tests
+
+| Technique | How | Use it for |
+|---|---|---|
+| **Offline eval** | Run the new version on the dataset | Every change, first |
+| **Shadow mode** | Run the new version on live traffic in parallel; users only see the old one; compare outputs with judges or sampling | Model upgrades, big retrieval changes; real inputs with zero user risk |
+| **Canary** | Route a small share of traffic (e.g. 5%) to the new version; watch guardrails and monitors | Gradual rollout with fast rollback |
+| **A/B test** | Split users randomly; compare outcome metrics (edit ratio, resolution time, escalations) | Proving a change improves **business outcomes**, not just eval scores |
+
+For A/B tests, decide the **primary metric and the minimum effect worth detecting before starting**, and run long enough to see it. Watching the dashboard and stopping when it looks good inflates false positives.
+
+<FailureCard
+	title="Monitoring averages only"
+	symptom="Global faithfulness is steady at 94%, yet one enterprise customer escalates about wrong answers."
+	cause="That customer's documents (a different language, scanned PDFs) performed far worse, but they were 3% of traffic, invisible in the average."
+	detect="Dashboards and alerts sliced by customer, language and document type."
+	fix="Per-segment monitors with their own thresholds, and per-customer eval sets for key accounts. That's standard practice in FDE engagements."
+/>
+
+<FailureCard
+	title="The judge bill"
+	symptom="Online evaluation costs more than the feature itself."
+	cause="Every production response was scored by three LLM judges using a frontier model."
+	detect="Track eval cost as its own line item."
+	fix="Sample (e.g. 5% random plus all flagged traces), use the cheapest judge model that stays calibrated, use code checks for everything they can cover, and score more heavily only in segments under investigation."
+/>
+
+## 🧪 Module 5 lab: Relay's evaluation system
+
+Build it on top of your Module 1–4 work. **Acceptance criteria:**
+
+1. **Error analysis:** at least 100 traces reviewed with open coding, a failure taxonomy with counts, and a written pass rule. Agreement measured with a second reviewer on 30 traces.
+2. **Dataset:** at least 150 cases from production samples, failures, expert cases and dimension-based synthetic cases (reviewed), tagged and versioned, with dev, test and critical splits.
+3. **Scorers:** one code check per failure category where possible; at least two LLM judges (e.g. faithfulness, answer relevance), each **calibrated** with TPR and TNR on a held-out test split.
+4. **RAG and agent metrics:** recall@5 and MRR, the RAG triad per case, and trajectory checks for the refund agent.
+5. **CI gate:** critical cases block; quality metrics compared with the base branch using bootstrap intervals; a PR comment with per-tag diffs and eval cost; path filters; a nightly full run.
+6. **Online:** guardrails in the request path (refund promises, number grounding), a 5% sampled judge monitor, a drift signal (topic mix over time), and a weekly review queue that adds cases to the dataset.
+7. `docs/module-5.md`: your taxonomy, judge calibration tables, a screenshot of a blocked PR, and **one regression your system caught** that you would have missed before.
+
+<ThinkFirst question="A new model version is 35% cheaper. Offline evals: critical cases 100%, quality 1 point lower (within noise). Describe a rollout plan that protects users and proves (or disproves) the switch.">
+
+1. **Offline, deeper:** run the full suite several times on both models; compare per tag and look at flipped cases. Check the calibrated judges still behave on the new model's style (verbosity, format).
+2. **Shadow mode (about 1 week):** run the new model on live traffic in parallel. Score both with sampled judges and guardrails; review disagreements by hand, especially in high-stakes tags (refunds, customs).
+3. **Canary (5% → 25%):** with automatic rollback triggers (guardrail failure rate, refusal-rate shifts, latency) and per-segment monitors.
+4. **A/B on outcomes:** edit ratio, escalation rate, resolution time, with the primary metric and the minimum detectable effect decided up front.
+5. **Decide and document:** if outcomes hold, switch fully and bank the 35% saving; keep the old model configured as a fallback for a while. Add any new failure patterns found along the way to the dataset.
+
+This sequence (offline → shadow → canary → A/B) is how mature AI teams change models without drama.
+
+</ThinkFirst>
+
+<Practice title="Build it yourself: Module 5 wrap-up">
+
+- **Warm-up:** add two guardrails (refund-promise regex, number grounding) to Relay's request path, and log every trigger.
+- **Stretch:** add a sampled online judge (5%), and a weekly report of scores by tag and customer, with the topic mix compared with last week.
+- **Boss level:** run a **shadow-mode experiment**: route live (or replayed) traffic to two prompt versions, score both with your calibrated judges, and write a one-page decision memo with the evidence. This memo format is exactly what FDEs present to customers.
+
+</Practice>
+
+<Quiz
+	id="m5-online"
+	title="Module 5 final quiz"
+	questions={[
+		{
+			q: 'What is the difference between a guardrail and a monitor?',
+			options: [
+				'There is none',
+				'Guardrails run in the request path to block or fix outputs; monitors score sampled traffic asynchronously to measure and alert',
+				'Monitors are always LLM judges',
+				'Guardrails only run in CI',
+			],
+			answer: 1,
+			why: 'Guardrails must be fast and reliable; monitors can be slower and richer. Checks often graduate from monitor to guardrail.',
+		},
+		{
+			q: 'Offline evals are green, but a new topic appears in production. Which signal catches it?',
+			options: ['CI pass rate', 'Drift monitoring on the topic and intent mix of incoming questions, plus "not covered" rates', 'Latency', 'Token cost'],
+			answer: 1,
+			why: 'Your dataset can\'t contain topics that didn\'t exist when it was built. Watch the input distribution.',
+		},
+		{
+			q: 'What does shadow mode give you that an offline eval doesn\'t?',
+			options: ['Lower cost', 'Real production inputs, with zero user exposure to the new version', 'Faster responses', 'Human labels'],
+			answer: 1,
+			why: 'It tests the candidate on reality while users still see the trusted version.',
+		},
+		{
+			q: 'Why slice monitors by customer and language?',
+			options: ['For prettier dashboards', 'Small segments can fail badly while global averages look fine', 'It is cheaper', 'Judges require it'],
+			answer: 1,
+			why: 'The segment on fire is often a small, important one, and averages hide it.',
+		},
+		{
+			q: 'Which practice inflates false positives in A/B tests?',
+			options: ['Choosing a primary metric in advance', 'Stopping the test as soon as the dashboard looks good', 'Random assignment', 'Running long enough'],
+			answer: 1,
+			why: 'Peeking and stopping early makes noise look like wins. Decide the metric, effect size and duration up front.',
+		},
+	]}
+/>
+
+<LessonComplete id="evals/online-evals" />

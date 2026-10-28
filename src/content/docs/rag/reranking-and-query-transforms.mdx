@@ -1,0 +1,191 @@
+---
+title: Reranking and query transformations
+description: Two-stage retrieval with cross-encoder rerankers, plus rewriting, HyDE and multi-query to fix bad questions before you search.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'What about Germany?'" severity="SEV3">
+An agent asked Relay "What are the import duties for Norway?", then followed up with "What about Germany?". Relay searched for the literal text "What about Germany?" and retrieved a random German warehouse address. The answer was confidently irrelevant. The follow-up only made sense **in the context of the conversation**, and the retriever never saw the conversation.
+</Incident>
+
+Hybrid search gets the right chunk **somewhere in the top 50** most of the time. Two techniques turn that into a **great top 5**: reranking (better ordering after retrieval) and query transformation (a better question before retrieval).
+
+## Why not just send all 50 chunks?
+
+More context isn't free accuracy. Twenty loosely related chunks cost tokens and latency, and they **distract** the generator: it may blend a near-miss chunk into the answer. The goal is a **small, highly relevant** context.
+
+<Diagram
+	caption="Two-stage retrieval: cheap and wide first, precise and narrow second."
+	code={`flowchart LR
+    Q["Query"] --> H["Stage 1: hybrid retrieval<br/>fast, recall-oriented<br/>top 50"]
+    H --> R["Stage 2: reranker<br/>slower, precision-oriented<br/>scores each (query, chunk) pair"]
+    R --> T["Top 5 to the LLM"]`}
+/>
+
+## Bi-encoders vs cross-encoders
+
+| | Bi-encoder (embeddings) | Cross-encoder (reranker) |
+|---|---|---|
+| How | Query and document are encoded **separately**; compare vectors | Query and document go through the model **together**; it outputs a relevance score |
+| Speed | Documents pre-computed; search millions in milliseconds | Must run once per (query, chunk) pair at query time |
+| Accuracy | Good, "roughly the right neighbourhood" | Better: it reads both texts with full attention to each other |
+| Use for | Stage 1: retrieve candidates | Stage 2: rerank the top 20–100 |
+
+```python
+# app/rag/rerank.py: an open-source cross-encoder reranker
+from sentence_transformers import CrossEncoder
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
+def rerank(query: str, chunks: list[dict], top_n: int = 5) -> list[dict]:
+    scores = reranker.predict([(query, c["content"]) for c in chunks])
+    ranked = sorted(zip(chunks, scores), key=lambda pair: pair[1], reverse=True)
+    return [{**chunk, "rerank_score": float(score)} for chunk, score in ranked[:top_n]]
+```
+
+Hosted rerank APIs (Cohere, Voyage, Jina and others) do the same over HTTP. You can also use an LLM as a reranker (ask it to score or pick the most relevant chunks), which is flexible but slower and costlier per query.
+
+:::tip[Reranker scores can also gate answers]
+Cross-encoder scores are comparable across queries in a way that cosine similarities often aren't. If the best reranked chunk scores below a threshold (tuned on your eval set), that's a strong signal to **refuse** ("the policies don't cover this") rather than generate. That's the honest "I don't know" from Module 2.
+:::
+
+## Query transformations
+
+Fix the question before searching:
+
+| Technique | What it does | Fixes |
+|---|---|---|
+| **Conversational rewriting** | Turn a follow-up into a standalone query using the chat history | "What about Germany?" → "What are the import duties for shipments to Germany?" |
+| **Multi-query** | Generate 3–5 phrasings, search each, fuse with RRF | Vocabulary mismatch; vague questions |
+| **HyDE** (Hypothetical Document Embeddings) | Ask an LLM to write a *hypothetical answer*, then embed **that** to search | Short questions vs long documents ("asymmetric" queries); answers look more like documents than questions do |
+| **Decomposition** | Split a compound question into sub-questions | "Compare refund rules for insured vs standard shipments" |
+| **Metadata extraction** | Pull filters out of the question | "Policies effective after 2025" → `effective_date > 2025-01-01` |
+
+Conversational rewriting fixes the incident, with one small, fast call:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+
+def standalone_query(history: list[dict], question: str) -> str:
+    """Rewrite a follow-up question so it can be searched without the conversation."""
+    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    msg = client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=1000,
+        output_config={"effort": "low"},  # simple task: keep it fast
+        system="Rewrite the user's last question as a standalone search query. "
+               "Resolve pronouns and references using the conversation. Output only the query.",
+        messages=[{"role": "user", "content": f"<conversation>\n{transcript}\n</conversation>\n\n<question>{question}</question>"}],
+    )
+    return "".join(b.text for b in msg.content if b.type == "text").strip()
+```
+
+And HyDE, which embeds a hypothetical answer instead of the question:
+
+```python
+def hyde_query_text(question: str) -> str:
+    msg = client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=1000,
+        output_config={"effort": "low"},
+        system="Write a short passage, in the style of a company policy document, that would answer the question. "
+               "It may contain made-up specifics; it is only used to search for real documents.",
+        messages=[{"role": "user", "content": question}],
+    )
+    return "".join(b.text for b in msg.content if b.type == "text").strip()
+
+# embed(hyde_query_text(q)) for the semantic branch; keep the ORIGINAL question for BM25
+```
+
+:::caution[Every transformation adds a model call]
+Each one adds latency (hundreds of ms) and cost, and can **hurt**: HyDE can invent details that pull in the wrong documents; rewriting can drop a crucial term. Add them one at a time, behind your retrieval eval, and keep the ones that pay for themselves.
+:::
+
+<FailureCard
+	title="The rewriter that dropped the code"
+	symptom="After adding query rewriting, searches for specific error codes got worse."
+	cause="The rewriter 'cleaned up' queries like `ERR_RATE_429 after upgrade` into 'API rate limit error after an upgrade', removing the exact token that keyword search needed."
+	detect="Retrieval eval cases with exact identifiers, run on every pipeline change."
+	fix="Instruct the rewriter to preserve identifiers verbatim; search with **both** the original and the rewritten query (fuse with RRF); never rewrite the keyword branch's input."
+/>
+
+<FailureCard
+	title="Reranker latency spike"
+	symptom="p95 latency doubled after adding a reranker; some requests time out."
+	cause="The reranker scored 200 candidates per query on a CPU, and long chunks made each pair slow."
+	detect="Per-stage latency in traces (retrieve, rerank, generate)."
+	fix="Rerank fewer candidates (30–50), cap the text length per pair, batch pairs, use a GPU or a hosted reranker, and give each stage a latency budget."
+/>
+
+<ThinkFirst question="Relay's retrieval eval: hybrid recall@50 = 0.96, but recall@5 = 0.78. You can add a reranker (+120 ms) or multi-query (+400 ms and 3 extra searches). Which do you try first, and why?">
+
+**The reranker first.** The diagnosis is in the numbers: the right chunk is almost always *retrieved* (recall@50 = 0.96) but often not *ranked* in the top 5 (0.78). That's an **ordering** problem, exactly what a reranker fixes.
+
+Multi-query mainly improves **recall** (finding chunks you'd otherwise miss), and recall@50 is already 0.96, so it targets the wrong bottleneck, at higher latency and cost.
+
+Then measure: recall@5 after reranking, p95 latency, and the end-to-end answer quality (Module 5). The general skill is to **diagnose which stage is failing before choosing a fix.**
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** take 10 multi-turn conversations and write the standalone query you'd want for each follow-up. These become test cases for your rewriter.
+- **Stretch:** add a cross-encoder reranker to your hybrid search. Measure recall@5 and MRR before and after, plus p95 latency.
+- **Boss level:** build an **ablation table**: hybrid; + reranker; + rewriting; + HyDE; + multi-query. For each row, report recall@5, MRR, p95 latency and cost per 1,000 queries, and recommend a configuration.
+
+</Practice>
+
+<Quiz
+	id="m4-rerank"
+	questions={[
+		{
+			q: 'Why is a cross-encoder more accurate than a bi-encoder for ranking?',
+			options: [
+				'It uses bigger vectors',
+				'It reads the query and the chunk together, so it can judge their relevance with full attention to both',
+				'It is trained on more data',
+				'It uses BM25 internally',
+			],
+			answer: 1,
+			why: 'Bi-encoders compress each text separately; cross-encoders compare them jointly. That precision is why they\'re used on a short candidate list.',
+		},
+		{
+			q: 'A user asks "What about Germany?" after a question about Norway\'s import duties. What fixes retrieval?',
+			options: ['A larger top-k', 'Conversational query rewriting into a standalone question', 'A reranker', 'Fine-tuning'],
+			answer: 1,
+			why: 'The query is meaningless without the conversation. Rewrite it before searching.',
+		},
+		{
+			q: 'recall@50 is 0.96 but recall@5 is 0.78. What is the bottleneck?',
+			options: ['Recall (finding candidates)', 'Ordering of the candidates, so a reranker is the right first fix', 'The embedding model', 'Chunk size'],
+			answer: 1,
+			why: 'The right chunk is retrieved but ranked too low, which is a ranking problem.',
+		},
+		{
+			q: 'What is a risk of HyDE?',
+			options: [
+				'It is too fast',
+				'The hypothetical answer can include invented details that pull in the wrong documents',
+				'It cannot be used with embeddings',
+				'It only works in English',
+			],
+			answer: 1,
+			why: 'HyDE trades a model call for better semantic matching, but hallucinated specifics can mislead retrieval. Keep the original query for BM25 and measure.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/reranking-and-query-transforms" />

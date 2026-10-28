@@ -1,0 +1,219 @@
+---
+title: Error analysis first
+description: Read traces before choosing metrics. Open coding, building a failure taxonomy, counting, and deciding what to fix, with a hands-on labelling exercise.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LabelingExercise from '../../../components/LabelingExercise.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The metrics dashboard nobody looked behind" severity="SEV3">
+A team installed an eval framework and turned on its ten default metrics: "helpfulness", "coherence", "toxicity", and others. Scores were all 0.8–0.9. Meanwhile, the actual top problem, found later by reading 100 conversations in an afternoon, was that the assistant **asked customers for their order number even when they'd already given it**. None of the generic metrics could see that.
+</Incident>
+
+The most valuable eval activity isn't writing scorers. It's **looking at your data**. Generic metrics measure generic things; your product fails in specific ways that you only discover by reading traces.
+
+## The process
+
+<Diagram
+	caption="Error analysis in four steps. A first pass on 100 traces takes a few hours and usually reveals the top problems."
+	code={`flowchart LR
+    A["1. Sample traces<br/>~100, diverse and recent"] --> B["2. Open coding<br/>write a free-text note on<br/>what went wrong in each"]
+    B --> C["3. Axial coding<br/>group notes into a<br/>failure taxonomy"]
+    C --> D["4. Count and prioritise<br/>frequency x severity"]
+    D --> E["Write evals for the top failures<br/>and fix them"]`}
+/>
+
+1. **Sample:** pull about 100 traces (inputs, retrieved context, tool calls, outputs). Mix random samples with known-bad ones (thumbs-down, big edits, escalations), and cover different segments (languages, ticket types).
+2. **Open coding:** for each trace, write one short note about the **first** thing that went wrong, in your own words ("asked for the order number again", "quoted the old refund window"). No predefined categories yet: you're discovering them.
+3. **Axial coding:** group similar notes into categories: your **failure taxonomy**. Typically 5–10 categories emerge.
+4. **Count and prioritise:** how often does each category occur, and how bad is it? Fix the top of the list first.
+
+:::tip[Who should do this?]
+Someone who knows what "good" looks like in this domain. For Relay, a senior support agent or policy expert, together with the engineer. FDEs often run this session **with the customer's experts**, and it builds enormous trust: they see you taking their judgment seriously.
+:::
+
+## Try it
+
+Eight real-looking Relay traces. Label each one pass or fail and pick a failure category, then compare with an expert's labels:
+
+<LabelingExercise
+	id="relay-traces"
+	categories={['Hallucinated policy', 'Missed retrieval', 'Ignored context', 'Unsafe promise', 'Wrong tone', 'Incomplete answer']}
+	traces={[
+		{
+			id: 't1',
+			question: 'Can I get a refund on a parcel delivered 3 weeks ago?',
+			context: 'Refund policy §1: refunds within 30 days of delivery; not for perishable or custom goods.',
+			answer: 'Yes, refunds are possible within 30 days of delivery, unless the goods are perishable or custom-made [Refund policy §1].',
+			expert: 'pass',
+			note: 'Correct, complete, cited.',
+		},
+		{
+			id: 't2',
+			question: 'My order ACM-2025-000183 is late. Where is it?',
+			answer: 'I\'m sorry to hear that! Could you please share your order number so I can look it up?',
+			expert: 'fail',
+			category: 'Ignored context',
+			note: 'The customer already gave the ID. In the full 100-trace review (table below) this was the most common failure.',
+		},
+		{
+			id: 't3',
+			question: 'Do insured shipments need an invoice for damage claims?',
+			context: 'Damage policy §2 table: Insured, Declared value, Photos + invoice.',
+			answer: 'Yes. Insured shipments need photos and the invoice; compensation is up to the declared value [Damage policy §2].',
+			expert: 'pass',
+			note: 'Correct reading of the table.',
+		},
+		{
+			id: 't4',
+			question: 'My glass vase arrived broken. Will you refund me?',
+			answer: 'Absolutely, we will refund you the full amount right away. Sorry for the trouble!',
+			expert: 'fail',
+			category: 'Unsafe promise',
+			note: 'Promises a refund (not allowed without approval) and ignores the 100 EUR fragile cap and the photo requirement.',
+		},
+		{
+			id: 't5',
+			question: 'How long do refunds take to arrive?',
+			context: '(retrieved: a chunk about delivery times to islands)',
+			answer: 'Refunds usually take a few days, depending on your bank.',
+			expert: 'fail',
+			category: 'Missed retrieval',
+			note: 'The payout chunk (10 business days) wasn\'t retrieved; the model filled the gap with a vague guess.',
+		},
+		{
+			id: 't6',
+			question: 'Is there a fee for changing the delivery address?',
+			context: 'Address policy: you can change the address until the parcel leaves the warehouse.',
+			answer: 'Address changes cost 5 EUR and are possible until the parcel leaves our warehouse.',
+			expert: 'fail',
+			category: 'Hallucinated policy',
+			note: 'The "5 EUR" fee is invented. The policy doesn\'t mention a fee.',
+		},
+		{
+			id: 't7',
+			question: 'Your company lost my parcel AGAIN. This is ridiculous.',
+			answer: 'Per policy, packages without tracking updates for 14 days are treated as lost. Submit a claim.',
+			expert: 'fail',
+			category: 'Wrong tone',
+			note: 'Factually right, but no acknowledgement or apology to an angry repeat customer. Agents rewrite these heavily.',
+		},
+		{
+			id: 't8',
+			question: 'What documents do I need to ship to Norway?',
+			context: 'Customs §1: commercial invoice and customs declaration for every package. Customs §3: batteries need a hazmat label.',
+			answer: 'You need a commercial invoice and a customs declaration for every package [Customs §1].',
+			expert: 'pass',
+			note: 'Complete for this question (no batteries mentioned). Some reviewers mark it "incomplete": a sign the pass rule needs to be written down.',
+		},
+	]}
+/>
+
+These 8 traces are a slice of a 100-trace review. Across all 100, the most common failure was **ignored context** (asking for information the customer already gave), as the table below shows. No generic "helpfulness" metric would have named it. That's the point of error analysis.
+
+## Pass/fail beats 1–10 scales
+
+Label each trace **pass or fail** against a clear rule, not "quality: 7/10". Binary labels:
+
+- **force a decision** about what's acceptable (the rule gets written down);
+- are **more consistent** across reviewers (is a 6 different from a 7?);
+- **map directly to actions** (fix the fails);
+- make **judges easier to calibrate** (lesson 5).
+
+Capture nuance in the free-text note and the failure category, not in the score.
+
+## Turning the taxonomy into action
+
+| Failure category | Count (of 100) | Severity | Fix | Eval |
+|---|---|---|---|---|
+| Ignored context (asks for info already given) | 14 | Medium | Prompt rule plus extracting entities into case state | Code check: if the ticket contains an order ID, the reply must not ask for it |
+| Unsafe promise (refunds) | 6 | **High** | Prompt rule plus approval flow (Module 2) | Regex check plus LLM judge; **critical**: must be 0 |
+| Missed retrieval | 9 | High | Hybrid plus reranker (Module 4) | Retrieval recall@5 on these questions |
+| Hallucinated policy detail | 5 | High | Grounding prompt, number/date verification | Code check: numbers in the answer appear in sources |
+| Wrong tone with angry customers | 8 | Low–medium | Tone guidance plus few-shot examples | LLM judge with a rubric |
+
+Each row becomes **eval cases plus a scorer**, and each fix is proven against them.
+
+<FailureCard
+	title="Categories decided before looking"
+	symptom="The team's failure categories are 'accuracy', 'helpfulness', 'safety'. Almost everything lands in 'accuracy', and nobody knows what to fix."
+	cause="Categories were invented up front (top-down) instead of emerging from real traces (bottom-up). They're too broad to act on."
+	detect="If a category can't directly suggest a fix, it's too vague."
+	fix="Do open coding first, then group. Good categories are specific and actionable: 'quotes superseded policy version', not 'accuracy'."
+/>
+
+<FailureCard
+	title="Only reading the thumbs-down"
+	symptom="Error analysis focuses on complaints, and the team keeps fixing edge cases while common silent failures persist."
+	cause="Sampling only explicit negative feedback, which is rare and biased (Module 2). Many failures get no feedback at all."
+	detect="Compare category frequencies in the random sample vs the complaint sample."
+	fix="Always include a **random** sample alongside the flagged ones. Silent failures are found by random sampling."
+/>
+
+<ThinkFirst question="You and a colleague labelled the same 50 traces and agreed on pass/fail only 70% of the time. What does that tell you, and what do you do before labelling more?">
+
+**It tells you the definition of "pass" is ambiguous, not that one of you is wrong.** Seventy percent agreement means any metric built on these labels (including an LLM judge calibrated against them) is shaky.
+
+**Before labelling more:**
+
+1. **Review the disagreements together.** For each one, decide the right label *and why*.
+2. **Write the rule down** as explicit pass criteria. For example: "A reply passes if it answers the customer's actual question using only policy facts, includes required conditions, and makes no unapproved promises. Missing non-requested extras (e.g. battery rules when batteries aren't mentioned) is not a failure."
+3. **Re-label a fresh sample** independently and measure agreement again. Aim for high agreement (often 85–90%+) on clear criteria.
+4. Keep tricky examples as **anchor cases** in your labelling guide.
+
+That written rule becomes the rubric for your LLM judge in lesson 4.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** do the labelling exercise above, then write the one-sentence pass rule that would have resolved trace t8.
+- **Stretch:** pull 50 traces from your own Relay logs (or generate realistic ones), do open coding in a spreadsheet, and build your taxonomy with counts.
+- **Boss level:** build a tiny **trace review app** in your Relay UI (your frontend strength again): one trace per screen, keyboard shortcuts for pass/fail, a note field, category tags, and an export to JSONL. Teams that make reviewing fast review more, and their products get better.
+
+</Practice>
+
+<Quiz
+	id="m5-error-analysis"
+	questions={[
+		{
+			q: 'What is the first step of error analysis?',
+			options: ['Choose metrics from a framework', 'Read a sample of real traces and note what went wrong in each', 'Train a classifier', 'Write the rubric'],
+			answer: 1,
+			why: 'Look at the data first. Categories and metrics should emerge from real failures.',
+		},
+		{
+			q: 'Why prefer pass/fail labels over 1–10 quality scores?',
+			options: [
+				'They are faster to type',
+				'They force an explicit rule, are more consistent across reviewers, map to actions, and make judges easier to calibrate',
+				'Scores are illegal',
+				'Models can\'t output numbers',
+			],
+			answer: 1,
+			why: 'Binary decisions with notes beat fuzzy scales. Nuance goes in the note and the failure category.',
+		},
+		{
+			q: 'Which failure category is most actionable?',
+			options: ['"Accuracy issues"', '"Bad answers"', '"Quotes the superseded 2023 refund window"', '"Low quality"'],
+			answer: 2,
+			why: 'Specific categories suggest their own fix and their own eval check.',
+		},
+		{
+			q: 'Why include a random sample, not just thumbs-down traces?',
+			options: ['To save time', 'Because many failures get no feedback, and only random sampling reveals silent, common failures', 'Random samples are easier to read', 'It is required by law'],
+			answer: 1,
+			why: 'Explicit feedback is rare and biased. Random samples show what typical traffic really looks like.',
+		},
+	]}
+/>
+
+<LessonComplete id="evals/error-analysis" />

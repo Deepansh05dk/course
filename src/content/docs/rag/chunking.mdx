@@ -1,0 +1,212 @@
+---
+title: "Chunking: the decision that quietly decides quality"
+description: Fixed, recursive and structure-aware chunking; keeping tables whole; prepending context; contextual retrieval; and parent-document retrieval.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import ChunkingPlayground from '../../../components/ChunkingPlayground.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'Insured shipments: 250 EUR'" severity="SEV2">
+An agent asked Relay the maximum compensation for an insured shipment. Relay said 250 EUR. The real answer is "declared value". The compensation table had been split across two chunks: the header row and the "Standard: 250 EUR" row in one, the "Insured: Declared value" row in the next. Retrieval returned only the first. The model did its best with half a table.
+</Incident>
+
+You can't embed a 40-page PDF as one vector. Its meaning would be averaged into mush, and it wouldn't fit the embedding model anyway. So documents are split into **chunks**: the units you embed, retrieve, and hand to the model. How you split decides what can be found.
+
+## The trade-off
+
+| Chunks that are too **small** | Chunks that are too **large** |
+|---|---|
+| Lose context ("It does not apply to…", but what's "it"?) | Mix several topics, so the embedding is a blurry average |
+| Split tables, lists and steps | Waste context-window tokens on irrelevant text |
+| Need more of them per answer | Bury the relevant sentence among others |
+
+There's no universal best size. Typical starting points are a few hundred tokens per chunk, then **measure** with your retrieval eval (next lesson).
+
+## Play with it
+
+The sample is a slice of Acme's refund policy, with a table and some pronouns. Set the size to 200 characters and try fixed-size, then recursive, then markdown-aware. Then raise the size to 400 and compare. Finally, tick **Prepend document title + section**.
+
+<ChunkingPlayground />
+
+What you should see:
+
+- **Fixed size** cuts mid-sentence and mid-table, which is the incident above. Overlap reduces boundary damage but duplicates text.
+- **Recursive** respects paragraphs and sentences, but at small sizes it leaves a heading alone in its own chunk and separates table rows from their header. At 400 characters this sample happens to split cleanly; real documents with long sections won't be so lucky.
+- **Markdown-aware** splits by section, keeps headings with their content, and keeps **tables whole**.
+- **Prepending title and section** makes every chunk self-explanatory: "Section: 2. Damaged shipments" travels with the table.
+
+## Recursive splitting in Python
+
+The playground's recursive strategy is this function (it's tested: no text is lost, and every chunk respects the size limit):
+
+```python
+# app/rag/chunking.py
+SEPARATORS = ["\n\n", "\n", ". ", " "]  # try the biggest natural boundary first
+
+
+def recursive_split(text: str, max_chars: int = 800, separators: list[str] = SEPARATORS) -> list[str]:
+    """Split on the largest boundary that keeps pieces under max_chars, recursing as needed."""
+    if len(text) <= max_chars:
+        return [text.strip()] if text.strip() else []
+    if not separators:  # no boundary left: hard cut (rare with real text)
+        return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
+    sep, rest = separators[0], separators[1:]
+    parts = text.split(sep)
+    pieces = [p + sep for p in parts[:-1]] + [parts[-1]]  # keep the separator (e.g. the period)
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        if len(current) + len(piece) <= max_chars:
+            current += piece
+            continue
+        if current.strip():
+            chunks.append(current.strip())
+        if len(piece) > max_chars:
+            chunks.extend(recursive_split(piece, max_chars, rest))
+            current = ""
+        else:
+            current = piece
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+
+def with_context(doc_title: str, section: str, chunk: str) -> str:
+    """Prepend where the chunk came from, so it still makes sense on its own."""
+    return f"Document: {doc_title}\nSection: {section}\n\n{chunk}"
+```
+
+When we ran this on a short policy, its first chunk was just the heading `Refunds`, 7 characters with no content. That's the classic weakness of purely character-based splitting, and the reason structure-aware chunking attaches headings to the text below them.
+
+:::note[Characters vs tokens]
+Production chunkers usually measure size in **tokens** (with the embedding model's tokenizer), so chunks never exceed the model's input limit. Characters are fine for learning. Swap in a token counter before production.
+:::
+
+## Contextual retrieval: let an LLM write the context
+
+Prepending the title and section helps. Going further, you can ask an LLM to write **a sentence or two situating each chunk within its document**, and prepend that before embedding and keyword indexing. Anthropic published this technique as **contextual retrieval** and reported large reductions in retrieval failures in its experiments, especially combined with hybrid search and reranking.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+
+def situate(document: str, chunk: str) -> str:
+    msg = client.messages.create(
+        model="claude-haiku-5-5",  # a small, fast model is enough for this
+        max_tokens=1000,
+        system=[{
+            "type": "text",
+            "text": f"<document>\n{document}\n</document>",
+            "cache_control": {"type": "ephemeral"},  # the same document is re-sent for each of its chunks
+        }],
+        messages=[{
+            "role": "user",
+            "content": (
+                f"<chunk>\n{chunk}\n</chunk>\n"
+                "Write one or two sentences that situate this chunk within the document, "
+                "to improve search retrieval of the chunk. Answer with only those sentences."
+            ),
+        }],
+    )
+    context = "".join(b.text for b in msg.content if b.type == "text").strip()
+    return f"{context}\n\n{chunk}"
+```
+
+It's one LLM call per chunk at ingestion time, which is why **prompt caching the document** matters: every chunk of the same document shares that prefix.
+
+## Parent-document retrieval: search small, read big
+
+<Diagram
+	caption="Small chunks give precise matches; their parent sections give the model enough context to answer."
+	code={`flowchart LR
+    Q["Question"] --> S["Search small child chunks<br/>(about 100-200 tokens): precise matching"]
+    S --> H["Hits: child 7, child 12"]
+    H --> P["Look up their parent sections<br/>(about 1,000 tokens each)"]
+    P --> G["Generator reads the full parents:<br/>tables, conditions, exceptions intact"]`}
+/>
+
+Store each child chunk with a `parent_id`. Retrieve on children; send the deduplicated parents to the model. This gives precise retrieval *and* complete context, at the cost of more tokens per answer.
+
+<FailureCard
+	title="The orphaned 'It'"
+	symptom="Questions about perishable goods never retrieve the refund exception that covers them."
+	cause="The exception sat in its own chunk: 'It does not apply to perishable goods…'. Its embedding didn't connect 'It' to refunds, so neither semantic nor keyword search linked it to refund questions."
+	detect="Retrieval eval cases for exceptions and conditions; a scan for chunks starting with a pronoun."
+	fix="Structure-aware chunking that keeps related sentences together, prepended section context, or contextual retrieval."
+/>
+
+<FailureCard
+	title="Chunk size changed, quality changed, nobody knew"
+	symptom="After someone 'optimized' chunk size from 800 to 300 tokens, answers about multi-step procedures got worse."
+	cause="Procedures were split across many small chunks, and the top 5 retrieved results no longer contained all the steps."
+	detect="A retrieval eval in CI that runs on ingestion config changes, not just on code."
+	fix="Treat chunking parameters as versioned config, evaluated like a prompt change. Consider parent-document retrieval for procedures."
+/>
+
+<ThinkFirst question="Acme's customs manual has long numbered procedures (15+ steps), large tables of country rules, and short FAQ entries. One chunking strategy for all three, or different ones? Describe your approach.">
+
+**Different strategies per content type, all inside one pipeline:**
+
+- **FAQ entries:** one chunk per question-answer pair. Natural units, already self-contained.
+- **Procedures:** small chunks per step for precise matching, with **parent-document retrieval** returning the whole procedure, because a step without its siblings is dangerous ("step 7: submit the form" before which checks?).
+- **Country-rule tables:** keep each table whole if it's small. For large tables, **one chunk per row with the header repeated** ("Country: Norway | Batteries: hazmat label required | …"), so each row is self-describing.
+- **Everything:** prepend document title and section path; consider contextual retrieval for the procedures.
+
+Then measure per content type in the retrieval eval, since procedure questions and FAQ questions will behave differently.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** in the playground, paste a real policy or README you know, and find the strategy and size that produces no warnings.
+- **Stretch:** implement markdown-aware chunking in Python (split on headings, keep tables whole, prepend the heading path). Unit-test it on a document with a table and nested headings.
+- **Boss level:** run a **chunking bake-off** on 30 retrieval questions: fixed 500, recursive 500, markdown-aware, and markdown-aware with contextual retrieval. Report recall@5 for each (using next lesson's harness), plus ingestion cost.
+
+</Practice>
+
+<Quiz
+	id="m4-chunking"
+	questions={[
+		{
+			q: 'Why did Relay answer "250 EUR" for insured shipments?',
+			options: ['The model hallucinated', 'Fixed-size chunking split the table, so the retrieved chunk lacked the insured row', 'The embedding model was too small', 'The question was ambiguous'],
+			answer: 1,
+			why: 'Half a table gave the model half the facts. Structure-aware chunking keeps tables whole, or repeats the header per row.',
+		},
+		{
+			q: 'What does prepending "Document + Section" to each chunk improve?',
+			options: ['Embedding speed', 'Each chunk becomes self-explanatory, which improves both retrieval and the model\'s understanding', 'Storage costs', 'Nothing measurable'],
+			answer: 1,
+			why: 'Chunks lose context when cut from a document. A short header restores it for embeddings, BM25 and the generator.',
+		},
+		{
+			q: 'Parent-document retrieval searches over ___ and returns ___ to the model.',
+			options: ['parents; children', 'small child chunks; their larger parent sections', 'titles; summaries', 'embeddings; vectors'],
+			answer: 1,
+			why: 'Small chunks give precise matches; parents give complete context.',
+		},
+		{
+			q: 'Why use prompt caching in contextual retrieval?',
+			options: [
+				'It is required for Haiku',
+				'Every chunk of a document re-sends the same full document, so caching that prefix cuts cost and latency sharply',
+				'It improves the quality of the context sentence',
+				'It enables citations',
+			],
+			answer: 1,
+			why: 'One call per chunk with the same document prefix is the textbook case for prompt caching.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/chunking" />

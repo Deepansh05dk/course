@@ -1,0 +1,100 @@
+---
+import { inline } from './fmt';
+
+interface Trace {
+	id: string;
+	question: string;
+	context?: string;
+	answer: string;
+	expert: 'pass' | 'fail';
+	category?: string;
+	note: string;
+}
+interface Props {
+	id: string;
+	traces: Trace[];
+	categories: string[];
+}
+
+const { id, traces, categories } = Astro.props;
+---
+
+<section class="label not-content" data-label={id}>
+	<p class="label__badge">🔎 Error analysis: label these traces yourself</p>
+	<p class="label__intro">
+		For each trace, decide <strong>pass</strong> or <strong>fail</strong>. If it fails, pick the main failure category. Then compare
+		with an expert's labels.
+	</p>
+	<ol class="label__list">
+		{
+			traces.map((t) => (
+				<li class="label__trace" data-trace={t.id} data-expert={t.expert} data-category={t.category ?? ''}>
+					<p class="label__q">🧑 <Fragment set:html={inline(t.question)} /></p>
+					{t.context && <p class="label__ctx">📄 <Fragment set:html={inline(t.context)} /></p>}
+					<p class="label__a">🤖 <Fragment set:html={inline(t.answer)} /></p>
+					<div class="label__controls">
+						<label><input type="radio" name={`${id}-${t.id}`} value="pass" /> Pass</label>
+						<label><input type="radio" name={`${id}-${t.id}`} value="fail" /> Fail</label>
+						<select aria-label="Failure category" disabled>
+							<option value="">Failure category…</option>
+							{categories.map((c) => <option value={c}>{c}</option>)}
+						</select>
+					</div>
+					<p class="label__expert" hidden>
+						<strong>Expert:</strong> {t.expert === 'pass' ? '✅ pass' : `❌ fail${t.category ? ` (${t.category})` : ''}`}. <Fragment set:html={inline(t.note)} />
+					</p>
+				</li>
+			))
+		}
+	</ol>
+	<button type="button" class="label__compare">Compare with the expert</button>
+	<div class="label__result" hidden></div>
+</section>
+
+<script>
+	for (const box of document.querySelectorAll<HTMLElement>('[data-label]')) {
+		const traces = [...box.querySelectorAll<HTMLElement>('.label__trace')];
+		for (const t of traces) {
+			const select = t.querySelector('select')!;
+			t.addEventListener('change', () => {
+				const v = t.querySelector<HTMLInputElement>('input:checked')?.value;
+				select.disabled = v !== 'fail';
+			});
+		}
+		box.querySelector('.label__compare')!.addEventListener('click', () => {
+			let labelled = 0;
+			let agree = 0;
+			let catAgree = 0;
+			let catTotal = 0;
+			const counts: Record<string, number> = {};
+			for (const t of traces) {
+				const mine = t.querySelector<HTMLInputElement>('input:checked')?.value;
+				const expert = t.dataset.expert!;
+				const cat = t.dataset.category!;
+				if (expert === 'fail' && cat) counts[cat] = (counts[cat] ?? 0) + 1;
+				t.querySelector<HTMLElement>('.label__expert')!.hidden = false;
+				if (!mine) continue;
+				labelled++;
+				const ok = mine === expert;
+				agree += ok ? 1 : 0;
+				t.dataset.result = ok ? 'agree' : 'disagree';
+				if (mine === 'fail' && expert === 'fail' && cat) {
+					catTotal++;
+					if (t.querySelector('select')!.value === cat) catAgree++;
+				}
+			}
+			const result = box.querySelector<HTMLElement>('.label__result')!;
+			const max = Math.max(1, ...Object.values(counts));
+			const bars = Object.entries(counts)
+				.sort((a, b) => b[1] - a[1])
+				.map(([c, n]) => `<div class="label__bar"><span>${c}</span><i style="width:${(n / max) * 100}%"></i><b>${n}</b></div>`)
+				.join('');
+			result.innerHTML =
+				`<p><strong>Pass/fail agreement with the expert: ${agree}/${labelled}</strong>` +
+				(catTotal ? ` · Same failure category on ${catAgree}/${catTotal} shared failures` : '') +
+				`</p><p>Expert failure taxonomy for these traces. This is how you decide what to fix first:</p>${bars}` +
+				'<p class="label__tip">Disagreements are useful, not embarrassing: they show where your pass/fail definition is ambiguous. Write the rule down before you label more.</p>';
+			result.hidden = false;
+		});
+	}
+</script>

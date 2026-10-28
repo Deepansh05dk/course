@@ -1,0 +1,195 @@
+---
+title: "Ingestion: garbage in, garbage out"
+description: Parsing PDFs, tables and scans; metadata; incremental sync with content hashes; deletions; and keeping the index fresh and trustworthy.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The refund policy that was deleted, but not really" severity="SEV1">
+Acme withdrew its "90-day goodwill refund" promotion and deleted the PDF from the policy drive. Three weeks later, Relay was still citing it to customers. The ingestion job only ever **added and updated** documents. It never noticed that one had disappeared. The vector index kept the old chunks forever.
+</Incident>
+
+Most RAG quality problems are born in ingestion. The model can only be as right as the text you feed it, and production ingestion has to cope with messy formats, constant change, and deletions.
+
+## Parsing: getting clean text out of real documents
+
+| Source | Typical problems | Approaches |
+|---|---|---|
+| **Digital PDFs** | Multi-column layouts, headers and footers on every page, hyphenation, reading order | Layout-aware PDF parsers (PyMuPDF, pdfplumber); document-AI libraries (Docling, Unstructured) |
+| **Tables** | Flattened into word soup, losing which value belongs to which column | Table-aware extraction to markdown or HTML; keep each table as one unit |
+| **Scans / images** | No text layer at all | OCR, or a **vision-capable LLM** that reads the page and returns markdown |
+| **HTML / wikis** | Navigation, cookie banners, boilerplate | Extract the main content; keep heading structure |
+| **Office docs, email** | Embedded attachments, quoted reply chains | Format-specific parsers; strip quoted history; recurse into attachments |
+
+:::tip[Look at your parsed text]
+The single highest-value ingestion habit: **print the parsed output of 20 random documents and read it.** Broken tables, missing pages and garbled reading order are obvious to a human in seconds, and invisible in a retrieval score.
+:::
+
+## Metadata: the information you'll wish you had
+
+Store with every chunk (not just the text):
+
+| Field | Why |
+|---|---|
+| `doc_id`, `source_uri`, `title` | Citations and debugging |
+| `section` / heading path | Context for the chunk (lesson 3), and better citations |
+| `page` | "See page 4" citations for PDFs |
+| `version`, `effective_date`, `updated_at` | Resolving conflicts between old and new versions (lesson 6) |
+| `content_hash` | Incremental sync (below) |
+| `language` | Language-aware search and answers |
+| `allowed_groups`, `tenant_id` | Permission-aware retrieval (lesson 7) |
+| `embedding_model` | The index contract (Module 3) |
+
+## Incremental sync: re-embed only what changed
+
+Re-embedding everything every night is slow and expensive, and it hides problems. Instead, hash each document's content and compare with what's indexed:
+
+```python
+# app/rag/ingest.py: only re-embed what changed
+import hashlib
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def plan_sync(source_docs: dict[str, str], indexed_hashes: dict[str, str]) -> dict[str, list[str]]:
+    """source_docs: doc_id -> current text. indexed_hashes: doc_id -> hash stored at last ingestion."""
+    current = {doc_id: content_hash(text) for doc_id, text in source_docs.items()}
+    return {
+        "add": [d for d in current if d not in indexed_hashes],
+        "update": [d for d in current if d in indexed_hashes and current[d] != indexed_hashes[d]],
+        "delete": [d for d in indexed_hashes if d not in current],  # removed at the source: must leave the index
+        "unchanged": [d for d in current if indexed_hashes.get(d) == current[d]],
+    }
+```
+
+For an update, **replace all of the document's chunks in one transaction** (delete the old ones, insert the new ones), so search never sees half-old, half-new content. The `delete` list is the line that would have prevented the incident above.
+
+<Diagram
+	caption="A production ingestion pipeline. The quality gate stops a bad batch from replacing a good index."
+	code={`flowchart LR
+    S["Source systems<br/>drive, wiki, CMS"] --> D["Detect changes<br/>hashes, webhooks, timestamps"]
+    D --> P["Parse + clean"]
+    P --> Q{"Quality gate<br/>empty text? garbled?<br/>pages missing?"}
+    Q -- fail --> X["Quarantine + alert<br/>keep the old version live"]
+    Q -- pass --> C["Chunk + metadata<br/>+ permissions"]
+    C --> E["Embed (batched,<br/>retries, rate limits)"]
+    E --> U["Upsert in a transaction<br/>delete removed docs"]
+    U --> M["Metrics: docs/chunks,<br/>failures, freshness lag"]`}
+/>
+
+## Freshness as a metric
+
+**Freshness lag** = time between a change in the source and that change being searchable. Decide the target with the business ("policy changes must be live within 1 hour"), then monitor it. Webhooks from the source system beat nightly batch jobs when freshness matters.
+
+<FailureCard
+	title="Empty chunks from scanned PDFs"
+	symptom="Some questions about older policies never retrieve anything, though the documents are 'indexed'."
+	cause="Older policies were scanned images. The PDF parser extracted empty text, which was chunked and embedded as nothing."
+	detect="A quality gate: characters per page, the share of empty chunks per document, and an alert on documents with near-zero text."
+	fix="Route low-text pages to OCR or a vision-capable model; quarantine documents that still fail; report coverage ('193/200 documents parsed')."
+/>
+
+<FailureCard
+	title="Headers and footers everywhere"
+	symptom="Searches for 'confidential' or the company address return every chunk. Unrelated chunks look oddly similar."
+	cause="Every page's header and footer ('Acme Logistics, Confidential, Page 3 of 40') was included in every chunk, adding the same noise to all of them."
+	detect="Find lines that repeat across most pages of a document."
+	fix="Strip repeated header and footer lines during cleaning, and keep the useful bit (the page number) as metadata instead."
+/>
+
+<IncidentDrill
+	id="ingestion-drill"
+	title="The withdrawn promotion"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Legal: "The 90-day goodwill promotion ended 3 weeks ago. Relay is still quoting it." The PDF is gone from the drive. First action?',
+			choices: [
+				{ label: 'Delete the stale chunks from the index now, and verify with a test query', next: 's2', cost: 5, note: 'Relay stops quoting it within minutes.' },
+				{ label: 'Re-run the nightly ingestion job', next: 's1b', cost: 30, note: 'The job only adds and updates, so the stale chunks remain.' },
+				{ label: 'Add "the 90-day promotion has ended" to the system prompt', next: 's1c', cost: 20, note: 'It mostly works, but the chunks are still retrieved and sometimes win.' },
+			],
+		},
+		s1b: { text: 'Still quoting it after the job finishes. Why?', choices: [{ label: 'The pipeline never deletes. Remove the chunks manually now, then fix the pipeline', next: 's2', cost: 5 }] },
+		s1c: { text: 'Prompt patches pile up and don\'t remove the source of truth problem. Next?', choices: [{ label: 'Delete the stale chunks and fix the pipeline', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'Stale chunks removed. What prevents this class of incident?',
+			choices: [
+				{ label: 'Sync computes deletions (indexed minus source), runs on change events, and a freshness eval checks recently changed policies', next: 'end_good', cost: 0 },
+				{ label: 'Wipe and rebuild the whole index nightly', next: 'end_ok', cost: 0, note: 'It handles deletions, but costs a full re-embed every night and leaves a staleness window of up to a day.' },
+			],
+		},
+		end_good: { text: 'Deletions are now first-class, freshness is measured, and there is an eval for exactly this class of bug.', end: 'good' },
+		end_ok: { text: 'Correct, but expensive and still up to a day stale. Incremental sync with deletes is the better design.', end: 'ok' },
+	}}
+/>
+
+<ThinkFirst question="Acme's 200 policy PDFs live in a shared drive. About 15 change per month, mostly small edits, and 30 are scanned images. Design the ingestion pipeline: triggers, parsing, quality checks, and how a policy update reaches Relay safely.">
+
+1. **Trigger:** drive change notifications (webhook) plus a nightly reconciliation job that lists the whole drive (catches missed events **and deletions**).
+2. **Parse:** a layout-aware parser for digital PDFs, with tables extracted as markdown. Pages with little or no text go to OCR or a vision model.
+3. **Quality gate:** minimum text per page, table detection sanity, no duplicate-header noise, and a diff summary ("section 4.2 changed: 30 → 14 days"). Failures are quarantined, and the **previous version stays live**.
+4. **Chunk + metadata:** section path, page, `effective_date`, version, permissions, content hash.
+5. **Atomic swap per document:** delete the old chunks and insert the new ones in one transaction.
+6. **Post-ingestion checks:** run the retrieval eval subset for the changed documents ("What is the refund window?" must retrieve the new section) before announcing the update.
+7. **Metrics:** freshness lag, parse failure rate, chunks per document over time.
+
+For high-stakes changes (refund terms), a human in the policy team can approve the diff before it goes live. That's cheap insurance.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** parse 5 real PDFs (any public reports with tables) with two different parsers, and read the output. Which one handles the tables better?
+- **Stretch:** implement `plan_sync` against a folder of files and a SQLite table of hashes. Add, edit and delete files, and check that each change is detected.
+- **Boss level:** build Relay's ingestion service: watch a folder, parse (with OCR fallback for scans), apply a quality gate, chunk, embed, and upsert atomically into pgvector with deletions. Expose `/ingestion/status` with counts, failures and freshness lag.
+
+</Practice>
+
+<Quiz
+	id="m4-ingestion"
+	questions={[
+		{
+			q: 'A document was deleted at the source but is still being cited. What was missing?',
+			options: ['A better embedding model', 'Deletion handling in the sync (indexed docs minus source docs must be removed)', 'A reranker', 'More chunks'],
+			answer: 1,
+			why: 'Add-and-update-only pipelines accumulate ghosts. Compute deletions on every sync and reconcile regularly.',
+		},
+		{
+			q: 'Why replace a document\'s chunks inside a single transaction?',
+			options: ['It is faster', 'So search never sees a mix of old and new chunks from the same document', 'Postgres requires it', 'To save storage'],
+			answer: 1,
+			why: 'A half-updated document can produce contradictory answers. Atomic replacement keeps every version consistent.',
+		},
+		{
+			q: 'What is the purpose of the quality gate in ingestion?',
+			options: [
+				'To speed up embedding',
+				'To stop badly parsed documents (empty, garbled, missing pages) from replacing good indexed versions',
+				'To compress vectors',
+				'To translate documents',
+			],
+			answer: 1,
+			why: 'Bad parses fail silently. A gate quarantines them, keeps the previous version live, and alerts someone.',
+		},
+		{
+			q: 'Scanned PDFs produce empty text. What is the right fix?',
+			options: ['Ignore them', 'Route low-text pages to OCR or a vision-capable model, and track parse coverage', 'Use a bigger embedding model', 'Increase chunk size'],
+			answer: 1,
+			why: 'No text layer means nothing to embed. Detect it, use OCR or vision parsing, and report coverage honestly.',
+		},
+	]}
+/>
+
+<LessonComplete id="rag/ingestion" />

@@ -1,0 +1,178 @@
+---
+const sample = `# Acme Refund & Damage Policy (2026)
+
+## 1. Refund window
+Customers can request a refund within 30 days of delivery. It does not apply to perishable goods or custom-made products. Refunds are paid to the original payment method within 10 business days.
+
+## 2. Damaged shipments
+Report damage within 48 hours of delivery and attach photos of the box and the items. Claims without photos are rejected. This also applies to insured shipments.
+
+| Shipment type | Max compensation | Evidence required |
+|---|---|---|
+| Standard | 250 EUR | Photos |
+| Insured | Declared value | Photos + invoice |
+| Fragile (glass, ceramics) | 100 EUR | Photos + packaging proof |
+
+## 3. Exceptions
+Shipments to islands may take 5 extra days. They are not eligible for late-delivery refunds. Hazardous goods follow a separate policy (HZ-12).`;
+---
+
+<section class="chunk not-content" data-chunk>
+	<p class="chunk__badge">✂️ Chunking playground</p>
+	<div class="chunk__controls">
+		<label>Strategy
+			<select name="strategy">
+				<option value="fixed">Fixed size (characters)</option>
+				<option value="recursive">Recursive (paragraph → line → sentence → word)</option>
+				<option value="markdown" selected>Markdown-aware (by section)</option>
+			</select>
+		</label>
+		<label>Max chunk size: <output name="sizeOut"></output>
+			<input type="range" name="size" min="100" max="900" step="20" value="400" />
+		</label>
+		<label>Overlap (fixed only): <output name="overlapOut"></output>
+			<input type="range" name="overlap" min="0" max="200" step="10" value="0" />
+		</label>
+		<label class="chunk__check"><input type="checkbox" name="context" /> Prepend document title + section to each chunk</label>
+	</div>
+	<details class="chunk__src">
+		<summary>Edit the source document</summary>
+		<textarea rows="12">{sample}</textarea>
+	</details>
+	<p class="chunk__summary" aria-live="polite"></p>
+	<ol class="chunk__list"></ol>
+</section>
+
+<script>
+	type Chunk = { text: string; section: string };
+	const SEPARATORS = ['\n\n', '\n', '. ', ' '];
+
+	// Same algorithm as app/rag/chunking.py in the lesson.
+	function recursiveSplit(text: string, max: number, seps = SEPARATORS): string[] {
+		if (text.length <= max) return text.trim() ? [text.trim()] : [];
+		if (!seps.length) {
+			const out = [];
+			for (let i = 0; i < text.length; i += max) out.push(text.slice(i, i + max));
+			return out;
+		}
+		const [sep, ...rest] = seps;
+		const parts = text.split(sep);
+		const pieces = parts.map((p, i) => (i < parts.length - 1 ? p + sep : p));
+		const chunks: string[] = [];
+		let current = '';
+		for (const piece of pieces) {
+			if (current.length + piece.length <= max) {
+				current += piece;
+				continue;
+			}
+			if (current.trim()) chunks.push(current.trim());
+			if (piece.length > max) {
+				chunks.push(...recursiveSplit(piece, max, rest));
+				current = '';
+			} else current = piece;
+		}
+		if (current.trim()) chunks.push(current.trim());
+		return chunks;
+	}
+
+	function fixed(text: string, size: number, overlap: number): string[] {
+		const out = [];
+		const step = Math.max(20, size - overlap);
+		for (let i = 0; i < text.length; i += step) out.push(text.slice(i, i + size));
+		return out.filter((c) => c.trim());
+	}
+
+	function sectionOf(text: string, chunk: string): string {
+		const idx = text.indexOf(chunk.slice(0, 40));
+		const before = idx >= 0 ? text.slice(0, idx + 1) : '';
+		const headings = [...before.matchAll(/^#{1,6}\s+(.+)$/gm)];
+		return headings.length ? headings[headings.length - 1][1] : '(none)';
+	}
+
+	function markdownChunks(text: string, max: number): Chunk[] {
+		const sections = text.split(/\n(?=#{1,6}\s)/);
+		const out: Chunk[] = [];
+		for (const sec of sections) {
+			const heading = sec.match(/^#{1,6}\s+(.+)$/m)?.[1] ?? '(none)';
+			const body = sec.replace(/^#{1,6}\s+.+\n?/, '').trim();
+			if (!body) continue; // a heading alone is not a useful chunk: it travels with its section
+			const tableMatch = body.match(/(^\|.*\|$\n?)+/m);
+			if (tableMatch) {
+				// keep tables whole: split the prose around them, never the table itself
+				const [pre, post] = body.split(tableMatch[0]);
+				for (const part of recursiveSplit(pre ?? '', max)) out.push({ text: part, section: heading });
+				out.push({ text: tableMatch[0].trim(), section: heading });
+				for (const part of recursiveSplit(post ?? '', max)) out.push({ text: part, section: heading });
+			} else {
+				for (const part of recursiveSplit(body, max)) out.push({ text: part, section: heading });
+			}
+		}
+		return out;
+	}
+
+	function problems(c: string): string[] {
+		const p: string[] = [];
+		const t = c.trim();
+		const lines = t.split('\n');
+		const tableLines = lines.filter((l) => l.trim().startsWith('|'));
+		if (tableLines.length && !/\|\s*-{3}/.test(t)) p.push('table rows without their header');
+		const last = lines[lines.length - 1].trim();
+		if (last.startsWith('|') && !last.endsWith('|')) p.push('table cut mid-row');
+		if (/^(it|this|they|these|that|those)\b/i.test(t.replace(/^document:.*\nsection:.*\n\n/i, ''))) p.push('starts with a pronoun: unclear what it refers to');
+		if (!/[.:|)]$/.test(t) && !/^#/.test(t.split('\n').pop() ?? '')) p.push('cut mid-sentence');
+		if (t.length < 60 && /^#/.test(t)) p.push('heading only: no content');
+		return p;
+	}
+
+	for (const box of document.querySelectorAll<HTMLElement>('[data-chunk]')) {
+		const get = (n: string) => box.querySelector<HTMLInputElement>(`[name="${n}"]`)!;
+		const textarea = box.querySelector('textarea')!;
+		const list = box.querySelector<HTMLOListElement>('.chunk__list')!;
+		const summary = box.querySelector<HTMLElement>('.chunk__summary')!;
+		const colors = ['#6366f1', '#0ea5e9', '#10b981', '#f59e0b', '#ef4444', '#a855f7', '#ec4899', '#64748b'];
+
+		const render = () => {
+			const text = textarea.value;
+			const size = Number(get('size').value);
+			const overlap = Number(get('overlap').value);
+			get('sizeOut').value = `${size} chars`;
+			get('overlapOut').value = `${overlap} chars`;
+			get('overlap').disabled = get('strategy').value !== 'fixed';
+			const title = text.match(/^#\s+(.+)$/m)?.[1] ?? 'Untitled document';
+			let chunks: Chunk[];
+			const strategy = get('strategy').value;
+			if (strategy === 'fixed') chunks = fixed(text, size, overlap).map((c) => ({ text: c, section: sectionOf(text, c) }));
+			else if (strategy === 'recursive') chunks = recursiveSplit(text, size).map((c) => ({ text: c, section: sectionOf(text, c) }));
+			else chunks = markdownChunks(text, size);
+			const withCtx = get('context').checked;
+
+			let issues = 0;
+			list.replaceChildren(
+				...chunks.map((c, i) => {
+					const body = withCtx ? `Document: ${title}\nSection: ${c.section}\n\n${c.text}` : c.text;
+					const probs = problems(c.text);
+					issues += probs.length ? 1 : 0;
+					const li = document.createElement('li');
+					li.style.borderLeftColor = colors[i % colors.length];
+					const meta = document.createElement('p');
+					meta.className = 'chunk__meta';
+					meta.textContent = `Chunk ${i + 1} · ${body.length} chars`;
+					const pre = document.createElement('pre');
+					pre.textContent = body;
+					li.append(meta, pre);
+					if (probs.length) {
+						const warn = document.createElement('p');
+						warn.className = 'chunk__warn';
+						warn.textContent = `⚠️ ${probs.join(' · ')}`;
+						li.append(warn);
+					}
+					return li;
+				}),
+			);
+			summary.textContent = `${chunks.length} chunks, ${issues} with likely problems.`;
+		};
+		box.addEventListener('input', render);
+		box.addEventListener('change', render);
+		render();
+	}
+</script>
