@@ -1,0 +1,156 @@
+---
+title: What MCP is, and why it won
+description: The integration problem MCP solves, hosts, clients and servers, the three core primitives, transports, and what a session looks like on the wire.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Four integrations of the same CRM" severity="SEV3">
+At Acme, four teams connected AI tools to the same CRM: Relay's agent (Python), the sales assistant (TypeScript), a Claude Code setup for the ops engineers, and an analytics notebook. Four different wrappers, four sets of credentials, four interpretations of "customer status". When the CRM changed its API, three of the four broke, each in a different way.
+</Incident>
+
+## The problem: M × N integrations
+
+Every AI application (chat app, agent, IDE assistant) needs access to tools and data (CRM, ticketing, databases, file systems). Without a standard, every app builds its own connector to every system: **M apps × N systems** integrations, each with its own bugs and security model.
+
+The **Model Context Protocol (MCP)** is an open standard that turns that into **M + N**: each system exposes **one MCP server**, and each AI app implements **one MCP client**. Anthropic introduced it in late 2024, every major AI provider adopted it, and it was donated to the Agentic AI Foundation in December 2025. It's now named directly in GenAI and FDE job postings (see the [research](/research/)).
+
+<Diagram
+	caption="Before and after MCP. One server per system, reusable by every AI application that speaks the protocol."
+	code={`flowchart LR
+    subgraph Hosts["AI applications (hosts with MCP clients)"]
+        R["Relay agent"]
+        C["Claude Code / desktop apps"]
+        S["Sales assistant"]
+    end
+    subgraph Servers["MCP servers"]
+        CRM["acme-crm server"]
+        SHIP["acme-ops server<br/>(shipments)"]
+        DOCS["policy-docs server"]
+    end
+    R --> CRM
+    R --> SHIP
+    C --> CRM
+    C --> DOCS
+    S --> CRM`}
+/>
+
+## The roles
+
+| Role | What it is | Example |
+|---|---|---|
+| **Host** | The AI application the user interacts with | Relay, Claude Code, an IDE, a chat app |
+| **Client** | The component inside the host that holds one connection to one server | Relay's connection to `acme-ops` |
+| **Server** | A program that exposes capabilities over MCP | `acme-ops`, wrapping Acme's shipment API |
+
+The **host** stays in control: it decides which servers to connect, which tools the model may see, and which calls need user approval.
+
+## The three core primitives
+
+| Primitive | Controlled by | What it is | Acme example |
+|---|---|---|---|
+| **Tools** | The **model** (it decides to call them) | Functions with a JSON Schema input, and optionally a structured output | `get_shipment(shipment_id)`, `create_claim(...)` |
+| **Resources** | The **application** (it decides what to load) | Readable data identified by a URI, including templates | `acme://customers/C-2201`, policy documents |
+| **Prompts** | The **user** (they pick one) | Reusable prompt templates with arguments | "Draft a delay apology for shipment X" |
+
+Clients can also offer capabilities **to servers**: for example, letting a server ask the user for missing input (elicitation), or ask the host's model to generate text (sampling). You'll meet these in advanced servers; tools, resources and prompts cover most real integrations.
+
+## Transports
+
+| Transport | How | Use for |
+|---|---|---|
+| **stdio** | The host launches the server as a subprocess and talks over stdin/stdout | Local tools on a developer's machine (file systems, local databases, CLIs) |
+| **Streamable HTTP** | The server is a web service at a URL (e.g. `https://mcp.acme.example/mcp`) | Remote, shared, production servers with authentication (lesson 4) |
+
+## What a session looks like
+
+MCP messages are **JSON-RPC 2.0**. Step through a tool call:
+
+<AgentStepper
+	title="An MCP tool call on the wire (simplified)"
+	steps={[
+		{ kind: 'harness', title: 'Client → server: discover', body: 'The client learns the server\'s protocol versions and capabilities (tools? resources? prompts?). Newer protocol versions are stateless and use `server/discover`; older ones use an `initialize` handshake. SDKs negotiate this for you.' },
+		{ kind: 'tool_call', title: 'Client → server: tools/list', body: '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' },
+		{ kind: 'tool_result', title: 'Server → client: tool definitions', body: '[{"name":"get_shipment","description":"Look up the live status of one shipment...","inputSchema":{...},"outputSchema":{...},"annotations":{"readOnlyHint":true}}]' },
+		{ kind: 'model', title: 'Host gives the tools to the model', body: 'The host converts the MCP definitions into the model API\'s tool format, possibly filtering them to an allow-list.' },
+		{ kind: 'tool_call', title: 'Model wants a tool → client → server: tools/call', body: '{"method":"tools/call","params":{"name":"get_shipment","arguments":{"shipment_id":"ACM-2025-000183"}}}' },
+		{ kind: 'tool_result', title: 'Server → client: result', body: '{"structuredContent":{"status":"delayed","location":"Antwerp",...},"isError":false}. The host passes it back to the model as a tool result.' },
+	]}
+/>
+
+:::note[The protocol is evolving]
+MCP is versioned by date. The 2026-07-28 revision made the protocol **stateless** (clients discover servers instead of holding an initialized session), and the official SDKs negotiate older versions automatically. The **concepts** in this module (hosts, clients, servers, tools, resources, prompts, transports, auth) are stable. Check the current specification at modelcontextprotocol.io for wire-level details.
+:::
+
+<FailureCard
+	title="The MCP server that was just the whole API"
+	symptom="The model struggles to use a CRM MCP server: wrong endpoints, malformed bodies, huge responses."
+	cause="Someone auto-generated one MCP tool per REST endpoint (140 tools) with the API's raw descriptions. Great for completeness, terrible for a model choosing between 140 near-identical tools."
+	detect="Tool-selection accuracy in evals; tool calls per task; context tokens spent on tool definitions."
+	fix="Design MCP tools around **tasks** the model performs (lesson 3), not around the API's endpoints."
+/>
+
+<ThinkFirst question="Acme asks: 'Should we build an MCP server for our CRM, or just give Relay a Python function that calls the CRM API?' What do you recommend, and what decides it?">
+
+**It depends on reuse and ownership:**
+
+- **Just a function** if Relay is the only consumer, the integration is small, and the same team owns both. MCP adds a process boundary, deployment and auth that you don't need yet.
+- **An MCP server** when **several AI applications** need the CRM (Relay, the sales assistant, engineers in Claude Code), when the **CRM team** should own the integration and its security (one place for permissions, rate limits and auditing), or when you want to plug the CRM into off-the-shelf hosts without writing code for each.
+
+A good middle path: write the tool logic as **plain functions** in a shared package now, and wrap them in an MCP server when the second consumer appears. That's a few dozen lines (next lesson).
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** install an MCP server you'd find useful (a filesystem or Git server) in an MCP host you use, and watch which tools it exposes.
+- **Stretch:** open the MCP Inspector (`uv run mcp dev server.py`, next lesson) against any server and inspect the raw `tools/list` output. Which descriptions would confuse a model?
+- **Boss level:** map Acme's systems (CRM, shipments, policies, ticketing) to MCP servers: which primitives each one exposes (tools, resources, prompts), the transport, and who owns it. That's an architecture diagram an FDE would present to a customer.
+
+</Practice>
+
+<Quiz
+	id="m7-what"
+	questions={[
+		{
+			q: 'What problem does MCP primarily solve?',
+			options: [
+				'Model accuracy',
+				'The M × N integration problem: each system exposes one server, each AI app one client, so integrations become M + N',
+				'Token cost',
+				'Prompt injection',
+			],
+			answer: 1,
+			why: 'A standard protocol lets any MCP host use any MCP server, so integrations are built once and reused.',
+		},
+		{
+			q: 'Which primitive is controlled by the model?',
+			options: ['Resources', 'Prompts', 'Tools', 'Transports'],
+			answer: 2,
+			why: 'The model decides when to call tools. Resources are loaded by the application, prompts are chosen by the user.',
+		},
+		{
+			q: 'Which transport fits a shared, production MCP server used by many people?',
+			options: ['stdio', 'Streamable HTTP, with authentication', 'Email', 'A shared file'],
+			answer: 1,
+			why: 'stdio is for local subprocesses. Remote servers run over HTTP and need auth (lesson 4).',
+		},
+		{
+			q: 'Who decides which MCP tools the model is allowed to see and call?',
+			options: ['The MCP server', 'The host application', 'The model', 'The user\'s browser'],
+			answer: 1,
+			why: 'The host stays in control: which servers to connect, which tools to expose, and which calls need approval.',
+		},
+	]}
+/>
+
+<LessonComplete id="mcp/what-is-mcp" />

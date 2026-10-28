@@ -1,0 +1,177 @@
+---
+title: Frameworks and multi-agent systems
+description: Choosing between LangGraph, PydanticAI, provider agent SDKs, the AI SDK, managed agents, or no framework at all, and when multiple agents help versus when they only multiply cost. Plus the Module 6 lab.
+sidebar:
+  order: 7
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="Five agents to write one email" severity="SEV3">
+A demo-driven team built a "multi-agent support crew": a Planner, a Researcher, a Policy Expert, a Writer and a Reviewer, chatting with each other to answer each ticket. It looked impressive in a video. In production it used about 14× the tokens of a single agent with the same tools, took 40 seconds per ticket, and when it got something wrong, nobody could tell which agent caused it. A single agent with good tools and one review step matched its quality.
+</Incident>
+
+## The framework landscape
+
+Frameworks change fast; the **concepts** you've learned (the loop, tools, state, checkpoints, approvals, budgets) don't. Use this table to orient yourself, then check each project's current documentation.
+
+| Option | What it is | Reach for it when |
+|---|---|---|
+| **No framework** (your own loop, lesson 1) | ~100 lines you fully control | Simple agents; you want zero magic; learning |
+| **LangGraph** | Graphs of nodes with typed state, checkpointers, interrupts | Complex, stateful flows with human pauses and durability (lesson 6) |
+| **PydanticAI** | Type-safe Python agents built around Pydantic models | Python teams that want typed tools and outputs with little ceremony |
+| **OpenAI Agents SDK** | Lightweight agents with handoffs and guardrails, for OpenAI models | OpenAI-centred stacks |
+| **Claude Agent SDK** | The Claude Code harness as a library: built-in file, shell and search tools, subagents, hooks, permissions | Coding or file-heavy agents; you want a battle-tested harness (see the [case study](/case-studies/claude-code/)) |
+| **Vercel AI SDK** (agents, tool loops) | TypeScript loops with tools, approvals and streaming to the UI | TypeScript products; agents tightly coupled to a web UI (Module 2) |
+| **CrewAI and similar** | Role-based multi-agent "crews" | Prototyping multi-agent ideas |
+| **Managed agent platforms** (e.g. Anthropic's Managed Agents) | The provider hosts the loop, sandbox and session state | You want hosted, long-running agents and their data model fits your requirements |
+
+How to choose, in practice:
+
+1. **Start with the problem shape** (lesson 2). Most features are workflows, and many need no agent framework at all.
+2. **Prefer thin abstractions** you can read in an afternoon. When something breaks at 3 a.m., you need to understand what the framework did.
+3. **Check the production features**: persistence, human-in-the-loop, streaming, tracing hooks, testing support, and how upgrades are handled (Module 2's version-churn lesson applies to every framework).
+4. **Keep your domain logic framework-free**: tools, policies and validation in plain modules, so switching frameworks is a rewrite of the glue, not of the business logic.
+
+## Multi-agent: when does it help?
+
+<Diagram
+	caption="Three common multi-agent shapes. Each adds coordination cost; use one only when it buys something specific."
+	code={`flowchart TB
+    subgraph Supervisor
+        S1["Supervisor"] --> A1["Specialist A"]
+        S1 --> B1["Specialist B"]
+        A1 --> S1
+        B1 --> S1
+    end
+    subgraph Fanout["Parallel fan-out"]
+        L["Lead"] --> W1["Worker 1<br/>own context"]
+        L --> W2["Worker 2<br/>own context"]
+        L --> W3["Worker 3<br/>own context"]
+        W1 --> L
+        W2 --> L
+        W3 --> L
+    end
+    subgraph Pipeline["Generator + reviewer"]
+        G["Generator"] --> R["Reviewer"]
+        R -- feedback --> G
+    end`}
+/>
+
+Multiple agents **help** when:
+
+- **Context isolation pays off:** sub-tasks read a lot (40 documents, a whole codebase) but only a summary matters. Workers keep the lead's context clean. This is the main reason Claude Code uses subagents.
+- **Work is genuinely parallel:** independent research directions, many items to process.
+- **Different tools or permissions are needed:** a read-only research agent and a separate, tightly permissioned action agent.
+- **A distinct reviewer adds real signal:** an independent check with different instructions (the evaluator-optimizer pattern).
+
+They **hurt** when:
+
+- The sub-tasks are tightly coupled and agents keep passing context back and forth.
+- "Roles" are just personas on the same model with the same information (Planner, Researcher and Writer that all see everything).
+- You can't trace which agent made which decision.
+
+**Default to one agent with good tools.** Add agents for isolation, parallelism or permissions, and **measure** quality, cost and latency against the single-agent baseline.
+
+<FailureCard
+	title="The telephone game"
+	symptom="Final answers contain details that no tool ever returned, and they get worse as the chain of agents gets longer."
+	cause="Each agent summarized the previous agent's summary. Errors and embellishments compounded, and the original evidence was lost along the way."
+	detect="Trajectory evals: check that claims in the final answer trace back to tool results, not to another agent's prose."
+	fix="Fewer hops; pass structured findings with sources (not prose summaries) between agents; let the final writer see the original evidence."
+/>
+
+<FailureCard
+	title="The unaccountable crew"
+	symptom="A wrong refund recommendation came out of a 5-agent discussion, and nobody can tell which agent introduced the error."
+	cause="No per-agent tracing, and agents edited a shared scratchpad without attribution."
+	detect="Try to reconstruct the decision from your traces. If you can't, your observability is insufficient."
+	fix="Trace every agent's inputs, outputs and tool calls under one parent trace ID; give each agent a clear, narrow responsibility; and keep side effects in one accountable place."
+/>
+
+## 🧪 Module 6 lab: Relay's operations agent
+
+Build it in `relay`. **Acceptance criteria:**
+
+1. **Your own loop** (lesson 1) with unit tests: parallel calls in one message, error results, and all three circuit breakers.
+2. **Routing first:** a classifier sends simple tickets to workflows; only "complex investigation" and "refund" go to agents.
+3. **Tools designed for models:** at least 5 tools (shipment lookup, paginated shipment search, customer lookup, policy search from Module 4, refund) with bounded outputs and errors that teach.
+4. **A LangGraph refund flow** with a persistent checkpointer, `interrupt`-based approval over $100, edit-before-approve, re-validation before the refund, and idempotent execution.
+5. **Context management:** bounded tool outputs, stale-result clearing, and a notes state; caching on the stable prefix.
+6. **Memory** limited to customer preferences, with the code filter against stored claims.
+7. **Evals:** at least 20 agent tasks in a sandbox, with outcome (end-state) checks and trajectory checks (Module 5), plus a chaos test that kills the worker mid-refund.
+8. `docs/module-6.md`: workflow vs agent decisions with reasons, the cost per task with and without caching and compaction, and **three agent failures** you found and fixed.
+
+<ThinkFirst question="A stakeholder asks for 'an AI team of agents' to handle all customer support, because they saw an impressive multi-agent demo. How do you respond, and what would you propose instead?">
+
+**Respond with curiosity, then data.** Ask what they liked about the demo (often: visible reasoning, specialization, autonomy). Then explain the trade-offs: multi-agent setups multiply cost and latency, and make failures harder to attribute and fix.
+
+**Propose:**
+
+1. **A routed workflow** for the 80% of tickets that are predictable (tracking, simple policy questions), which is cheap, fast and testable.
+2. **A single agent with good tools** for complex cases, with approval steps for actions.
+3. **Sub-agents only where they earn their place**, such as a research sub-agent that reads long case histories and returns a summary (context isolation).
+4. **A visible trace in the UI** (Module 2: "showing the work") to give stakeholders the transparency they liked in the demo.
+5. **A bake-off:** run the proposed design and a multi-agent version on the same 50 eval tasks. Compare success, cost per ticket, latency, and how easy failures are to debug. Let the numbers decide.
+
+That's the FDE skill: take the enthusiasm seriously, and steer it toward what will work in production.
+
+</ThinkFirst>
+
+<Practice title="Build it yourself: Module 6 wrap-up">
+
+- **Warm-up:** rebuild your lesson 1 agent with one framework (LangGraph or PydanticAI) and compare line count, readability, and how easy it is to add a budget.
+- **Stretch:** add a research sub-agent with read-only tools and its own context, returning a structured summary with sources. Measure the lead agent's tokens per task before and after.
+- **Boss level:** complete the Module 6 lab, then run the single-agent vs multi-agent bake-off on your 20 sandbox tasks. Publish the comparison table. Few candidates can show this kind of evidence.
+
+</Practice>
+
+<Quiz
+	id="m6-frameworks"
+	title="Module 6 final quiz"
+	questions={[
+		{
+			q: 'What is the strongest reason to use sub-agents?',
+			options: ['They look impressive', 'Context isolation: a sub-agent can read a lot and return only a summary, keeping the main context focused', 'They are always cheaper', 'Each one is smarter'],
+			answer: 1,
+			why: 'Isolation (and genuine parallelism or separate permissions) is what multi-agent setups buy. Personas alone add cost without benefit.',
+		},
+		{
+			q: 'How should you keep framework lock-in low?',
+			options: ['Never use a framework', 'Keep domain logic (tools, policies, validation) in plain modules, with the framework only as glue', 'Use every framework at once', 'Fork the framework'],
+			answer: 1,
+			why: 'Frameworks change fast. Portable business logic makes switching a manageable change.',
+		},
+		{
+			q: 'A chain of agents passes prose summaries along, and the final answers contain unsupported details. What is the fix?',
+			options: ['Add more agents', 'Pass structured findings with sources, reduce hops, and let the final step see the original evidence', 'Use a bigger model for the last agent', 'Remove tools'],
+			answer: 1,
+			why: 'Summaries of summaries compound errors. Keep evidence attached all the way to the final answer.',
+		},
+		{
+			q: 'Which control best prevents runaway agent cost?',
+			options: ['A longer system prompt', 'Budgets (turns, tokens, money), repeated-call detection, and graceful exhaustion', 'More tools', 'Streaming'],
+			answer: 1,
+			why: 'Explicit budgets and stuck-detection turn unbounded loops into bounded, observable failures.',
+		},
+		{
+			q: 'Why must side effects be idempotent in durable agents?',
+			options: [
+				'It makes them faster',
+				'Steps can be retried after crashes or resumes, so a repeated step must not repeat its effect',
+				'APIs require it',
+				'It reduces tokens',
+			],
+			answer: 1,
+			why: 'Durability means "at least once". Idempotency turns that into "effectively once".',
+		},
+	]}
+/>
+
+<LessonComplete id="agents/frameworks-and-multi-agent" />

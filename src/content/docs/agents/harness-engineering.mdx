@@ -1,0 +1,161 @@
+---
+title: Harness engineering
+description: Everything around the model that makes an agent work. Tool design, context management and compaction, budgets and stop conditions, and observability for agents.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentCostSimulator from '../../../components/AgentCostSimulator.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The tool that returned 2 MB" severity="SEV2">
+Relay's agent had a `list_customer_shipments` tool that returned every shipment a customer had ever sent, as raw JSON. For most customers that was fine. For one large business customer it was 14,000 shipments, about 2 MB of text. The first call filled the context window; the request failed. Worse, for medium-sized customers it "worked": the model received 80,000 tokens of shipment JSON, cost ballooned, and answers got worse because the one relevant shipment was buried.
+</Incident>
+
+The 2026 framing in the [research](/research/) is useful: prompt engineering made the **prompt** the focus, context engineering made **what the model sees** the focus, and **harness engineering** makes **the runtime around the model** the focus: the loop, the tools, context management, budgets, safety and observability. With capable models, the harness usually decides whether an agent works. You saw a production harness in the [Claude Code case study](/case-studies/claude-code/).
+
+<Diagram
+	caption="The agent harness. The model is one box; everything else is engineering you own."
+	code={`flowchart TB
+    subgraph Harness
+        L["Loop + stop conditions"]
+        T["Tool layer<br/>design, validation, permissions"]
+        C["Context manager<br/>what's in the window, compaction"]
+        B["Budgets<br/>turns, tokens, money, time"]
+        S["Safety<br/>approvals, sandbox, hooks"]
+        O["Observability<br/>traces, cost, outcomes"]
+    end
+    M["Model"] <--> L
+    L --> T
+    L --> C
+    L --> B
+    T --> S
+    L --> O`}
+/>
+
+## Tool design: the agent's user interface
+
+Models use tools the way people use UIs: good design makes correct use easy. (Module 7 goes deeper.)
+
+| Principle | Bad | Good |
+|---|---|---|
+| **Return what's needed, bounded** | `list_customer_shipments` → all 14,000 rows | `search_shipments(customer_id, status?, since?, limit=20)` → 20 rows + "14,000 total, refine your filters" |
+| **Errors that teach** | `Error 500` | `"No shipment 'ACM-183'. IDs look like ACM-2025-000183. Ask the customer to confirm."` |
+| **One clear job per tool** | `crm_api(method, path, body)` | `get_customer`, `update_address`, `create_claim` |
+| **Hard to misuse** | `amount: number` | `amount: number, max 5000`, plus a server-side policy check |
+| **Descriptions say when to use it** | "Gets shipment" | "Use when the customer mentions a shipment ID. Returns status, location, ETA. Read-only." |
+
+## Context management
+
+Every turn re-sends the conversation, so the context grows. It costs more each turn, and quality can drop as relevant details get buried. You saw the arithmetic in [cost math](/foundations/cost-math/); here it is per turn. Try 15 turns, then turn on caching, then compaction:
+
+<AgentCostSimulator />
+
+The main techniques:
+
+| Technique | What it does | Trade-off |
+|---|---|---|
+| **Bounded tool outputs** | Paginate, filter and truncate at the tool | Model may need another call for more |
+| **Prompt caching** | Re-sent stable prefix and history billed at a fraction | Prefix must stay byte-identical (Module 1) |
+| **Clearing old tool results** | Replace stale, bulky tool outputs with a short stub | Model can't re-read them (it can call the tool again) |
+| **Compaction** | Summarize older history when it passes a threshold | Details can be lost, so keep critical facts elsewhere |
+| **External state ("notes")** | Agent writes key facts, plans and decisions to a file or store | Needs a tool and discipline |
+| **Sub-agents** | Delegate exploration to a fresh context; get back only a summary | Extra calls; coordination overhead (lesson 7) |
+
+## Budgets and stop conditions
+
+Every agent needs explicit answers to "when do we stop?":
+
+- **Success:** the model ends its turn (`end_turn`), and ideally a **verification** step confirms the outcome (the refund exists, the tests pass).
+- **Budget exhausted:** turns, tokens, dollars, wall-clock time.
+- **Stuck:** repeated identical calls, or no progress for N turns.
+- **Unsafe:** a guardrail or permission check fails.
+
+And every stop needs a **graceful exit**: a useful partial result and a hand-off, not a stack trace.
+
+## Observability for agents
+
+For a single LLM call, logging input and output is enough. For agents, you need the **trajectory**: every turn, tool call, tool result (or a summary of it), tokens, latency and cost, linked under one trace ID. Without it you can't debug "why did it do that?", and you can't build the trajectory evals from Module 5. (Module 9 covers tracing infrastructure.)
+
+<FailureCard
+	title="Death by context"
+	symptom="Agent quality drops steadily within long tasks: early on it's sharp, by turn 20 it repeats work and forgets constraints."
+	cause="Bulky tool outputs and long histories filled the context; the important early instructions and findings were diluted."
+	detect="Quality and token usage by turn number in traces; eval tasks of different lengths."
+	fix="Bound tool outputs, clear stale results, compact at a threshold, and have the agent keep a short notes or plan state that's always included."
+/>
+
+<FailureCard
+	title="The agent that declared victory"
+	symptom="The agent reports 'Refund issued!', but the payments system shows nothing."
+	cause="The refund tool returned an error the model glossed over, and the harness trusted the model's final text."
+	detect="Outcome checks against systems of record (Module 5's end-state evals), in production too."
+	fix="A verification step: after side effects, the harness (not the model) confirms the result in the system of record before reporting success."
+/>
+
+<ThinkFirst question="Relay's investigation agent sometimes needs 25+ turns on complex claims and its context hits 150K tokens. List the harness changes you'd make, in the order you'd try them, and say why that order.">
+
+Order from cheapest and safest to most invasive:
+
+1. **Bound tool outputs** (filters, pagination, summaries in the tool). It's often the biggest win: fewer tokens per turn, better focus, and no quality risk.
+2. **Prompt caching** on the stable prefix and the growing history. A big cost cut with no behaviour change.
+3. **Clear stale tool results** (keep stubs). Cheap, and the agent can re-fetch if needed.
+4. **A notes or plan state:** the agent records key facts and decisions, so later compaction can't lose them.
+5. **Compaction** at a threshold (e.g. 60% of the window), now safe because critical facts live in the notes.
+6. **Sub-agents** for exploration-heavy sub-tasks (reading 30 policy sections), returning short summaries.
+7. **Re-examine the design:** should part of this be a workflow (lesson 2)? 25 turns is sometimes a sign the model is doing work code could do.
+
+Measure each step with your agent evals: task success, tokens, cost and turns.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** in the simulator, find settings where caching saves more than compaction, and settings where the opposite is true. What decides it?
+- **Stretch:** redesign one bulky tool in your Relay agent to be paginated and filtered, with a "N more results" hint. Measure tokens per task before and after.
+- **Boss level:** add context management to your `run_agent` loop: clear tool results older than 5 turns (replacing them with a stub), compact the history above a token threshold with a summarization call, and keep a `notes` dict that's always included. Run your agent eval suite before and after, and report success rate, tokens and cost.
+
+</Practice>
+
+<Quiz
+	id="m6-harness"
+	questions={[
+		{
+			q: 'What is "harness engineering"?',
+			options: [
+				'Fine-tuning the model',
+				'Engineering the runtime around the model: loop, tools, context management, budgets, safety and observability',
+				'Writing longer prompts',
+				'Choosing a GPU',
+			],
+			answer: 1,
+			why: 'With capable models, the harness usually decides whether an agent is reliable, affordable and safe.',
+		},
+		{
+			q: 'A tool returns 2 MB of JSON. What is the best fix?',
+			options: ['A model with a bigger context window', 'Redesign the tool: filters, pagination, bounded output, and a hint when there are more results', 'Ask the model to ignore irrelevant rows', 'Compress the JSON'],
+			answer: 1,
+			why: 'Fix it at the source: tools should return what\'s needed, bounded, with a way to get more.',
+		},
+		{
+			q: 'Why keep a separate "notes" state when using compaction?',
+			options: ['It is required by the API', 'Compaction can lose details, so critical facts and decisions must live somewhere that is always included', 'Notes are cheaper than messages', 'For the UI only'],
+			answer: 1,
+			why: 'Summaries are lossy. Durable notes make compaction safe for the facts that matter.',
+		},
+		{
+			q: 'The agent says "Refund issued" but none exists. Which harness feature prevents this?',
+			options: ['A longer system prompt', 'Verification of side effects against the system of record before reporting success', 'Higher temperature', 'More tools'],
+			answer: 1,
+			why: 'Don\'t trust the model\'s summary of its own actions. Verify outcomes in code.',
+		},
+	]}
+/>
+
+<LessonComplete id="agents/harness-engineering" />

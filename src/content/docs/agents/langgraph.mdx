@@ -1,0 +1,229 @@
+---
+title: Stateful agent graphs with LangGraph
+description: Typed state, nodes and conditional edges, interrupt-based human approval, checkpointers that survive restarts, time travel, and the gotchas that bite in production.
+sidebar:
+  order: 6
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The linear chain that couldn't go back" severity="SEV3">
+Relay's first refund flow was a linear chain: extract → check policy → draft → send. Real cases didn't fit. If the photos were missing, it needed to **ask the customer and wait**. If the amount was large, it needed **approval**. If a reviewer edited the draft, it needed to **loop back** and re-check the policy. Each exception was bolted on with flags and nested ifs until nobody dared touch the code.
+</Incident>
+
+**LangGraph** models an agent or workflow as a **graph**: nodes are steps (LLM calls, tool calls, plain code), edges decide what runs next, and a **typed state** flows through. It supports loops, branches, human pauses and persistence: exactly the things linear chains can't express. It's one of the most widely used agent frameworks in job postings, so it's worth knowing well.
+
+## The refund flow as a graph
+
+<Diagram
+	caption="Relay's refund flow. The conditional edges are plain Python functions; the approval node pauses the graph until a human answers."
+	code={`flowchart LR
+    S((start)) --> A["assess<br/>extract shipment + amount"]
+    A -- "amount > 100" --> P["approve<br/>interrupt: wait for human"]
+    A -- "amount <= 100" --> I["issue_refund<br/>idempotent side effect"]
+    P -- approved --> I
+    P -- denied --> W["write_reply"]
+    I --> W
+    W --> E((end))`}
+/>
+
+Here's the full implementation, tested with LangGraph 1.2 and its SQLite checkpointer. The `assess` node is a placeholder where your structured-output LLM call goes:
+
+```python
+# app/agents/refund_graph.py: a refund workflow with a human approval step that survives restarts
+import hashlib
+import sqlite3
+from typing import Literal, TypedDict
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+
+class RefundState(TypedDict, total=False):
+    ticket: str
+    shipment_id: str
+    amount: float
+    decision: str           # "approved" | "denied" | "auto"
+    refund_id: str
+    reply: str
+
+
+def assess(state: RefundState) -> RefundState:
+    # In production: an LLM call with structured output extracts these from the ticket.
+    return {"shipment_id": "ACM-2025-000183", "amount": 340.0}
+
+
+def route(state: RefundState) -> Literal["approve", "issue_refund"]:
+    return "approve" if state["amount"] > 100 else "issue_refund"
+
+
+def approve(state: RefundState) -> RefundState:
+    # Pauses the graph here. The state is checkpointed; the process can even exit.
+    answer = interrupt({"question": f"Refund {state['amount']} EUR on {state['shipment_id']}?"})
+    return {"decision": "approved" if answer == "approve" else "denied"}
+
+
+def after_approval(state: RefundState) -> Literal["issue_refund", "write_reply"]:
+    return "issue_refund" if state["decision"] == "approved" else "write_reply"
+
+
+def issue_refund(state: RefundState) -> RefundState:
+    # Side effect: the idempotency key makes a replayed step safe (Module 2, lesson 5).
+    key = f"refund:{state['shipment_id']}:{state['amount']}"  # same logical refund -> same key, in any process
+    refund_id = "RF-" + hashlib.sha256(key.encode()).hexdigest()[:8]  # stand-in for payments.refund(idempotency_key=key)
+    return {"refund_id": refund_id, "decision": state.get("decision", "auto")}
+
+
+def write_reply(state: RefundState) -> RefundState:
+    if state.get("refund_id"):
+        return {"reply": f"Refund of {state['amount']} EUR issued ({state['refund_id']})."}
+    return {"reply": "Your refund request was reviewed and could not be approved. An agent will contact you."}
+
+
+def build(checkpointer):
+    graph = StateGraph(RefundState)
+    graph.add_node("assess", assess)
+    graph.add_node("approve", approve)
+    graph.add_node("issue_refund", issue_refund)
+    graph.add_node("write_reply", write_reply)
+    graph.add_edge(START, "assess")
+    graph.add_conditional_edges("assess", route)
+    graph.add_conditional_edges("approve", after_approval)
+    graph.add_edge("issue_refund", "write_reply")
+    graph.add_edge("write_reply", END)
+    return graph.compile(checkpointer=checkpointer)
+
+
+def open_app(path: str = "refunds.db"):
+    return build(SqliteSaver(sqlite3.connect(path, check_same_thread=False)))
+```
+
+## Pause, exit, resume in a new process
+
+The approval wait shouldn't hold a running process (lesson 5). With a checkpointer, the graph saves its state at every step, so a **completely new process** can resume it:
+
+```python
+# step1.py: start the task; it pauses at the approval node
+from refund_graph import open_app
+app = open_app()
+config = {"configurable": {"thread_id": "ticket-8812"}}
+result = app.invoke({"ticket": "My glassware arrived broken, I want my 340 EUR back."}, config)
+print("paused with:", result.get("__interrupt__"))
+print("next node:", app.get_state(config).next)
+```
+
+```python
+# step2.py: hours later, in another process (after a deploy, say)
+# A NEW process: simulates a server restart between the pause and the human's decision.
+from langgraph.types import Command
+from refund_graph import open_app
+app = open_app()
+config = {"configurable": {"thread_id": "ticket-8812"}}
+print("restored, waiting at:", app.get_state(config).next)
+result = app.invoke(Command(resume="approve"), config)
+print("final:", result["reply"], "| decision:", result["decision"])
+print("history (newest first):", [s.next for s in app.get_state_history(config)][:6])
+```
+
+The real output from running these two scripts as separate processes:
+
+```text
+paused with: [Interrupt(value={'question': 'Refund 340.0 EUR on ACM-2025-000183?'}, ...)]
+next node: ('approve',)
+--- process exited; starting a new one ---
+restored, waiting at: ('approve',)
+final: Refund of 340.0 EUR issued (RF-d1de8bb6). | decision: approved
+history (newest first): [(), ('write_reply',), ('issue_refund',), ('approve',), ('assess',), ('__start__',)]
+```
+
+The **thread ID** (`ticket-8812`) is the durable identity of the task. Use your own business ID (the ticket), so the approval UI can find and resume it.
+
+## Time travel
+
+`get_state_history(config)` returns every checkpoint. You can inspect exactly what the state was before each step (great for debugging and audits), and even **resume from an earlier checkpoint**, for example to re-run from "assess" after fixing a bug. Treat this carefully: replaying past a side effect must rely on idempotency.
+
+## The gotchas
+
+<FailureCard
+	title="Code before interrupt() runs twice"
+	symptom="Every approved refund sends two 'your request is under review' messages."
+	cause="When a graph resumes from an `interrupt`, LangGraph **re-runs the interrupted node from the top**. The message was sent in the same node, before `interrupt()`. (Verified with LangGraph 1.2: code before the interrupt ran twice.)"
+	detect="Count side effects per thread; anything duplicated around an approval is a clue."
+	fix="Keep nodes that call `interrupt()` free of side effects (or make them idempotent). Put side effects in separate nodes after the pause."
+/>
+
+<FailureCard
+	title="Non-deterministic IDs across restarts"
+	symptom="A refund resumed after a restart is issued again, with a different 'idempotency' key."
+	cause="The key was derived with Python's built-in `hash()`, which is randomized per process. The first version of this lesson's example had exactly this bug, caught by testing across two processes."
+	detect="Run the pause/resume flow in two separate processes in your tests, and compare keys."
+	fix="Derive keys with `hashlib` from stable business data, or generate once and store the key in the graph state."
+/>
+
+<FailureCard
+	title="In-memory checkpointer in production"
+	symptom="After every deploy, all pending approvals vanish and approvers get 'task not found'."
+	cause="The graph was compiled with an in-memory saver (fine for tests), so state lived only in the process."
+	detect="A test that restarts the process between pause and resume (like the two scripts above)."
+	fix="Use a persistent checkpointer (Postgres in production, SQLite for single-machine setups), with backups and a retention policy."
+/>
+
+## Multi-agent graphs
+
+The same building blocks express multi-agent systems. A common shape is the **supervisor**: one node (an LLM with routing tools) decides which specialist node runs next (researcher, writer, reviewer), and specialists return to the supervisor. Lesson 7 discusses when that's worth it, which is less often than you'd think.
+
+<ThinkFirst question="An approver edits the refund amount from 340 to 250 EUR before approving. How would you support that in this graph, and what must happen after the edit?">
+
+1. **Resume with data, not just a yes/no:** `Command(resume={"decision": "approve", "amount": 250, "approver": "j.smith"})`, and have the `approve` node write the new amount (and the approver) into the state.
+2. **Re-validate after the edit:** route through a policy-check node again (the edited amount must still be within policy and caps). That's a loop back in the graph, which is natural in LangGraph.
+3. **The idempotency key changes with the amount** (`refund:ACM-183:250`), which is correct: it's a different logical refund. But make sure the 340 version was never executed.
+4. **Audit:** store the original and the edited amount, who edited it and when, in the state and in your audit log.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the graph above locally. Use `get_state_history` to print the state after every step.
+- **Stretch:** replace `assess` with a real structured-output LLM call, and add a "missing photos" branch that pauses with `interrupt` to ask the customer, then resumes when they reply.
+- **Boss level:** move the checkpointer to Postgres, build a tiny approvals UI (list pending threads, approve with an edited amount, resume), and add the two-process test and a chaos test to CI.
+
+</Practice>
+
+<Quiz
+	id="m6-langgraph"
+	questions={[
+		{
+			q: 'What does a checkpointer give a LangGraph application?',
+			options: ['Faster LLM calls', 'Persisted state after every step, so threads can pause, resume in another process, and be inspected later', 'Automatic evals', 'Cheaper tokens'],
+			answer: 1,
+			why: 'Checkpoints make agents durable and debuggable: human waits, crash recovery, and time travel.',
+		},
+		{
+			q: 'A node sends an email and then calls interrupt(). What happens when the graph resumes?',
+			options: ['The email is sent once', 'The node re-runs from the top, so the email is sent again', 'The graph crashes', 'The email is cancelled'],
+			answer: 1,
+			why: 'Interrupted nodes restart on resume. Keep side effects out of them, or make them idempotent.',
+		},
+		{
+			q: 'What should the thread_id usually be?',
+			options: ['A random value per request', 'A stable business identifier, such as the ticket ID, so the task can be found and resumed', 'The user\'s email', 'The model name'],
+			answer: 1,
+			why: 'The thread is the durable identity of the task. Your approval UI and logs need to find it.',
+		},
+		{
+			q: 'Which checkpointer belongs in production for multi-day approvals?',
+			options: ['In-memory', 'A persistent one, such as Postgres', 'None', 'A JSON file in /tmp'],
+			answer: 1,
+			why: 'State must survive deploys and crashes, with backups.',
+		},
+	]}
+/>
+
+<LessonComplete id="agents/langgraph" />

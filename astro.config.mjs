@@ -22,6 +22,8 @@ export default defineConfig({
 				{ label: '3 · Embeddings & Vector Search', items: [{ autogenerate: { directory: 'embeddings' } }] },
 				{ label: '4 · Production RAG', items: [{ autogenerate: { directory: 'rag' } }] },
 				{ label: '5 · Evals & CI', items: [{ autogenerate: { directory: 'evals' } }] },
+				{ label: '6 · Tools, Workflows & Agents', items: [{ autogenerate: { directory: 'agents' } }] },
+				{ label: '7 · MCP & Integrations', items: [{ autogenerate: { directory: 'mcp' } }] },
 				{ label: 'Case Studies', items: [{ autogenerate: { directory: 'case-studies' } }] },
 			],
 		}),

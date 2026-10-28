@@ -1,0 +1,235 @@
+---
+title: Consuming MCP from your agents
+description: Four ways to use MCP servers. A Python bridge into your own agent loop, the Claude API's MCP connector, the AI SDK's MCP client, and developer tools. Plus allow-lists and approvals on the host side.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="All 47 tools, all the time" severity="SEV3">
+Relay connected three MCP servers and passed every tool they offered (47 in total) to the model on every turn. Tool definitions alone were about 9,000 tokens per request. Worse, the third-party analytics server exposed `export_all_data`, and in one test conversation the model called it "to be thorough". Nobody had decided which tools Relay should actually have.
+</Incident>
+
+Connecting an MCP server is easy. Deciding **what the model may use, and with which checks**, is the engineering. That decision always belongs to the **host**: your application.
+
+<Diagram
+	caption="The host sits between the model and every MCP server: it filters tools, applies approval policy, and logs every call."
+	code={`flowchart LR
+    M["Model"] <--> H["Host (your app)<br/>allow-list, approvals,<br/>budgets, logging"]
+    H <--> A["MCP client to acme-ops"]
+    H <--> B["MCP client to acme-crm"]
+    H <--> C["MCP client to a<br/>third-party server"]`}
+/>
+
+## Option 1: a bridge into your own agent loop (Python)
+
+Your Module 6 loop works with any MCP server through a small bridge: list the server's tools, convert them to Claude tool definitions (**keeping only an allow-list**), and route tool calls back to the server. Tested against the acme-ops server in-process:
+
+```python
+# app/agents/mcp_bridge.py: use any MCP server's tools from your own agent loop
+import json
+
+from mcp import Client
+
+
+async def anthropic_tools(client: Client, allow: set[str]) -> list[dict]:
+    """Convert MCP tool definitions into Claude tool definitions, keeping only allow-listed tools."""
+    listed = await client.list_tools()
+    return [
+        {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
+        for t in listed.tools
+        if t.name in allow
+    ]
+
+
+async def run_mcp_tool(client: Client, tool_use_id: str, name: str, arguments: dict) -> dict:
+    """Execute one tool call on the MCP server and shape the result as a Claude tool_result."""
+    result = await client.call_tool(name, arguments)
+    if result.structured_content is not None:
+        content = json.dumps(result.structured_content)
+    else:
+        content = "\n".join(c.text for c in result.content if c.type == "text")
+    block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
+    if result.is_error:
+        block["is_error"] = True
+    return block
+```
+
+Real output:
+
+```text
+tools: [('get_shipment', ['shipment_id'])]
+{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': '{"shipment_id": "ACM-2025-000183", "status": "delayed", "location": "Antwerp", "eta": "2026-10-30"}'}
+{'type': 'tool_result', 'tool_use_id': 'toolu_2', 'content': "Error executing tool get_shipment: No shipment 'nope'. Check the ID format ACM-YYYY-NNNNNN or ask the customer.", 'is_error': True}
+```
+
+Notice that the server's `ToolError` arrives as an `is_error` tool result, so the model can recover (ask the customer for the right ID), exactly like errors from your own tools in Module 6. For production, connect with `Client("https://mcp.acme.example/mcp")` plus the user's token (lesson 4).
+
+## Option 2: the Claude API's MCP connector
+
+For **remote** servers, the Claude API can connect to the MCP server itself, server-side, so you don't write the bridge. You declare the server and a toolset that references it (beta):
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+response = client.beta.messages.create(
+    model="claude-opus-5-5",
+    max_tokens=16000,
+    betas=["mcp-client-2025-11-20"],
+    mcp_servers=[{
+        "type": "url",
+        "url": "https://mcp.acme.example/mcp",
+        "name": "acme-ops",
+        "authorization_token": user_access_token,  # the user's token, so the server enforces their permissions
+    }],
+    tools=[{
+        "type": "mcp_toolset",
+        "mcp_server_name": "acme-ops",
+        "default_config": {"enabled": False},          # allow-list mode: everything off by default...
+        "configs": {"get_shipment": {"enabled": True}},  # ...then enable only what Relay needs
+    }],
+    messages=[{"role": "user", "content": "Where is ACM-2025-000183?"}],
+)
+```
+
+The trade-off: less code, but the calls happen between the API and the MCP server, so the server must be reachable from the internet, and your own per-call approval hooks don't run in between. Use your own bridge when you need approvals on each call, private network access, or full logging control.
+
+## Option 3: the AI SDK's MCP client (TypeScript)
+
+In a TypeScript product (Module 2), `@ai-sdk/mcp` connects to a server and turns its tools into AI SDK tools. This snippet type-checks against AI SDK 7, and includes a defence from lesson 6 (detecting changed tool definitions):
+
+```ts
+// app/api/chat/route.ts (excerpt): Relay's TypeScript agent using Acme's MCP server
+import { anthropic } from '@ai-sdk/anthropic';
+import { createMCPClient } from '@ai-sdk/mcp';
+import { detectToolDrift, fingerprintTools, isStepCount, streamText, type ToolSet } from 'ai';
+
+declare function loadApprovedFingerprints(): Promise<Awaited<ReturnType<typeof fingerprintTools>>>;
+
+export async function answer(question: string, userToken: string) {
+	const mcpClient = await createMCPClient({
+		transport: {
+			type: 'http',
+			url: 'https://mcp.acme.example/mcp',
+			headers: { Authorization: `Bearer ${userToken}` }, // the USER's token, so the server enforces their permissions
+		},
+	});
+
+	const tools = await mcpClient.tools();
+	const drift = detectToolDrift(await fingerprintTools(tools), await loadApprovedFingerprints());
+	if (drift.changed.length || drift.added.length) {
+		await mcpClient.close();
+		throw new Error(`MCP tool definitions changed since review: ${[...drift.changed, ...drift.added].join(', ')}`);
+	}
+
+	return streamText({
+		model: anthropic('claude-opus-5-5'),
+		instructions: 'You are Relay, the support assistant for Acme Logistics.',
+		prompt: question,
+		tools: tools as ToolSet,
+		stopWhen: isStepCount(5),
+		onEnd: async () => {
+			await mcpClient.close();
+		},
+	});
+}
+```
+
+## Option 4: developer tools
+
+Developers can use the same servers from their tools. For example, Claude Code connects to a remote server with:
+
+```bash
+claude mcp add --transport http acme-ops https://mcp.acme.example/mcp
+```
+
+A project can also commit an MCP configuration file so the whole team gets the same servers. Check your host's documentation for the exact configuration format, which differs between hosts.
+
+## Host-side policy: what Relay actually allows
+
+| Server | Tools allowed for Relay | Policy |
+|---|---|---|
+| acme-ops | `get_shipment`, `search_shipments` | Auto-approve (read-only) |
+| acme-crm | `get_customer_overview`, `create_claim` | `create_claim` needs agent approval above 100 EUR |
+| analytics (third-party) | none | Not connected for Relay at all |
+
+Server **annotations** (`read_only_hint`, `destructive_hint`) are **hints from the server**, so useful but not trustworthy on their own. The host's own allow-list and approval policy decide. A malicious or buggy server can mark a destructive tool as read-only.
+
+<FailureCard
+	title="Tool bloat from MCP"
+	symptom="Per-request input tokens jump by 9,000 after connecting three MCP servers, and tool selection gets worse."
+	cause="Every tool from every server was passed to the model on every turn."
+	detect="Track tool-definition tokens per request, and tool-selection accuracy in evals."
+	fix="Allow-list per feature, load rarely used tools on demand (tool search or deferred loading), and keep definitions short."
+/>
+
+<FailureCard
+	title="Trusting the read-only label"
+	symptom="A tool marked `read_only_hint: true` by a third-party server actually modifies records."
+	cause="The host auto-approved anything annotated read-only. Annotations are self-reported by the server."
+	detect="Review third-party tools before enabling them; monitor upstream effects; fingerprint definitions (lesson 6)."
+	fix="Approval policy comes from the host's own reviewed configuration. Annotations can inform the review, never replace it."
+/>
+
+<ThinkFirst question="Relay's agent runs in Acme's private network and needs acme-ops (internal) plus a public weather MCP server. Which consumption option would you use for each, and why?">
+
+- **acme-ops (internal): your own bridge (option 1).** The server isn't reachable from the internet (and shouldn't be), you want per-call approval hooks and full logging in Relay, and Relay passes each user's token so permissions are enforced per user.
+- **Public weather server: either option works.** The Claude API's MCP connector (option 2) is simplest if the data isn't sensitive and you don't need per-call approvals. Your bridge is better if you want uniform logging and policies for every tool.
+
+The general rule: **the more sensitive the data or the action, the more you want the calls to pass through your own host code**, where approvals, logging and budgets live.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** connect your acme-ops server to an MCP host you use (Claude Code or another) and ask it a shipment question.
+- **Stretch:** plug the bridge into your Module 6 agent loop (an async version), with an allow-list per feature, and log every MCP call with timing.
+- **Boss level:** build Relay's **MCP gateway layer**: one place in the host that holds the server list, allow-lists per feature, approval policy per tool (independent of annotations), tool-definition fingerprints, and per-call audit logging. Every agent in Relay gets its MCP tools only through it.
+
+</Practice>
+
+<Quiz
+	id="m7-consume"
+	questions={[
+		{
+			q: 'Who should decide which MCP tools the model can use?',
+			options: ['The MCP server', 'The host application, with an explicit allow-list per feature', 'The model', 'Whoever installs the server'],
+			answer: 1,
+			why: 'Servers offer tools; hosts decide. Least privilege applies to tools too.',
+		},
+		{
+			q: 'When is your own bridge preferable to the Claude API\'s MCP connector?',
+			options: [
+				'Never',
+				'When the server is on a private network, or you need per-call approvals and full logging in your own code',
+				'When you want less code',
+				'When the server is public',
+			],
+			answer: 1,
+			why: 'The connector runs calls between the API and the server. Your bridge keeps them in your host, where your controls live.',
+		},
+		{
+			q: 'A third-party server marks a tool read_only_hint: true. Should the host auto-approve it?',
+			options: ['Yes, always', 'Not on that basis alone: annotations are self-reported hints; the host\'s reviewed policy decides', 'Only on weekends', 'Yes, if the server is popular'],
+			answer: 1,
+			why: 'A malicious or buggy server can mislabel tools. Trust your own review, not the label.',
+		},
+		{
+			q: 'What happens to a server-side ToolError in the bridge shown above?',
+			options: ['It crashes the agent', 'It becomes a tool_result with is_error: true, so the model can recover', 'It is silently dropped', 'It is shown to the user as a stack trace'],
+			answer: 1,
+			why: 'Errors flow back to the model as information, consistent with Module 6\'s loop.',
+		},
+	]}
+/>
+
+<LessonComplete id="mcp/consuming-mcp" />

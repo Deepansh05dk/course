@@ -1,0 +1,156 @@
+---
+title: Designing tools for models
+description: Tools are a user interface for a model. Naming, descriptions, task-shaped granularity, bounded outputs, errors that teach, too many tools, and how to evaluate tool designs.
+sidebar:
+  order: 3
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="get_customer vs get_customers vs fetch_customer_record" severity="SEV3">
+Acme's CRM MCP server grew to 38 tools, built by four developers. Three of them returned customer data, with slightly different names, inputs and outputs. The model picked the wrong one about 20% of the time, sometimes fetching all customers (2,000 rows) when it needed one. Nothing was "broken"; the tool set was confusing, and confusion has a measurable error rate.
+</Incident>
+
+A tool definition is a **prompt** and a **UI** at the same time. The model reads its name, description and schema to decide **whether**, **when** and **how** to call it. Designing tools well is one of the highest-leverage skills in agent engineering.
+
+## Seven principles
+
+### 1. Shape tools around tasks, not endpoints
+
+| Endpoint-shaped (hard for models) | Task-shaped (easy) |
+|---|---|
+| `GET /customers`, `GET /customers/{id}`, `GET /customers/{id}/shipments`, `GET /shipments/{id}/events` | `find_customer(query)`, `get_customer_overview(customer_id)` (profile + open shipments + open claims in one call) |
+
+Each call costs a round trip, tokens and a chance of error. A tool that does what an agent actually needs in one step is usually better than four primitives the agent must chain.
+
+### 2. Names and descriptions that disambiguate
+
+- Names: verb + object, consistent across the server (`get_shipment`, `search_shipments`, `create_claim`).
+- Descriptions say **what it does, when to use it, when not to, and what it returns**:
+
+> `search_shipments`: "Find shipments for ONE customer, filtered by status and date. Use when the customer asks about 'my shipments' without an ID. For a known shipment ID, use get_shipment instead. Returns at most `limit` results plus the total count."
+
+### 3. Inputs that are hard to get wrong
+
+- Enums instead of free text (`status: "in_transit" | "delayed" | "delivered"`).
+- Formats, patterns and ranges in the schema (`amount ≤ 5000`).
+- Sensible defaults (`limit=20`), and nothing the model can't know (no internal database IDs it has never seen).
+- Make the identifier the one the **user** uses (the shipment number on their label), not an internal key.
+
+### 4. Bounded, relevant outputs
+
+- Return **only the fields** the model needs, in a predictable structure.
+- **Paginate** and report totals ("showing 20 of 340; refine by status or date").
+- Offer a `detail` or `format` parameter when sometimes a summary is enough and sometimes the full record is needed.
+- Prefer human-meaningful values ("2026-10-30", "Antwerp") over internal codes.
+
+### 5. Errors that teach
+
+| Unhelpful | Teaches the model what to do |
+|---|---|
+| `404` | "No shipment 'ACM-183'. IDs look like ACM-2025-000183. Ask the customer to check their label." |
+| `Validation error` | "`since` must be an ISO date like 2026-10-01. You sent 'last week'." |
+| `Rate limited` | "Too many requests. Retry after 30 seconds, or narrow the search to fewer customers." |
+
+### 6. Safe by construction
+
+- Separate **read** tools from **write** tools, and annotate them honestly (`read_only_hint`, `destructive_hint`, `idempotent_hint`).
+- Put **limits and policy checks in the server**, not just in the model's instructions (max refund amount, own-customer-only).
+- Accept an **idempotency key** for every write tool.
+- Leave dangerous operations out entirely (no `delete_customer` for a support agent).
+
+### 7. Fewer, better tools
+
+Every tool definition costs context tokens on every turn, and every extra tool adds a chance to pick the wrong one. Consolidate overlapping tools. When a host really needs dozens of tools (many MCP servers), use the host's tool-search or deferred-loading features so only relevant tool definitions are loaded (the [Claude Code case study](/case-studies/claude-code/) shows this in practice).
+
+## Evaluate your tools
+
+Tool design is testable, using Module 5's methods:
+
+1. Write 20–30 realistic tasks for the agent.
+2. Run them and record **which tools were called with which arguments**.
+3. Measure: right tool chosen? valid arguments on the first try? number of calls per task? tokens spent on tool outputs?
+4. Read the failures. They point directly at names, descriptions or schemas to fix.
+5. Change one thing at a time and re-run.
+
+A useful trick: **ask the model to critique your tool definitions** ("What's ambiguous here? When would you pick the wrong tool?"). Models are good at spotting confusing descriptions, and it's cheap.
+
+<FailureCard
+	title="The overlapping trio"
+	symptom="get_customer, get_customers and fetch_customer_record are chosen inconsistently; 1 in 5 tasks uses the wrong one."
+	cause="Overlapping tools with near-identical names and vague descriptions, added by different people over time."
+	detect="Tool-selection accuracy in agent evals, and a periodic review of the tool list as a whole."
+	fix="Consolidate into one well-described tool (with a `detail` parameter if needed), deprecate the others, and make tool-set changes part of design review."
+/>
+
+<FailureCard
+	title="Retry storms from vague errors"
+	symptom="Agents call the same failing tool with slight variations 6–8 times before giving up."
+	cause="Errors said 'invalid request' without saying what was wrong, so the model guessed."
+	detect="Count consecutive failed calls to the same tool in traces."
+	fix="Specific, actionable error messages (what was wrong, the expected format, what to do next), plus the repeat breaker from Module 6."
+/>
+
+<ThinkFirst question="Design the tool set (names, one-line descriptions, key parameters) for Relay to handle claims for damaged goods. Aim for the smallest set that covers: checking a shipment, seeing the customer's tier and previous claims, checking the policy, creating a claim, and requesting photos.">
+
+A compact, task-shaped set of five tools:
+
+1. **`get_shipment(shipment_id)`**: live status, contents category (e.g. fragile), insured yes/no, delivery date. Read-only.
+2. **`get_customer_overview(customer_id)`**: tier, contract exceptions, and the last 5 claims with outcomes. Read-only, bounded.
+3. **`search_policies(query)`**: top 5 policy passages with section and effective date (Module 4). Read-only.
+4. **`create_claim(shipment_id, damage_description, photo_ids, requested_amount, idempotency_key)`**: validates in the server (within 48 hours? photos present? amount ≤ cap for tier?) and returns a claim ID, or an error that explains what's missing. The amount is a **request**; approval stays with humans (Module 2).
+5. **`request_customer_photos(shipment_id, message)`**: sends the standard photo request. Idempotent per shipment per day.
+
+What's deliberately **not** there: a generic CRM query tool, a refund tool (refunds follow approved claims in a separate flow), and anything that deletes.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** review the tool list of an MCP server you use. Rewrite the two weakest descriptions using the template above.
+- **Stretch:** write 20 tasks for your acme-ops server, run them through your agent, and measure tool-selection accuracy and first-try argument validity.
+- **Boss level:** run a **tool-design A/B**: two versions of the tool set (endpoint-shaped vs task-shaped) on the same 20 tasks. Report success rate, calls per task and tokens per task. Publish the before/after definitions with the numbers.
+
+</Practice>
+
+<Quiz
+	id="m7-tool-design"
+	questions={[
+		{
+			q: 'Why prefer task-shaped tools over one tool per API endpoint?',
+			options: [
+				'Endpoints are deprecated',
+				'Fewer calls, fewer tokens, and fewer chances to chain primitives wrongly, so the model does what it actually needs in one step',
+				'MCP forbids REST',
+				'They are easier to write',
+			],
+			answer: 1,
+			why: 'Tools should match the agent\'s tasks. Every extra hop is latency, cost and a chance of error.',
+		},
+		{
+			q: 'Which error message helps a model recover best?',
+			options: ['"400"', '"Invalid input"', '"since must be an ISO date like 2026-10-01; you sent \'last week\'"', '"Error"'],
+			answer: 2,
+			why: 'Say what was wrong, the expected format, and what to do next.',
+		},
+		{
+			q: 'Where should a refund cap of 5,000 EUR be enforced?',
+			options: ['Only in the system prompt', 'In the tool\'s schema and in the server\'s own policy check', 'In the UI', 'Nowhere, the model is careful'],
+			answer: 1,
+			why: 'Instructions influence; servers enforce. Limits belong in code at the boundary.',
+		},
+		{
+			q: 'A host connects 12 MCP servers with 200 tools in total. What helps most?',
+			options: ['Put all 200 definitions in every request', 'Tool search or deferred loading, so only relevant tool definitions enter the context', 'Remove all descriptions', 'Use a smaller model'],
+			answer: 1,
+			why: 'Tool definitions cost tokens every turn and dilute selection. Load them on demand.',
+		},
+	]}
+/>
+
+<LessonComplete id="mcp/tool-design" />

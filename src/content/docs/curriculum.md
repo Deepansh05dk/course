@@ -119,24 +119,21 @@ You build one product the whole way through, like a real FDE engagement. *Acme L
 ### Phase 4: Agents
 
 #### Module 6 · Tools, Workflows & Agents *(weeks 12–14)*
-- Tool calling from first principles: you write the loop
-- Workflows vs agents, and the "do you need an agent?" checklist
-- Patterns: chaining, routing, parallelization, orchestrator–workers, evaluator–optimizer
-- The ReAct cycle (thought → action → observation) and self-correction from tool errors
-- **Harness engineering:** tool design, context management/compaction, stop conditions
-- **Circuit breakers:** max iterations, token/$ budgets, repeated-action (cycle) detection
-- Memory: scratchpads, rolling summaries, long-term episodic memory, and what never to store
-- **Stateful graphs with LangGraph:** typed state, nodes, conditional edges, supervisor multi-agent, `interrupt` for approvals, Postgres checkpoints, and time-travel replay
-- Durable execution and idempotency; framework comparison (LangGraph, PydanticAI, OpenAI Agents SDK, Claude Agent SDK, AI SDK agents, managed agents)
-- Multi-agent: when it helps, and when it only multiplies cost
+1. [Tool calling from first principles](/agents/tool-calling-from-scratch/): the loop by hand, parallel calls, error results, stop reasons, circuit breakers (tested)
+2. [Workflows vs agents](/agents/workflows-vs-agents/): the checklist, plus chaining, routing, parallelization, orchestrator–workers, evaluator–optimizer
+3. [Harness engineering](/agents/harness-engineering/): tool design, context management and compaction (cost simulator), budgets, verification
+4. [Memory](/agents/memory/): working, session and long-term memory; extraction with filters; privacy and memory poisoning
+5. [Durable agents and human approval](/agents/durable-agents/): checkpoints, idempotent side effects, durable waits, re-validation
+6. [Stateful agent graphs with LangGraph](/agents/langgraph/): typed state, conditional edges, `interrupt` approvals that survive restarts (tested across processes)
+7. [Frameworks and multi-agent systems](/agents/frameworks-and-multi-agent/): choosing a framework, when multiple agents help, and the Module 6 lab
 
 #### Module 7 · MCP & Enterprise Integrations *(week 15)*
-- The Model Context Protocol: tools, resources, prompts, transports
-- Build MCP servers in Python for an internal API and a database
-- Remote MCP: OAuth, multi-tenancy, rate limits
-- Tool design for models: names, descriptions, recoverable errors
-- Consuming MCP from your Python agent **and** from the AI SDK
-- Enterprise integration: SSO, least-privilege scopes, legacy systems; agent-to-agent protocols (overview)
+1. [What MCP is, and why it won](/mcp/what-is-mcp/): hosts, clients, servers; tools, resources, prompts; transports; the wire protocol
+2. [Build an MCP server in Python](/mcp/build-mcp-server/): the official SDK v2 (`MCPServer`), structured outputs, errors, in-process tests, stdio and HTTP
+3. [Designing tools for models](/mcp/tool-design/): task-shaped tools, descriptions, bounded outputs, errors that teach, tool evals
+4. [Remote MCP servers and authentication](/mcp/remote-and-auth/): OAuth resource servers, discovery, audience-bound tokens, per-user authorization, no token passthrough
+5. [Consuming MCP from your agents](/mcp/consuming-mcp/): a Python bridge, the Claude API MCP connector, the AI SDK MCP client, host-side policy
+6. [MCP security and enterprise integration](/mcp/security-and-enterprise/): tool poisoning, rug pulls, cross-server exfiltration, legacy systems, A2A, and the Module 7 lab
 
 #### Module 8 · Safe Tool Execution & AI Security *(weeks 16–17)*
 - Why `exec()` on model output is a breach waiting to happen: fork bombs, credential theft, disk wipes
@@ -225,5 +222,7 @@ Every capstone ships with a public URL, an eval report, and a **post-mortem of w
 | Module 3 · Embeddings & Vector Search | ✅ Ready |
 | Module 4 · Production RAG | ✅ Ready |
 | Module 5 · Evals & CI | ✅ Ready |
+| Module 6 · Tools, Workflows & Agents | ✅ Ready |
+| Module 7 · MCP & Enterprise Integrations | ✅ Ready |
 | Case study C1 · Claude Code | ✅ Ready |
-| Modules 6–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |
+| Modules 8–12, electives, C2–C3, capstones | 📝 Planned (outlined above) |

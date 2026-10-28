@@ -1,0 +1,237 @@
+---
+title: Remote MCP servers and authentication
+description: Serving MCP over HTTP to many users. OAuth roles, discovery via protected resource metadata, scopes, audience-bound tokens, per-user authorization inside tools, and the token-passthrough trap.
+sidebar:
+  order: 4
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The service account that could see everything" severity="SEV1">
+Acme's first remote MCP server for the CRM authenticated with one shared API key, and internally called the CRM with a super-user service account. Every connected AI app (and every user of those apps) could read every customer, including other business units' key accounts. An intern's Claude Code session pulled a competitor-sensitive account list into a notebook. The server was "authenticated". It just didn't know **who** was asking.
+</Incident>
+
+A local stdio server runs with the permissions of the person who launched it. A **remote** server is shared by many users and apps, so it must answer two questions on every request: **who is calling** (authentication) and **what are they allowed to do** (authorization).
+
+## The OAuth roles in MCP
+
+MCP's authorization model builds on OAuth 2.1. Map the roles:
+
+| OAuth role | In MCP | At Acme |
+|---|---|---|
+| **Resource server** | The MCP server | `https://mcp.acme.example/mcp` |
+| **Authorization server** | Your identity provider (IdP) | Acme's SSO (Okta, Entra ID, Auth0, Keycloak…) |
+| **Client** | The MCP client inside the host | Relay, Claude Code, the sales assistant |
+| **Resource owner** | The user | Jane, a support agent |
+
+<Diagram
+	caption="Discovery and token flow. The MCP server never sees the user's password; it validates tokens issued by the identity provider."
+	code={`sequenceDiagram
+    participant C as MCP client (host)
+    participant M as MCP server
+    participant A as Authorization server (SSO)
+    C->>M: request without a token
+    M-->>C: 401 + WWW-Authenticate: resource_metadata=".../.well-known/oauth-protected-resource/mcp"
+    C->>M: GET protected resource metadata
+    M-->>C: {resource, authorization_servers: [SSO], scopes_supported}
+    C->>A: OAuth authorization (user signs in, PKCE), asking for a token for THIS resource
+    A-->>C: access token (audience = MCP server, scopes)
+    C->>M: request + Authorization: Bearer token
+    M->>M: verify signature, expiry, audience, scopes
+    M-->>C: result, computed with Jane's permissions`}
+/>
+
+## An MCP server as a resource server
+
+The v2 Python SDK supports this directly: you provide a **token verifier** (in production, JWT validation against your IdP) and auth settings. This example was run over HTTP for this lesson:
+
+```python
+# mcp_servers/acme_ops_remote.py: the same tools, served remotely, as an OAuth resource server
+from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver.exceptions import ToolError
+
+RESOURCE_URL = "http://127.0.0.1:8812/mcp"
+
+
+class IdpTokenVerifier(TokenVerifier):
+    """Validate tokens issued by Acme's identity provider (in production: verify the JWT
+    signature, expiry, issuer, and that the audience is THIS server)."""
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        demo_tokens = {  # stand-in for JWT validation, for this local test only
+            "tok-agent-jane": AccessToken(token=token, client_id="relay", scopes=["shipments:read"],
+                                          subject="jane@acme.example", resource=RESOURCE_URL),
+            "tok-other-audience": AccessToken(token=token, client_id="relay", scopes=["shipments:read"],
+                                              subject="jane@acme.example", resource="https://other.example/mcp"),
+        }
+        return demo_tokens.get(token)
+
+
+mcp = MCPServer(
+    "acme-ops",
+    token_verifier=IdpTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url="https://login.acme.example",   # the authorization server clients get tokens from
+        resource_server_url=RESOURCE_URL,          # this server's identity (token audience)
+        required_scopes=["shipments:read"],
+        validate_token_resource=True,              # reject tokens issued for a different server
+    ),
+)
+
+
+@mcp.tool()
+def whoami() -> str:
+    """Return the authenticated user (demonstrates per-user context inside tools)."""
+    token = get_access_token()
+    if token is None:
+        raise ToolError("Not authenticated")
+    return f"{token.subject} via {token.client_id} with scopes {token.scopes}"
+
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=8812, stateless_http=True)
+```
+
+What happened when we called it:
+
+```text
+$ curl -i -X POST http://127.0.0.1:8812/mcp  (no Authorization header)
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer error="invalid_token", error_description="Authentication required", resource_metadata="http://127.0.0.1:8812/.well-known/oauth-protected-resource/mcp"
+
+$ curl http://127.0.0.1:8812/.well-known/oauth-protected-resource/mcp
+{"resource":"http://127.0.0.1:8812/mcp","authorization_servers":["https://login.acme.example"],"scopes_supported":["shipments:read"],"bearer_methods_supported":["header"]}
+
+$ python test_client.py  (valid token, then a token for another server, then garbage)
+valid token -> jane@acme.example via relay with scopes ['shipments:read']
+tok-other-audience -> rejected: HTTP 401
+garbage -> rejected: HTTP 401
+```
+
+| Request | Result |
+|---|---|
+| No token | `401`, with a pointer to the protected resource metadata (so clients can discover where to log in) |
+| Valid token for this server | Tool runs; `get_access_token()` gives the tool the **user's identity and scopes** |
+| Valid token issued for a **different** server | Rejected (`validate_token_resource=True`): the audience doesn't match |
+| Garbage token | Rejected |
+
+## Per-user authorization inside tools
+
+Authentication tells you **who**; your tools must still decide **what they may see**:
+
+- Use the token's subject (and groups or roles from claims) to scope every query: Jane sees her business unit's customers, nothing else (the same principle as permission-aware retrieval in Module 4).
+- Check **scopes** per tool (`shipments:read` for lookups, `claims:write` for `create_claim`).
+- Log every call with the user identity for auditing.
+
+## The token-passthrough trap
+
+The MCP server often has to call **upstream** APIs (the CRM). The tempting shortcut is to forward the token the client sent. Don't:
+
+- That token's **audience** is the MCP server, not the CRM. Forwarding it breaks the audience model, and a server that accepts tokens meant for someone else can be abused.
+- It creates a **confused deputy**: the upstream API can't tell which service is really acting, and policies, rate limits and audit trails stop meaning anything.
+
+Instead, the MCP server calls upstream APIs with **its own credentials**, scoped down, passing the user's identity for authorization checks, or uses a proper **token exchange** with the IdP to get a token for the upstream API on the user's behalf.
+
+## Operating a remote server
+
+| Concern | Practice |
+|---|---|
+| **Transport security** | HTTPS only; for local HTTP servers, bind to localhost and keep the SDK's DNS-rebinding protection on |
+| **Rate limits and quotas** | Per client and per user, to protect upstream systems from looping agents |
+| **Statelessness** | The latest protocol revision is stateless, which makes horizontal scaling straightforward (stateless HTTP mode) |
+| **Versioning** | Tool definitions change deliberately, with notice. Clients may pin and fingerprint them (lesson 6) |
+| **Observability** | Per-tool latency, error rates, and calls per user and client (Module 9) |
+
+<FailureCard
+	title="The shared API key"
+	symptom="Every user of every connected app can read every customer through the MCP server."
+	cause="One static API key authenticated the *app*, not the *user*, and the server called the CRM as a super-user."
+	detect="Ask: can this server tell which human is asking, and does it enforce that human's permissions? Test it with two users who have different access."
+	fix="OAuth with user-level tokens from the company IdP, and per-user authorization inside tools. Service accounts get least privilege."
+/>
+
+<FailureCard
+	title="Tokens for anyone, accepted by everyone"
+	symptom="A token issued to a low-risk MCP server is replayed against the high-privilege CRM MCP server, and accepted."
+	cause="Servers checked only the signature and expiry of tokens, not the **audience**. Any valid company token worked everywhere."
+	detect="A negative test: present a validly signed token for another resource. It must be rejected."
+	fix="Request tokens for a specific resource, and validate the audience in every server (`validate_token_resource` or your JWT library's audience check)."
+/>
+
+<ThinkFirst question="Acme's IT security team asks: 'If we let Claude Code and Relay connect to our CRM MCP server, how do we know an AI isn't seeing data the user couldn't see themselves?' What do you answer, and what evidence would you offer?">
+
+**The answer:** the AI acts **as the user**, never with more access than the user has.
+
+1. **User-level OAuth through Acme's SSO:** every MCP request carries a token for that specific user, with scopes, issued by Acme's own identity provider. No shared keys.
+2. **Audience-bound tokens:** tokens are issued for the CRM MCP server specifically and rejected elsewhere.
+3. **Per-user authorization in every tool:** queries are filtered by the user's business unit and roles, exactly like the CRM's own UI.
+4. **No token passthrough:** the MCP server calls the CRM with its own least-privilege credentials, enforcing the user's permissions itself.
+5. **Audit logs:** every tool call is recorded with the user's identity, the arguments and the result status, available to the security team.
+
+**Evidence:** an automated test suite with test users of different roles proving they can't see each other's data (including canary records), the negative audience test, and a sample of audit logs. Security teams trust tests and logs, not assurances.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** run the server above, `curl` it without a token, and read the metadata your client would use to find the authorization server.
+- **Stretch:** replace the demo verifier with real JWT validation (e.g. against a free Auth0 or Keycloak tenant): signature, expiry, issuer, audience, and scopes per tool.
+- **Boss level:** add per-user authorization to acme-ops (users only see their business unit's customers), scope checks per tool, audit logging, and a test suite with two users and canary records proving isolation.
+
+</Practice>
+
+<Quiz
+	id="m7-auth"
+	questions={[
+		{
+			q: 'In MCP\'s OAuth model, what is the MCP server?',
+			options: ['The authorization server', 'The resource server that validates tokens', 'The OAuth client', 'The identity provider'],
+			answer: 1,
+			why: 'The MCP server protects resources and validates tokens issued by your identity provider.',
+		},
+		{
+			q: 'Why validate the token\'s audience?',
+			options: [
+				'It makes requests faster',
+				'So a token issued for one server can\'t be replayed against another',
+				'The spec forbids signatures',
+				'To reduce token size',
+			],
+			answer: 1,
+			why: 'Audience binding limits the blast radius of any single token.',
+		},
+		{
+			q: 'Your MCP server needs to call the CRM API. What should it NOT do?',
+			options: [
+				'Use its own least-privilege credentials',
+				'Forward the client\'s MCP access token to the CRM (token passthrough)',
+				'Enforce the user\'s permissions',
+				'Log the call',
+			],
+			answer: 1,
+			why: 'Token passthrough breaks the audience model and creates a confused deputy. Use the server\'s own credentials or a proper token exchange.',
+		},
+		{
+			q: 'How does an MCP client find out where to get a token?',
+			options: [
+				'It guesses',
+				'From the 401 response\'s pointer to the server\'s protected resource metadata, which lists the authorization servers',
+				'From the tool descriptions',
+				'From the user\'s browser history',
+			],
+			answer: 1,
+			why: 'Discovery is part of the protocol: the 401 points to the metadata, and the metadata points to the authorization server.',
+		},
+	]}
+/>
+
+<LessonComplete id="mcp/remote-and-auth" />

@@ -1,0 +1,184 @@
+---
+title: Durable agents and human approval
+description: Making agents survive crashes, deploys and multi-day human approvals. Checkpoints, idempotent side effects, resuming safely, and where approval gates belong in backend agents.
+sidebar:
+  order: 5
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import IncidentDrill from '../../../components/IncidentDrill.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The deploy that refunded twice" severity="SEV1">
+Relay's refund agent ran inside the web server process. A deploy restarted the servers while 14 refund tasks were mid-flight. The retry logic restarted those tasks **from the beginning**. Six of them had already issued the refund before the restart, and issued it again after. The payments API had no idempotency key. Total double-payments: 2,340 EUR, discovered by finance a week later.
+</Incident>
+
+A chat answer that fails can simply be retried. An agent that **takes actions over minutes, hours or days** (waiting for a human approval on Friday that comes on Monday) needs to survive crashes, deploys and restarts **without repeating its side effects**. That's **durable execution**.
+
+## The core ideas
+
+| Idea | What it means | Relay example |
+|---|---|---|
+| **Checkpointing** | Save the agent's state after every step, in a database | After "assess" and after "approve", state is persisted |
+| **Resume, don't restart** | After a crash, continue from the last checkpoint | The refund task resumes at "issue_refund", not at "assess" |
+| **Idempotent side effects** | Repeating a step can't repeat its effect | The payments API dedupes on an idempotency key |
+| **Durable waits** | Waiting for a human doesn't hold a process or a thread | The approval can take 3 days; nothing is running meanwhile |
+| **Exactly-once illusion** | "At least once" execution + idempotency = effectively once | Retries are safe by construction |
+
+<Diagram
+	caption="A durable refund task. Each step's result is checkpointed; the approval wait holds no running process; the side effect is idempotent."
+	code={`sequenceDiagram
+    participant W as Worker
+    participant DB as Checkpoint store
+    participant H as Human (approval UI)
+    participant P as Payments API
+    W->>DB: step "assess" done (amount 340)
+    W->>DB: step "approve": waiting for human
+    Note over W: worker exits, nothing running
+    H->>DB: approved (Monday 09:12)
+    DB-->>W: resume thread ticket-8812 at "approve"
+    W->>P: refund(idempotency_key="refund:ACM-183:340")
+    Note over W: crash here!
+    DB-->>W: resume again at "issue_refund"
+    W->>P: refund(same key)
+    P-->>W: already processed: returns the same refund ID
+    W->>DB: step "issue_refund" done`}
+/>
+
+## Where idempotency keys come from
+
+The key must identify **the logical action**, and be identical every time that action is retried, **in any process**:
+
+- ✅ `refund:{ticket_id}:{shipment_id}:{amount}`, or an ID generated once and saved in the checkpoint **before** the call.
+- ❌ A random UUID generated inside the retried step: every retry gets a new key, so no deduplication.
+- ❌ Python's built-in `hash()` of a string: it's **randomized per process**, so after a restart the same action gets a different key. (This exact bug was caught while testing this lesson's example. Use `hashlib`.)
+
+## Tools for durable execution
+
+| Option | Model | Good for |
+|---|---|---|
+| **LangGraph checkpointers** (SQLite, Postgres) | State saved after each graph step; `interrupt` for human input | Agent workflows in Python (next lesson) |
+| **Temporal** (and similar workflow engines) | Workflows as code; every step's result recorded in an event history and replayed after crashes | Long-running, business-critical processes with many external calls |
+| **A job queue + database state** | You checkpoint manually; workers pick up resumable tasks | Simple flows where you want full control |
+| **Managed agent platforms** | The provider hosts the loop and session state | Hosted agents where that fits your data and control requirements |
+
+## Human approval in backend agents
+
+In [Module 2](/ai-ux/human-in-the-loop/) you designed approval **UX**. In the backend, an approval is a **durable pause**:
+
+1. The agent reaches a gated action and records a pending approval (what, why, evidence) in the database.
+2. The task **stops**, with no thread blocked, no open connection.
+3. The approval UI shows the request; a human approves, edits or denies it, and the decision is stored with who and when.
+4. The decision **resumes** the task from its checkpoint, with the decision as input.
+5. Approvals **expire**: an unanswered approval after N days escalates or cancels, so nothing silently executes months later.
+
+<FailureCard
+	title="Approval of a stale request"
+	symptom="A refund approved on Monday was issued, but the customer had cancelled the claim on Saturday."
+	cause="The approval resumed the task with the state captured on Friday. Nothing re-checked the world before acting."
+	detect="Compare the state at approval time with the current state of the claim in the system of record."
+	fix="Re-validate preconditions right before executing the side effect (is the claim still open? is the amount still right?), and expire old approvals."
+/>
+
+<FailureCard
+	title="The side effect before the pause"
+	symptom="Every approved refund sends the customer two 'we are reviewing your refund' emails."
+	cause="The email was sent in the same step as the approval pause. On resume, that step re-ran from the start, sending the email again."
+	detect="Count side effects per task in traces; duplicates of anything around a pause are a red flag."
+	fix="Put side effects in their own steps **after** the pause, or make them idempotent. In LangGraph specifically, a node re-runs from the top when it resumes from `interrupt` (next lesson)."
+/>
+
+<IncidentDrill
+	id="durable-drill"
+	title="Replay the deploy that refunded twice"
+	start="s1"
+	nodes={{
+		s1: {
+			text: 'Finance reports 6 double refunds, all at 14:02 Tuesday, which was a deploy. The agent runs inside the web servers. First action?',
+			choices: [
+				{ label: 'Freeze deploys of the agent service until fixed, and reconcile: list all refunds issued twice for the same ticket', next: 's2', cost: 5 },
+				{ label: 'Disable retries in the agent', next: 's1b', cost: 30, note: 'No more doubles, but now refunds interrupted by a deploy are silently never issued.' },
+				{ label: 'Ask customers to return the extra money', next: 'end_bad', cost: 60, note: 'Before knowing the full scope, and without fixing the cause.' },
+			],
+		},
+		s1b: { text: 'Now some refunds silently vanish during deploys. Customers complain. Next?', choices: [{ label: 'Re-enable retries, freeze deploys, and reconcile', next: 's2', cost: 5 }] },
+		s2: {
+			text: 'Scope found: 6 doubles, 2,340 EUR. What is the root-cause fix?',
+			choices: [
+				{ label: 'Idempotency keys on every payment call, derived from the logical action, plus checkpointed steps so tasks resume instead of restarting', next: 's3', cost: 0 },
+				{ label: 'Only deploy at night', next: 'end_ok', cost: 0, note: 'It reduces the odds; a crash at 3 a.m. still doubles a refund.' },
+			],
+		},
+		s3: {
+			text: 'Fixed. How do you prove it stays fixed?',
+			choices: [
+				{ label: 'A chaos test in CI: kill the worker at random points during refund tasks and assert exactly one refund per task', next: 'end_good', cost: 0 },
+				{ label: 'Code review is enough', next: 'end_ok', cost: 0, note: 'Reviews miss timing bugs. A test makes it impossible to regress silently.' },
+			],
+		},
+		end_good: { text: 'Contained, scoped, fixed at the root (idempotency + durable resume), and protected with a chaos test.', end: 'good' },
+		end_ok: { text: 'Better, but the system still relies on luck or on review instead of guarantees.', end: 'ok' },
+		end_bad: { text: 'You acted on customers before understanding the scope or fixing the cause.', end: 'bad' },
+	}}
+/>
+
+<ThinkFirst question="An approval for a 2,000 EUR refund has been pending for 9 days. What should the system do, and how should that behaviour be designed up front?">
+
+Design approvals as **records with a lifecycle**, not open-ended waits:
+
+1. **Expiry policy, decided up front:** for example, a reminder after 24 hours, escalation to a supervisor after 3 days, and auto-cancel with notification after 7 days. A 9-day-old approval should already have been handled.
+2. **Re-validation on approval:** even if someone approves on day 9, re-check the preconditions (claim still open, amount unchanged, customer still eligible) before executing.
+3. **Customer communication:** the customer shouldn't wait silently. The agent can send a "still under review" update, as an idempotent, durable step.
+4. **Monitoring:** a dashboard of pending approvals by age, and an alert on any older than the policy allows.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** list every side effect your Relay agent can cause, and write the idempotency key for each.
+- **Stretch:** add a `pending_approvals` table and an approval endpoint; make the agent pause on refunds over $100 and resume when the approval arrives (next lesson shows a LangGraph version).
+- **Boss level:** write a **chaos test**: run 50 refund tasks while randomly killing the worker process, then assert exactly one refund per task in a fake payments service. Keep it in CI.
+
+</Practice>
+
+<Quiz
+	id="m6-durable"
+	questions={[
+		{
+			q: 'What makes "at least once" execution safe for side effects?',
+			options: ['Faster servers', 'Idempotency: repeating the step can\'t repeat its effect', 'Fewer retries', 'Longer timeouts'],
+			answer: 1,
+			why: 'Retries are inevitable in distributed systems. Idempotency makes them harmless.',
+		},
+		{
+			q: 'Which idempotency key is correct for a refund?',
+			options: [
+				'A new UUID generated each time the step runs',
+				'A key derived from the logical action (ticket, shipment, amount), or one generated once and checkpointed',
+				'Python hash() of the ticket text',
+				'The current timestamp',
+			],
+			answer: 1,
+			why: 'The key must be identical on every retry, in any process. Random UUIDs, timestamps and per-process hashes all change.',
+		},
+		{
+			q: 'A human approves an action 5 days after it was requested. What must happen before executing?',
+			options: ['Nothing, it\'s approved', 'Re-validate the preconditions against the current state of the systems of record', 'Ask the model again', 'Restart the whole task'],
+			answer: 1,
+			why: 'The world changes while you wait. Re-check, then act.',
+		},
+		{
+			q: 'Why should waiting for a human not hold a running process?',
+			options: ['It is slower', 'Waits can last days; processes crash and get redeployed. The state must live in a database and resume later', 'Humans prefer it', 'It doesn\'t matter'],
+			answer: 1,
+			why: 'Durable waits are checkpoints, not sleeping threads.',
+		},
+	]}
+/>
+
+<LessonComplete id="agents/durable-agents" />

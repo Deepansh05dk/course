@@ -1,0 +1,238 @@
+---
+title: Tool calling from first principles
+description: How tool use actually works on the wire, the agent loop written by hand, parallel calls, error results, stop reasons, and the circuit breakers every loop needs.
+sidebar:
+  order: 1
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import AgentStepper from '../../../components/AgentStepper.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The 3 a.m. loop" severity="SEV2">
+Relay's first agent prototype ran overnight in a batch job. One ticket mentioned a shipment ID with a typo. The agent called `get_shipment`, got "not found", tried again with the same ID, got "not found", and did that **1,140 times** until the job's 6-hour timeout. The cost of that one ticket was higher than the rest of the batch combined. The loop had no turn limit, no budget, and no detection of repeated calls.
+</Incident>
+
+Frameworks hide the agent loop. Before using one, you'll write it yourself, because when an agent misbehaves in production, you need to know exactly what happens on every turn.
+
+## How tool use works
+
+The model never runs code. It **asks** you to run a tool by returning a structured request; **your code** executes it and sends the result back. Then the model continues.
+
+<AgentStepper
+	title="One tool round trip, as raw messages"
+	steps={[
+		{ kind: 'user', title: 'Request 1 → model', body: 'messages: [user: "Where is ACM-2025-000183?"]\ntools: [get_shipment {shipment_id: string}]' },
+		{ kind: 'model', title: 'Response 1: stop_reason = "tool_use"', body: 'content: [text: "Let me check.", tool_use {id: "toolu_01", name: "get_shipment", input: {shipment_id: "ACM-2025-000183"}}]' },
+		{ kind: 'harness', title: 'Your code runs the tool', body: 'handlers["get_shipment"](shipment_id="ACM-2025-000183") → "delayed, Antwerp, ETA 30 Oct"' },
+		{ kind: 'tool_call', title: 'Request 2 → model', body: 'messages: [user: question, assistant: (response 1 content, unchanged), user: [tool_result {tool_use_id: "toolu_01", content: "delayed, Antwerp, ETA 30 Oct"}]]' },
+		{ kind: 'tool_result', title: 'Response 2: stop_reason = "end_turn"', body: '"Your shipment is in Antwerp and running a day late. The new ETA is 30 October."' },
+	]}
+/>
+
+Three rules that cause most bugs when broken:
+
+1. **Append the assistant's content unchanged**, including its `tool_use` blocks (and any thinking blocks), before the results.
+2. **Every `tool_use` gets a `tool_result` with the matching `tool_use_id`.**
+3. **When the model makes several calls in one turn, return all the results in one user message.** Splitting them across messages quietly teaches the model to stop making parallel calls.
+
+## A tool definition
+
+```python
+GET_SHIPMENT = {
+    "name": "get_shipment",
+    "description": (
+        "Look up the live status of ONE shipment by ID. Returns status, location and ETA. "
+        "Use this whenever the customer mentions a shipment ID. Read-only."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "shipment_id": {"type": "string", "description": "Format ACM-YYYY-NNNNNN, exactly as written by the customer"},
+        },
+        "required": ["shipment_id"],
+        "additionalProperties": False,
+    },
+    "strict": True,  # guarantees the input matches the schema
+}
+```
+
+The description is a **prompt**: it tells the model when to use the tool and what it returns. Lesson 3 and Module 7 cover tool design in depth.
+
+## The loop, with circuit breakers
+
+This is the loop you'll reuse. It's deliberately small, and it handles the things that go wrong in production: stop reasons, tool errors, parallel calls, and three circuit breakers (turns, token budget, repeated calls).
+
+```python
+# app/agents/loop.py: a minimal, production-minded agent loop
+import hashlib
+import json
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Budget:
+    max_turns: int = 8                 # model calls per task
+    max_input_tokens: int = 200_000    # summed across turns (history is re-sent every turn)
+    max_repeats: int = 2               # identical tool calls allowed before we stop
+
+
+@dataclass
+class AgentResult:
+    text: str
+    stopped_by: str                    # "end_turn" | "max_turns" | "budget" | "repeat" | "max_tokens" | "refusal"
+    turns: int
+    input_tokens: int
+    tool_calls: list[dict] = field(default_factory=list)
+
+
+def run_agent(client, *, model: str, system: str, tools: list[dict],
+              handlers: dict[str, Callable[..., str]], user_message: str,
+              budget: Budget = Budget()) -> AgentResult:
+    messages = [{"role": "user", "content": user_message}]
+    seen: dict[str, int] = {}
+    used_tokens, calls = 0, []
+
+    for turn in range(1, budget.max_turns + 1):
+        response = client.messages.create(model=model, max_tokens=16000, system=system,
+                                          tools=tools, messages=messages)
+        used_tokens += response.usage.input_tokens
+        text = "".join(b.text for b in response.content if b.type == "text")
+
+        if response.stop_reason in ("end_turn", "refusal", "max_tokens"):
+            # never run tools from a refused or truncated turn
+            return AgentResult(text, response.stop_reason, turn, used_tokens, calls)
+        if used_tokens > budget.max_input_tokens:
+            return AgentResult(text, "budget", turn, used_tokens, calls)
+
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+        for block in tool_uses:  # circuit breaker: the same call over and over means the agent is stuck
+            key = hashlib.sha256(f"{block.name}:{json.dumps(block.input, sort_keys=True)}".encode()).hexdigest()
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > budget.max_repeats:
+                return AgentResult(text, "repeat", turn, used_tokens, calls)
+
+        def execute(block) -> dict:
+            calls.append({"name": block.name, "input": block.input})
+            handler = handlers.get(block.name)
+            try:
+                if handler is None:
+                    raise ValueError(f"Unknown tool {block.name}")
+                return {"type": "tool_result", "tool_use_id": block.id, "content": handler(**block.input)}
+            except Exception as exc:  # report failures to the model instead of crashing the loop
+                return {"type": "tool_result", "tool_use_id": block.id, "content": f"Error: {exc}", "is_error": True}
+
+        with ThreadPoolExecutor() as pool:  # independent tool calls run in parallel
+            results = list(pool.map(execute, tool_uses))
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": results})  # ALL results in ONE user message
+
+    return AgentResult("", "max_turns", budget.max_turns, used_tokens, calls)
+```
+
+This loop was tested against a scripted fake client that returns real SDK `Message` objects, covering five scenarios: two parallel calls answered in one message, a crashing tool turned into an `is_error` result, a stuck agent stopped by the repeat breaker after 3 turns, a token budget stop, and a turn limit. Write the same tests for your own loop. They take ten minutes and catch the bugs that otherwise show up as 3 a.m. invoices.
+
+:::tip[In production, consider the SDK's tool runner]
+The Anthropic Python SDK has a **tool runner** (`client.beta.messages.tool_runner` with `@beta_tool` functions) that runs this loop for you, with typed inputs and validation. Use it once you understand the loop. You still need your own budgets, approvals and logging around it.
+:::
+
+## Stop reasons in a tool loop
+
+| `stop_reason` | Meaning | What your loop does |
+|---|---|---|
+| `tool_use` | The model wants tools run | Run them, append the results, continue |
+| `end_turn` | The model is done | Return the answer |
+| `max_tokens` | Output was cut off, possibly mid-tool-call | **Don't run tools from this turn.** Retry with more room or fail |
+| `refusal` | The model declined | Don't run tools; handle as in Module 1 |
+| `pause_turn` | A long server-side tool paused | Append and send again to let it continue |
+
+:::note[Forcing a tool call]
+Some APIs let you force a tool call with `tool_choice`. On the newest Claude models, forcing (`any` or a specific tool) returns a 400 error. Use `auto`, steer with the prompt ("Use get_shipment for any shipment ID"), and use `strict: true` for schema guarantees, or structured outputs if you only needed JSON.
+:::
+
+<FailureCard
+	title="The orphaned tool_use"
+	symptom="Every second conversation fails with a 400 error mentioning tool_use and tool_result."
+	cause="When a tool threw an exception, the loop skipped it, so one `tool_use` had no matching `tool_result`. The API requires every call to be answered."
+	detect="Integration tests with a tool that raises; alert on this 400 error type."
+	fix="Always return a result for every call. On failure, return `is_error: true` with a message the model can act on. The model usually recovers (asks the user, tries another approach)."
+/>
+
+<FailureCard
+	title="The silent sequential agent"
+	symptom="An agent that looks up 5 shipments takes 5 round trips instead of 1, and latency is 5× higher than expected."
+	cause="The loop returned each tool result in a separate user message. The model learned from its context that tools are answered one at a time, and stopped batching calls."
+	detect="Trace analysis: count tool calls per model turn. Consistently 1 when tasks are parallel is a smell."
+	fix="Return all results for a turn in one user message, and run independent tools concurrently."
+/>
+
+<ThinkFirst question="Your loop has max_turns = 8. A legitimate complex task (5 lookups, 2 policy searches, 1 refund) sometimes needs 9 turns and gets cut off. Do you just raise the limit to 30? What else would you consider?">
+
+**Raising the limit alone trades one failure for another:** stuck agents now burn 30 turns before stopping. Better options, often combined:
+
+1. **Parallelism first:** if the 5 lookups happen in one turn instead of five, the task fits easily. Check the traces: is the model batching?
+2. **Tiered budgets:** a per-task-type limit (8 for simple questions, 15 for refund flows), chosen by a cheap router.
+3. **Token budget over turn count:** turns are a proxy; the real cost is tokens. Cap both.
+4. **Graceful exhaustion:** when the budget runs out, don't just stop. Return what was found so far plus "I need a human to finish this", and hand off with the trace attached.
+5. **Measure:** look at the distribution of turns for successful tasks. Set the limit just above the 99th percentile, and alert on tasks that hit it.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** implement `run_agent` with two fake tools and run it against the real API on 5 questions. Print every request and response, and read them.
+- **Stretch:** write the five unit tests with a scripted fake client (parallel calls, tool error, repeat breaker, budget, turn limit).
+- **Boss level:** add **graceful exhaustion**: when any breaker trips, the agent returns a structured hand-off (what it found, what's missing, the trace ID), and Relay's UI shows it as an escalation card (Module 2).
+
+</Practice>
+
+<Quiz
+	id="m6-tools"
+	questions={[
+		{
+			q: 'Who actually executes a tool?',
+			options: ['The model provider', 'The model itself', 'Your code: the model only returns a structured request to call it', 'The browser'],
+			answer: 2,
+			why: 'The model proposes calls; your code executes them (with whatever permissions and checks you choose) and returns results.',
+		},
+		{
+			q: 'The model requested three tools in one turn. How should you return the results?',
+			options: ['Three separate user messages', 'All three tool_result blocks in one user message', 'Only the first result', 'In the system prompt'],
+			answer: 1,
+			why: 'One message with all results keeps the conversation valid and preserves the model\'s parallel-calling behaviour.',
+		},
+		{
+			q: 'A tool throws an exception. What should the loop send back?',
+			options: [
+				'Nothing, skip it',
+				'A tool_result with is_error: true and a message the model can act on',
+				'Crash the whole request',
+				'Retry forever',
+			],
+			answer: 1,
+			why: 'Every call needs a result. Error results let the model recover, and skipping one makes the next request invalid.',
+		},
+		{
+			q: 'Which breaker would have stopped the 1,140-call incident earliest?',
+			options: ['A turn limit of 100', 'Detection of repeated identical tool calls', 'A bigger model', 'Streaming'],
+			answer: 1,
+			why: 'The same call with the same input three times is a clear sign of a stuck agent. A turn limit and a token budget are the backstops.',
+		},
+		{
+			q: 'stop_reason is "max_tokens" and the response contains a tool_use block. What do you do?',
+			options: ['Run the tool', 'Don\'t run it: the input may be truncated. Retry with more room or fail', 'Ignore the stop reason', 'Return the partial text as final'],
+			answer: 1,
+			why: 'A cut-off turn can contain a partial tool input that still parses. Never execute tools from truncated or refused turns.',
+		},
+	]}
+/>
+
+<LessonComplete id="agents/tool-calling-from-scratch" />

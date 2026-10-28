@@ -1,0 +1,198 @@
+---
+title: Workflows vs agents
+description: When you need an agent and when a fixed workflow is better, plus the five composable patterns (chaining, routing, parallelization, orchestrator-workers, evaluator-optimizer).
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import Diagram from '../../../components/Diagram.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="The agent that should have been an if-statement" severity="SEV3">
+A team built an "autonomous triage agent" with 12 tools to categorize tickets and route them to queues. It averaged 6 model calls per ticket, took 14 seconds, and occasionally decided to email customers on its own initiative. A replacement (one classification call with structured output, then a plain Python `if/else` to route) was 10× cheaper, 8× faster, more accurate, and couldn't email anyone.
+</Incident>
+
+"Agent" is the most over-applied word in AI engineering. The useful distinction:
+
+- **Workflow:** **your code** decides the steps. LLM calls are steps in a predefined path.
+- **Agent:** **the model** decides the steps, choosing tools and when to stop, in a loop.
+
+Agents are powerful for open-ended problems, and they're slower, costlier, less predictable and harder to test. **Use the simplest thing that works.**
+
+## Do you need an agent? A checklist
+
+Use an agent only if **all** of these are true:
+
+1. **Complexity:** the steps can't be specified in advance (they depend on what's discovered along the way).
+2. **Value:** the outcome is worth the extra cost and latency.
+3. **Capability:** the model can actually do this task well (check with evals).
+4. **Recoverability:** mistakes can be caught and undone (approvals, tests, reversible actions).
+
+If any answer is no, use a workflow, or put a small agent inside one step of a workflow.
+
+## Five workflow patterns
+
+These patterns come from Anthropic's widely cited "Building effective agents" guidance. They compose: real systems mix several.
+
+### 1. Prompt chaining
+
+<Diagram
+	caption="Chaining: each step's output feeds the next. Code checks ('gates') can stop bad intermediate results."
+	code={`flowchart LR
+    A["Extract facts<br/>from ticket"] --> G{"Gate:<br/>shipment ID valid?"}
+    G -- yes --> B["Look up<br/>shipment (code)"]
+    B --> C["Draft reply"]
+    C --> D["Check: no<br/>refund promise"]
+    G -- no --> X["Ask customer<br/>for the ID"]`}
+/>
+
+Use it when a task splits cleanly into fixed steps. Each call is simpler (and more accurate), and you can validate between steps.
+
+### 2. Routing
+
+<Diagram
+	caption="Routing: classify first, then send each input to a specialized path, model or prompt."
+	code={`flowchart LR
+    T["Ticket"] --> R{"Classifier<br/>(small, fast model)"}
+    R -- tracking --> A["Tool lookup + template"]
+    R -- policy question --> B["RAG pipeline"]
+    R -- refund --> C["Refund workflow<br/>with approval"]
+    R -- angry escalation --> D["Human queue<br/>+ drafted summary"]`}
+/>
+
+Use it when inputs fall into distinct categories that need different handling. It also lets you send easy cases to cheap models.
+
+### 3. Parallelization
+
+<Diagram
+	caption="Parallelization: independent sub-tasks run at the same time (sectioning), or the same task runs several times and the results are combined (voting)."
+	code={`flowchart LR
+    T["Customs declaration"] --> A["Check parties"]
+    T --> B["Check goods codes"]
+    T --> C["Check values"]
+    A --> M["Merge findings"]
+    B --> M
+    C --> M`}
+/>
+
+```python
+import asyncio
+
+async def review_declaration(doc: str) -> dict:
+    parties, codes, values = await asyncio.gather(   # three independent LLM checks at once
+        check_parties(doc), check_hs_codes(doc), check_values(doc),
+    )
+    return {"parties": parties, "codes": codes, "values": values}
+```
+
+Use it for independent checks (latency drops to the slowest branch), or **voting**: run a high-stakes check three times and require agreement.
+
+### 4. Orchestrator–workers
+
+<Diagram
+	caption="Orchestrator-workers: a model breaks the task into sub-tasks it couldn't predict in advance, delegates them, and synthesizes the results."
+	code={`flowchart TB
+    O["Orchestrator<br/>'Find all customers affected by the Antwerp strike'"] --> W1["Worker: query shipments<br/>via Antwerp this week"]
+    O --> W2["Worker: check which have<br/>delivery deadlines"]
+    O --> W3["Worker: draft notices<br/>per customer tier"]
+    W1 --> S["Orchestrator synthesizes<br/>+ asks for approval"]
+    W2 --> S
+    W3 --> S`}
+/>
+
+Like parallelization, but the sub-tasks are decided **at runtime** by the model. This is where agent territory begins.
+
+### 5. Evaluator–optimizer
+
+<Diagram
+	caption="Evaluator-optimizer: one call generates, another critiques against clear criteria, and the loop repeats until the criteria pass or a limit is hit."
+	code={`flowchart LR
+    G["Generator<br/>drafts reply"] --> E{"Evaluator<br/>meets the rubric?"}
+    E -- "no + feedback" --> G
+    E -- yes --> OUT["Final draft"]
+    E -- "3 rounds" --> H["Escalate to human"]`}
+/>
+
+Use it when there are **clear evaluation criteria** and iteration measurably improves results, such as a tone rubric or a compliance checklist. Always cap the rounds.
+
+## The full agent
+
+When the path is truly open-ended, the model runs the loop from lesson 1: choose a tool, observe the result, decide the next step. That's the **ReAct** pattern (reason → act → observe). Keep agents **inside** a workflow when you can: for example, routing sends only the "complex investigation" category to an agent, with a budget and an approval step at the end.
+
+<FailureCard
+	title="Agent sprawl"
+	symptom="Every new feature becomes 'another agent'. Latency, cost and incident rate climb together."
+	cause="Agents became the default architecture instead of a deliberate choice."
+	detect="For each agent, check the traces: does it take different paths for different inputs? If 95% of runs follow the same 3 steps, it's a workflow in disguise."
+	fix="Convert predictable agents into workflows (keep an agent only for the long tail), and add the checklist above to design reviews."
+/>
+
+<FailureCard
+	title="The evaluator that never says yes"
+	symptom="Some drafts loop through 10 generate-evaluate rounds and still fail; cost per ticket spikes."
+	cause="The evaluator's criteria were contradictory or impossible for some inputs (e.g. 'under 50 words' plus 'explain all conditions'), and there was no round limit."
+	detect="Distribution of rounds per item; read the items that hit the limit."
+	fix="Cap the rounds, fix contradictory criteria, and escalate to a human with the best attempt when the cap is reached."
+/>
+
+<ThinkFirst question="Design Relay's handling of 'Damaged goods' tickets: classify, check the damage policy, look up the shipment and customer tier, compute the eligible compensation, draft a reply, and refund if approved. Workflow, agent, or both? Sketch it with the patterns from this lesson.">
+
+**Mostly a workflow, because the steps are known:**
+
+1. **Routing:** the classifier tags the ticket as "damage".
+2. **Parallelization:** in one step, look up the shipment and customer (tools/code) and retrieve the damage and insurance policies (RAG).
+3. **Chaining with gates:** extract the claim facts (structured output); gate: photos attached? within 48 hours? If not, draft a "please send photos" reply and stop.
+4. **Code, not LLM:** compute the eligible compensation from tier, insurance and the fragile cap, deterministically.
+5. **Evaluator–optimizer:** draft the reply; a tone and compliance evaluator checks it (max 2 rounds).
+6. **Human-in-the-loop:** a refund approval card for amounts over the threshold.
+
+**Where an agent fits:** only for the long tail. If the policies conflict or the case is unusual (multiple shipments, a contract exception), route to an agentic investigation with a budget, which produces a recommendation for a human.
+
+That's the typical production shape: **a workflow skeleton, with an agent for the hard cases.**
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** take three AI features you know and label each step: code, a single LLM call, or an agent. How many really need an agent?
+- **Stretch:** implement routing for Relay: a small-model classifier with structured output that sends tickets to four handlers. Measure accuracy, latency and cost against "one big agent handles everything".
+- **Boss level:** implement the damaged-goods workflow from the design drill end to end, with gates, parallel lookups, deterministic compensation, an evaluator loop (max 2 rounds), and the approval step. Compare it with a free-form agent on 20 tickets: accuracy, cost, latency, and how many times each one did something it shouldn't.
+
+</Practice>
+
+<Quiz
+	id="m6-workflows"
+	questions={[
+		{
+			q: 'What distinguishes an agent from a workflow?',
+			options: ['Agents use bigger models', 'In an agent the model decides the steps and when to stop; in a workflow your code does', 'Workflows can\'t call tools', 'Agents are always faster'],
+			answer: 1,
+			why: 'Control flow is the difference. That\'s also why agents are less predictable and harder to test.',
+		},
+		{
+			q: 'Ticket triage into 6 fixed queues. Which pattern fits best?',
+			options: ['Orchestrator-workers', 'Routing: one classification call, then code routes it', 'An autonomous agent', 'Evaluator-optimizer'],
+			answer: 1,
+			why: 'Distinct, known categories are a classification step plus code. That\'s cheaper, faster and safer.',
+		},
+		{
+			q: 'When is evaluator-optimizer a good fit?',
+			options: ['Always', 'When there are clear evaluation criteria and iterating measurably improves the output', 'For simple lookups', 'When latency must be minimal'],
+			answer: 1,
+			why: 'Without clear criteria the evaluator is arbitrary; without measured improvement the extra rounds are wasted cost. Always cap the rounds.',
+		},
+		{
+			q: 'Which checklist item most often rules out a fully autonomous agent for actions like refunds?',
+			options: ['Complexity', 'Recoverability: mistakes must be catchable and reversible, so approvals and limits are needed', 'Model size', 'Language support'],
+			answer: 1,
+			why: 'Irreversible or costly actions need a human or deterministic checks in the loop.',
+		},
+	]}
+/>
+
+<LessonComplete id="agents/workflows-vs-agents" />

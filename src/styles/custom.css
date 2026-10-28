@@ -297,3 +297,28 @@
 @media (max-width: 30rem) { .label__bar { grid-template-columns: 7rem 1fr 2rem; } }
 .chunk__controls label { min-width: 0; }
 .chunk__controls select { max-width: 100%; min-width: 0; }
+
+/* agent cost simulator */
+.acost {
+	margin-block: 1.5rem; border: 1px solid var(--c-border); border-radius: var(--c-radius);
+	padding: 1rem 1.15rem; background: var(--c-card);
+}
+.acost p { margin: 0.4rem 0; }
+.acost__badge { font-weight: 700; }
+.acost__controls { display: grid; gap: 0.6rem; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); font-size: 0.88rem; }
+.acost__controls label { display: grid; gap: 0.25rem; min-width: 0; }
+.acost__controls .acost__check { display: block; }
+.acost__chart { width: 100%; height: 9rem; margin-top: 0.75rem; background: var(--sl-color-bg); border-radius: 0.4rem; }
+.acost__prefix { fill: #6366f1; }
+.acost__hist { fill: #f59e0b; }
+.acost__cached { fill: #10b981; opacity: 0.55; }
+.acost__legend { font-size: 0.8rem; display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
+.acost__k { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 2px; margin-right: 0.25rem; }
+.acost__k--prefix { background: #6366f1; }
+.acost__k--hist { background: #f59e0b; }
+.acost__k--cached { background: #10b981; opacity: 0.55; }
+.acost__out { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.6rem; }
+.acost__out div { background: var(--sl-color-bg); border-radius: 0.4rem; padding: 0.6rem; display: grid; }
+.acost__out span { font-size: 0.8rem; color: var(--sl-color-gray-2); }
+.acost__out strong { font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+.acost__note { font-weight: 600; font-size: 0.9rem; }

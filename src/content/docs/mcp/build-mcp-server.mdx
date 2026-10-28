@@ -1,0 +1,240 @@
+---
+title: Build an MCP server in Python
+description: Expose Acme's shipment and customer systems over MCP with the official Python SDK (v2). Tools with structured output, resources, prompts, errors, testing in-process, and running over stdio and HTTP.
+sidebar:
+  order: 2
+---
+
+import Incident from '../../../components/Incident.astro';
+import Quiz from '../../../components/Quiz.astro';
+import ThinkFirst from '../../../components/ThinkFirst.astro';
+import FailureCard from '../../../components/FailureCard.astro';
+import Practice from '../../../components/Practice.astro';
+import LessonComplete from '../../../components/LessonComplete.astro';
+
+<Incident title="'No module named mcp.server.fastmcp'" severity="SEV3">
+A developer copied an MCP server from a popular tutorial, ran `pip install mcp`, and got an import error. The tutorial was written for version 1 of the Python SDK; pip installed version 2, where the main class was renamed. Half the examples online still use the old name. **Always check which major version a tutorial targets.**
+</Incident>
+
+In this lesson you'll build `acme-ops`, Relay's MCP server for shipments and customers, with the **official MCP Python SDK, version 2**. All the code below was run with `mcp` 2.3.
+
+:::caution[SDK v2 renamed FastMCP]
+In `mcp` 1.x the high-level class was `FastMCP` (from `mcp.server.fastmcp`). In 2.x it's **`MCPServer`** (from `mcp.server`), and importing the old path raises an error that points to the migration guide. If you need v1 code to keep working, pin `mcp<2`. For new servers, use v2.
+:::
+
+## Install
+
+```bash
+uv add "mcp[cli]"
+```
+
+## The server
+
+```python
+# mcp_servers/acme_ops.py: Acme's shipment and customer systems, exposed over MCP
+from typing import Annotated, Literal
+
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
+from mcp_types import ToolAnnotations
+from pydantic import BaseModel, Field
+
+mcp = MCPServer("acme-ops")
+
+# Stand-in for Acme's real systems (a database or internal APIs in production).
+SHIPMENTS = {
+    "ACM-2025-000183": {"customer_id": "C-2201", "status": "delayed", "location": "Antwerp", "eta": "2026-10-30"},
+    "ACM-2025-000184": {"customer_id": "C-1042", "status": "delivered", "location": "Ghent", "eta": "2026-10-20"},
+}
+CUSTOMERS = {"C-2201": {"name": "Jane Doe", "tier": "Business Plus"}, "C-1042": {"name": "Lars Berg", "tier": "Standard"}}
+
+
+class Shipment(BaseModel):
+    shipment_id: str
+    status: Literal["in_transit", "delayed", "delivered"]
+    location: str
+    eta: str = Field(description="Estimated delivery date, ISO format")
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def get_shipment(
+    shipment_id: Annotated[str, Field(description="Format ACM-YYYY-NNNNNN, exactly as the customer wrote it")],
+) -> Shipment:
+    """Look up the live status of one shipment. Read-only."""
+    record = SHIPMENTS.get(shipment_id)
+    if record is None:
+        # Anticipated failure: the message reaches the model so it can recover (e.g. ask the user).
+        raise ToolError(f"No shipment {shipment_id!r}. Check the ID format ACM-YYYY-NNNNNN or ask the customer.")
+    return Shipment(shipment_id=shipment_id, status=record["status"], location=record["location"], eta=record["eta"])
+
+
+@mcp.resource("acme://customers/{customer_id}")
+def customer_profile(customer_id: str) -> str:
+    """Customer profile: name and contract tier."""
+    customer = CUSTOMERS.get(customer_id)
+    if customer is None:
+        raise ResourceNotFoundError(f"Unknown customer {customer_id}")
+    return f"{customer['name']} (tier: {customer['tier']})"
+
+
+@mcp.prompt()
+def delay_apology(shipment_id: str) -> str:
+    """Draft an apology for a delayed shipment, using live shipment data."""
+    return (
+        f"Look up shipment {shipment_id} with get_shipment, then draft a short, sincere apology "
+        "with the new ETA. Do not promise compensation."
+    )
+
+
+if __name__ == "__main__":
+    mcp.run()  # stdio by default, for local clients like Claude Code or desktop apps
+```
+
+What the SDK does for you:
+
+- **Input schemas from type hints.** `shipment_id: str` becomes JSON Schema.
+- **Output schemas from return types.** Returning a Pydantic model (`Shipment`) gives the tool an **output schema** and **structured content** that clients can parse reliably.
+- **Errors split into two kinds.** Raising `ToolError` sends your message to the model with `is_error: true`, so it can recover ("ask the customer to confirm the ID"). Any **other** exception is treated as a crash: the model sees only a generic "Error executing tool get_shipment", and the details stay in your server logs. That's good security: internal stack traces never leak to the model or the user.
+- **Annotations** such as `read_only_hint` describe the tool's behaviour to hosts (more in lesson 6).
+
+:::tip[Parameter descriptions: use Field, not the docstring]
+While testing this server, a description written in the docstring's `Args:` section did **not** reach the tool's input schema. Only the explicit `Annotated[str, Field(description=...)]` form did. The model only sees what's in the schema, so verify what your server actually sends (the test below prints it).
+:::
+
+## Test it in-process
+
+The v2 `Client` can connect directly to a server object, with no network or subprocess, which makes unit tests easy:
+
+```python
+import anyio
+from mcp import Client
+from mcp_servers.acme_ops import mcp
+
+async def main():
+    async with Client(mcp) as client:  # in-process: no network, perfect for tests
+        tools = await client.list_tools()
+        t = tools.tools[0]
+        print("tool:", t.name, "| annotations:", t.annotations)
+        print("input schema:", t.input_schema)
+        print("output schema keys:", list((t.output_schema or {}).get("properties", {}).keys()))
+        ok = await client.call_tool("get_shipment", {"shipment_id": "ACM-2025-000183"})
+        print("ok -> is_error:", ok.is_error, "| structured:", ok.structured_content)
+        bad = await client.call_tool("get_shipment", {"shipment_id": "ACM-183"})
+        print("bad -> is_error:", bad.is_error, "| text:", bad.content[0].text)
+        res = await client.read_resource("acme://customers/C-2201")
+        print("resource:", res.contents[0].text)
+        prompts = await client.list_prompts()
+        p = await client.get_prompt("delay_apology", {"shipment_id": "ACM-2025-000183"})
+        print("prompt:", prompts.prompts[0].name, "->", p.messages[0].content.text[:60])
+
+anyio.run(main)
+```
+
+Real output:
+
+```text
+tool: get_shipment | annotations: title=None read_only_hint=True destructive_hint=None idempotent_hint=None open_world_hint=False
+input schema: {'type': 'object', 'properties': {'shipment_id': {'description': 'Format ACM-YYYY-NNNNNN, exactly as the customer wrote it', 'title': 'Shipment Id', 'type': 'string'}}, 'required': ['shipment_id'], 'title': 'get_shipmentArguments'}
+output schema keys: ['shipment_id', 'status', 'location', 'eta']
+ok -> is_error: False | structured: {'shipment_id': 'ACM-2025-000183', 'status': 'delayed', 'location': 'Antwerp', 'eta': '2026-10-30'}
+bad -> is_error: True | text: Error executing tool get_shipment: No shipment 'ACM-183'. Check the ID format ACM-YYYY-NNNNNN or ask the customer.
+resource: Jane Doe (tier: Business Plus)
+prompt: delay_apology -> Look up shipment ACM-2025-000183 with get_shipment, then dra
+```
+
+## Run it
+
+```bash
+uv run mcp dev mcp_servers/acme_ops.py      # MCP Inspector: click through tools, resources, prompts
+```
+
+```bash
+uv run mcp_servers/acme_ops.py              # stdio: what local hosts (Claude Code, desktop apps) launch
+```
+
+To serve it over HTTP (the transport for shared, remote servers), call `mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)`, and clients connect to `http://<host>:8000/mcp`. Lesson 4 adds authentication, which a remote server must have.
+
+Testing over a real stdio subprocess looks like this (also run for this lesson):
+
+```python
+import sys
+import anyio
+from mcp import Client, StdioServerParameters
+
+async def main():
+    params = StdioServerParameters(command=sys.executable, args=["mcp_servers/acme_ops.py"])
+    async with Client(params) as client:
+        r = await client.call_tool("get_shipment", {"shipment_id": "ACM-2025-000184"})
+        print("stdio ->", r.structured_content)
+
+anyio.run(main)
+```
+
+<FailureCard
+	title="The leaking stack trace"
+	symptom="A model's answer to a customer includes a database hostname and a SQL fragment."
+	cause="A hand-rolled MCP server caught exceptions and returned `str(exc)` as the tool result. A database error message travelled to the model, which repeated it."
+	detect="Security review of error paths; tests that force internal failures and inspect what the client receives."
+	fix="Return deliberate, user-safe messages for anticipated failures (`ToolError`), and let unexpected crashes produce only a generic error, with details in server logs. The v2 SDK does this by default."
+/>
+
+<FailureCard
+	title="The schema the model never saw"
+	symptom="The model keeps passing shipment IDs in the wrong format, even though the format is documented in the code."
+	cause="The format was described in a docstring section the SDK didn't put into the input schema. The model only sees the schema."
+	detect="Print the `tools/list` output (test above, or the Inspector) and read it as the model would."
+	fix="Put parameter guidance in `Field(description=...)`, constrain formats with patterns or enums, and keep the tool description about **when** to use it."
+/>
+
+<ThinkFirst question="Acme's CRM team will own the acme-crm MCP server, and three AI applications will use it. List the non-functional requirements you'd give the CRM team before they build it.">
+
+1. **Authentication and per-user authorization** (lesson 4): tools run with the calling user's permissions, never as a super-user.
+2. **Task-shaped tools with bounded outputs** (lesson 3): pagination, filters, errors that teach.
+3. **Stable, versioned tool definitions:** changes announced, schemas backward compatible, deprecations with a timeline. Clients may pin and fingerprint definitions (lesson 6).
+4. **Rate limits and quotas per client:** protect the CRM from a looping agent.
+5. **Audit logging:** who called what, with which arguments, and the result status, tied to the caller's identity.
+6. **Read-only vs mutating separation**, with accurate annotations, and destructive operations kept out of the server or behind extra checks.
+7. **Observability and SLOs:** latency, error rate, availability. Agents are only as reliable as their tools.
+8. **Tests:** in-process client tests for every tool, including error paths.
+
+</ThinkFirst>
+
+<Practice>
+
+- **Warm-up:** build the server above, open it in the MCP Inspector, and call each tool, resource and prompt.
+- **Stretch:** add `search_shipments(customer_id, status=None, since=None, limit=20)` with pagination ("showing 20 of 340, use offset"), and a `create_claim` tool. Test both in-process, including error paths.
+- **Boss level:** back the server with your Relay Postgres database, add pytest tests using the in-process `Client`, and connect it to an MCP host you use daily. Use it for a real task and note every time the model misused a tool. That list drives lesson 3.
+
+</Practice>
+
+<Quiz
+	id="m7-build"
+	questions={[
+		{
+			q: 'In MCP Python SDK v2, what replaced FastMCP?',
+			options: ['FastAPI', 'MCPServer (from mcp.server)', 'ToolServer', 'Nothing, FastMCP is unchanged'],
+			answer: 1,
+			why: 'v2 renamed FastMCP to MCPServer. Old imports fail with a pointer to the migration guide.',
+		},
+		{
+			q: 'What does returning a Pydantic model from a tool give you?',
+			options: ['Faster execution', 'An output schema and structured content that clients can parse reliably', 'Automatic caching', 'Authentication'],
+			answer: 1,
+			why: 'Structured outputs make tool results machine-readable for hosts and UIs, not just text for the model.',
+		},
+		{
+			q: 'A tool hits an unexpected database exception. What does the client see with the v2 SDK\'s defaults?',
+			options: ['The full stack trace', 'A generic "Error executing tool" message; details stay in the server logs', 'Nothing at all', 'The SQL query'],
+			answer: 1,
+			why: 'Unexpected crashes don\'t leak internals. Raise ToolError for failures the model should hear about.',
+		},
+		{
+			q: 'Where should parameter guidance go so the model actually sees it?',
+			options: ['A code comment', 'The input schema, e.g. Field(description=...), verified via tools/list', 'The README', 'The server name'],
+			answer: 1,
+			why: 'Models see only the definition the server sends. Verify it.',
+		},
+	]}
+/>
+
+<LessonComplete id="mcp/build-mcp-server" />
